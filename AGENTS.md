@@ -1,4 +1,4 @@
-# dsh-goal-acceptance — Project Rules
+# goal-acceptance — Project Rules
 
 ## Package Manager
 

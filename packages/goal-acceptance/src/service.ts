@@ -1,6 +1,6 @@
 /**
  * Service implementation for managing and validating goal acceptance criteria.
- * @module @deepseek-ai/dsh-goal-acceptance/service
+ * @module @cckyros/goal-acceptance/service
  */
 
 import { Context, Service } from '@deepseek-ai/cordis'
@@ -13,7 +13,7 @@ import {
   type GoalCriterion,
   type TaskUpdateSpec,
   type ValidateCriterionSpec,
-} from '@deepseek-ai/dsh-goal-acceptance-core'
+} from '@cckyros/goal-acceptance-core'
 import { SessionAcceptanceStore } from './store.ts'
 import { GoalAcceptanceError } from './types.ts'
 

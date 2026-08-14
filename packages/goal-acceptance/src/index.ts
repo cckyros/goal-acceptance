@@ -1,6 +1,6 @@
 /**
  * Model-provider-neutral goal acceptance criteria and validation plugin.
- * @module @deepseek-ai/dsh-goal-acceptance
+ * @module @cckyros/goal-acceptance
  */
 
 import type { Context } from '@deepseek-ai/cordis'
@@ -81,7 +81,7 @@ export function apply(ctx: Context, config: Config = {}): void {
     if (summary.allRequiredPassed) return
 
     // If there are no pending/in_progress criteria, all remaining items are already
-    // marked failed or blocked â€” no further work can be done automatically, let turn close.
+    // marked failed or blocked â€?no further work can be done automatically, let turn close.
     const actionable = criteria.filter(c => c.required && (c.status === 'pending' || c.status === 'in_progress'))
     if (actionable.length === 0) return
 
@@ -102,13 +102,13 @@ export function apply(ctx: Context, config: Config = {}): void {
       parts.push(`Task progress: ${tp.completedTasks}/${tp.totalTasks} completed.`)
     }
 
-    // Ready to validate â€” prompt the agent to validate these first
+    // Ready to validate â€?prompt the agent to validate these first
     if (summary.readyToValidate.length > 0) {
       const ready = summary.readyToValidate.map(c => `"${c.id}"`).join(', ')
       parts.push(`Ready to validate (all linked tasks done): ${ready}. Call \`validate_criterion\` with evidence now.`)
     }
 
-    // Next actionable â€” ordered by dependency
+    // Next actionable â€?ordered by dependency
     if (summary.nextActionable.length > 0) {
       const next = summary.nextActionable[0]!
       parts.push(`Next priority: "${next.id}" (${next.description}).`)
@@ -117,7 +117,7 @@ export function apply(ctx: Context, config: Config = {}): void {
         parts.push(`Then: ${rest}.`)
       }
     } else {
-      // No actionable with met dependencies â€” list what's blocked by deps
+      // No actionable with met dependencies â€?list what's blocked by deps
       const blocked = actionable.filter(c => !summary.nextActionable.includes(c))
       if (blocked.length > 0) {
         const blockedDesc = blocked.map(c => `"${c.id}" (waiting on: ${c.dependsOn.join(', ')})`).join(', ')

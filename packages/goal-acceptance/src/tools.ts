@@ -1,6 +1,6 @@
 /**
  * Model-facing tools for setting, reading, validating, and amending acceptance criteria.
- * @module @deepseek-ai/dsh-goal-acceptance/tools
+ * @module @cckyros/goal-acceptance/tools
  */
 
 import type { Context } from '@deepseek-ai/cordis'
@@ -189,7 +189,7 @@ export function createAcceptanceTools(ctx: Context): ToolDefinition[] {
         summary: service.summarize(agent),
       })) as never
     },
-    presentCall: args => present(`Update task "${String(args.task_id)}" â†’ ${String(args.status)}`, 'other', args),
+    presentCall: args => present(`Update task "${String(args.task_id)}" â†?${String(args.status)}`, 'other', args),
   })
 
   const amendTool = defineTool({

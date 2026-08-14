@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest'
-import { GoalAcceptanceEngine, InMemoryAcceptanceStore } from '@deepseek-ai/dsh-goal-acceptance-core'
+import { GoalAcceptanceEngine, InMemoryAcceptanceStore } from '@cckyros/goal-acceptance-core'
 
 describe('OpenClaw-style standalone usage', () => {
   it('can run the acceptance engine without Cordis or Harness', async () => {

@@ -1,6 +1,6 @@
 /**
  * Model-facing system prompt section for goal acceptance criteria.
- * @module @deepseek-ai/dsh-goal-acceptance/prompt
+ * @module @cckyros/goal-acceptance/prompt
  */
 
 import type { AcceptanceSummary } from './types.ts'
@@ -41,7 +41,7 @@ export function renderAcceptanceGuidance(summary?: AcceptanceSummary): string {
       const next = summary.nextActionable[0]!
       text += `\n- Next actionable: "${next.id}" (${next.description})`
       if (summary.nextActionable.length > 1) {
-        text += ` â€” followed by: ${summary.nextActionable.slice(1).map(c => `"${c.id}"`).join(', ')}`
+        text += ` â€?followed by: ${summary.nextActionable.slice(1).map(c => `"${c.id}"`).join(', ')}`
       }
     }
   }

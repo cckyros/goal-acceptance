@@ -1,4 +1,4 @@
-# @deepseek-ai/dsh-goal-acceptance
+# @cckyros/goal-acceptance
 
 English | [中文](README.zh.md)
 
@@ -6,9 +6,9 @@ Model-provider-neutral goal acceptance criteria and validation enforcement plugi
 
 This plugin manages immutable acceptance criteria per Goal session, provides model-facing tools (`set_acceptance_criteria`, `validate_criterion`, `get_acceptance_criteria`), and intercepts `agent/turn-stopping` to steer uncompleted work or report a final structured summary.
 
-It is a thin Cordis wrapper over [`@deepseek-ai/dsh-goal-acceptance-core`](../goal-acceptance-core), which is a framework-agnostic npm package that can also be used in OpenClaw, Cursor, Claude Code, or other agent runtimes.
+It is a thin Cordis wrapper over [`@cckyros/goal-acceptance-core`](../goal-acceptance-core), which is a framework-agnostic npm package that can also be used in OpenClaw, Cursor, Claude Code, or other agent runtimes.
 
-For the portable Agent Plugin and MCP packaging, see [`@deepseek-ai/dsh-goal-acceptance-mcp`](../goal-acceptance-mcp).
+For the portable Agent Plugin and MCP packaging, see [`@cckyros/goal-acceptance-mcp`](../goal-acceptance-mcp).
 
 ## Plugin
 

@@ -8,8 +8,8 @@ import {
   CallToolRequestSchema,
   ListToolsRequestSchema,
 } from '@modelcontextprotocol/sdk/types.js'
-import { GoalAcceptanceEngine, InMemoryAcceptanceStore } from '@deepseek-ai/dsh-goal-acceptance-core'
-import type { GoalRole, EvidenceType } from '@deepseek-ai/dsh-goal-acceptance-core'
+import { GoalAcceptanceEngine, InMemoryAcceptanceStore } from '@cckyros/goal-acceptance-core'
+import type { GoalRole, EvidenceType } from '@cckyros/goal-acceptance-core'
 import { FileAcceptanceStore } from './store.ts'
 
 interface ToolInput {
@@ -17,7 +17,7 @@ interface ToolInput {
 }
 
 /** Compact one-line summary for default (non-verbose) responses. */
-function slimSummary(s: import('@deepseek-ai/dsh-goal-acceptance-core').AcceptanceSummary) {
+function slimSummary(s: import('@cckyros/goal-acceptance-core').AcceptanceSummary) {
   return {
     allRequiredPassed: s.allRequiredPassed,
     passedCount: s.passedCount,
@@ -27,7 +27,7 @@ function slimSummary(s: import('@deepseek-ai/dsh-goal-acceptance-core').Acceptan
 }
 
 /** Resolve the active acceptance store. */
-function resolveStore(): import('@deepseek-ai/dsh-goal-acceptance-core').GoalAcceptanceStore {
+function resolveStore(): import('@cckyros/goal-acceptance-core').GoalAcceptanceStore {
   const dataDir = process.env.PLUGIN_DATA
   if (dataDir !== undefined && dataDir.length > 0) {
     const path = `${dataDir}/acceptance-events.json`
@@ -80,8 +80,8 @@ export function createMcpServer(): Server {
 
   const server = new Server(
     {
-      name: 'dsh-goal-acceptance-mcp',
-      version: '0.1.0-rc.5',
+      name: '@cckyros/goal-acceptance-mcp',
+      version: '0.1.0-rc.6',
     },
     {
       capabilities: {
@@ -266,7 +266,7 @@ export function createMcpServer(): Server {
       case 'validate_criterion': {
         const updated = await engine.validateCriterion({
           criterionId: input.criterion_id as string,
-          status: input.status as import('@deepseek-ai/dsh-goal-acceptance-core').GoalCriterionStatus,
+          status: input.status as import('@cckyros/goal-acceptance-core').GoalCriterionStatus,
           evidence: input.evidence as string | undefined,
           ...input.evidence_type !== undefined ? { evidenceType: input.evidence_type as EvidenceType } : {},
         })
@@ -284,7 +284,7 @@ export function createMcpServer(): Server {
       case 'update_task_status': {
         await engine.updateTaskStatus({
           taskId: input.task_id as string,
-          status: input.status as import('@deepseek-ai/dsh-goal-acceptance-core').TaskStatus,
+          status: input.status as import('@cckyros/goal-acceptance-core').TaskStatus,
         })
         const verbose = input.verbose === true
         const summary = engine.summarize()

@@ -1,13 +1,13 @@
 /**
  * Package-owned goal-acceptance invariants.
- * @module @deepseek-ai/dsh-goal-acceptance/invariant
+ * @module @cckyros/goal-acceptance/invariant
  */
 
 import type { Context } from '@deepseek-ai/cordis'
 import type { InvariantFailure, InvariantInstaller } from '@deepseek-ai/dsh-invariants'
 import type { Session, SessionEvent } from '@deepseek-ai/dsh-session'
 
-const PACKAGE_NAME = '@deepseek-ai/dsh-goal-acceptance'
+const PACKAGE_NAME = '@cckyros/goal-acceptance'
 
 /** Cordis companion plugin name. */
 export const name = 'goal-acceptance-invariant'

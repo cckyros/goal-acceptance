@@ -1,6 +1,6 @@
 /**
  * Session-backed store adapter for the goal-acceptance core engine.
- * @module @deepseek-ai/dsh-goal-acceptance/store
+ * @module @cckyros/goal-acceptance/store
  */
 
 import type { Session, SessionEvent } from '@deepseek-ai/dsh-session'
@@ -11,7 +11,7 @@ import type {
   GoalAcceptanceValidateEvent,
   GoalAcceptanceTaskUpdateEvent,
   GoalAcceptanceAmendEvent,
-} from '@deepseek-ai/dsh-goal-acceptance-core'
+} from '@cckyros/goal-acceptance-core'
 
 const ACCEPTANCE_EVENT_TYPES = new Set([
   'goal-acceptance/set',

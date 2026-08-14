@@ -21,10 +21,10 @@ Plugins. One package, multiple runtimes:
 | **Claude Code** | MCP stdio server | Model voluntarily calls tools |
 | **Cursor** | MCP stdio server | Model voluntarily calls tools |
 | **OpenClaw** | Agent Plugin (plugin.json + mcp.json + skills) | Model voluntarily calls tools |
-| **DeepSeek Harness** | Cordis plugin (`dsh-goal-acceptance`) | **Yes** — `agent.steer()` forces continuation |
+| **DeepSeek Harness** | Cordis plugin (@cckyros/goal-acceptance) | **Yes** �?`agent.steer()` forces continuation |
 | **Any MCP client** | stdio MCP server | Model voluntarily calls tools |
 | **Any Agent Plugins client** | plugin.json + mcp.json + skills | Model voluntarily calls tools |
-| **Any JS/TS runtime** | Core library (`dsh-goal-acceptance-core`) | Programmatic — you control it |
+| **Any JS/TS runtime** | Core library (@cckyros/goal-acceptance-core) | Programmatic �?you control it |
 
 The core state machine is **zero-dependency** and runs in any JS/TS runtime
 (Node.js, Bun, Deno, browser). The MCP server adds only the MCP SDK. The Cordis
@@ -46,7 +46,7 @@ See [MCP Tools](#mcp-tools) below for the full list.
 
 `set_acceptance_criteria` accepts a `role` parameter (`agent` / `reviewer` /
 `dual`). When `role=agent`, `validate_criterion` marks `passed` as
-`selfClaimed=true` — `can_complete_goal` blocks completion until a reviewer
+`selfClaimed=true` �?`can_complete_goal` blocks completion until a reviewer
 formally confirms. This breaks the "self-grading" loop where an agent both
 does the work and signs off on it.
 
@@ -79,39 +79,25 @@ for the full summary. This minimizes token overhead during normal operation.
 
 | Package | Description | Dependencies |
 |---------|-------------|--------------|
-| [`@deepseek-ai/dsh-goal-acceptance-core`](packages/goal-acceptance-core) | Framework-agnostic state machine, types, errors, abstract store | None |
-| [`@deepseek-ai/dsh-goal-acceptance-mcp`](packages/goal-acceptance-mcp) | MCP stdio server + Agent Plugin packaging (plugin.json, mcp.json, skills) | core, MCP SDK |
-| [`@deepseek-ai/dsh-goal-acceptance`](packages/goal-acceptance) | DeepSeek Harness Cordis plugin with turn-stopping steering | core, Cordis, Harness |
+| [`@cckyros/goal-acceptance-core`](packages/goal-acceptance-core) | Framework-agnostic state machine, types, errors, abstract store | None |
+| [`@cckyros/goal-acceptance-mcp`](packages/goal-acceptance-mcp) | MCP stdio server + Agent Plugin packaging (plugin.json, mcp.json, skills) | core, MCP SDK |
+| [`@cckyros/goal-acceptance`](packages/goal-acceptance) | DeepSeek Harness Cordis plugin with turn-stopping steering | core, Cordis, Harness |
 
 ## Architecture
 
 ```
-                    ┌─────────────────────────────────────────────────┐
-                    │  @deepseek-ai/dsh-goal-acceptance-core           │
-                    │  (zero-dep state machine, event-sourced)         │
-                    └────────────┬──────────────────┬──────────────────┘
-                                 │                  │
-                    ┌────────────┴────────┐ ┌──────┴───────────────────┐
-                    │ dsh-goal-acceptance │ │ dsh-goal-acceptance-mcp  │
-                    │ (Cordis plugin)     │ │ (MCP server + Agent      │
-                    │                     │ │  Plugin packaging)       │
-                    │ • turn-stopping     │ │ • stdio MCP server       │
-                    │ • agent.steer()     │ │ • plugin.json + mcp.json │
-                    │ • system prompt     │ │ • skills/ (Agent Skills) │
-                    │ • tool registration │ │ • FileAcceptanceStore    │
-                    └─────────────────────┘ └──────────────────────────┘
-```
+                    ┌─────────────────────────────────────────────────�?                    �? @cckyros/goal-acceptance-core           �?                    �? (zero-dep state machine, event-sourced)         �?                    └────────────┬──────────────────┬──────────────────�?                                 �?                 �?                    ┌────────────┴────────�?┌──────┴───────────────────�?                    �?@cckyros/goal-acceptance �?�?@cckyros/goal-acceptance-mcp  �?                    �?(Cordis plugin)     �?�?(MCP server + Agent      �?                    �?                    �?�? Plugin packaging)       �?                    �?�?turn-stopping     �?�?�?stdio MCP server       �?                    �?�?agent.steer()     �?�?�?plugin.json + mcp.json �?                    �?�?system prompt     �?�?�?skills/ (Agent Skills) �?                    �?�?tool registration �?�?�?FileAcceptanceStore    �?                    └─────────────────────�?└──────────────────────────�?```
 
 ## Quick Start
 
 ### Core library (any JS/TS runtime)
 
 ```sh
-npm install @deepseek-ai/dsh-goal-acceptance-core
+npm install @cckyros/goal-acceptance-core
 ```
 
 ```typescript
-import { GoalAcceptanceEngine, InMemoryAcceptanceStore } from '@deepseek-ai/dsh-goal-acceptance-core'
+import { GoalAcceptanceEngine, InMemoryAcceptanceStore } from '@cckyros/goal-acceptance-core'
 
 const engine = new GoalAcceptanceEngine(new InMemoryAcceptanceStore())
 
@@ -127,25 +113,25 @@ await engine.updateTaskStatus({ taskId: 'task-2', status: 'completed' })
 
 // When all linked tasks are done, the criterion is "ready to validate"
 const summary = engine.summarize()
-console.log(summary.readyToValidate.map(c => c.id)) // → ['api-200']
+console.log(summary.readyToValidate.map(c => c.id)) // �?['api-200']
 
 // Record validation with evidence
 await engine.validateCriterion({
   criterionId: 'api-200',
   status: 'passed',
-  evidence: 'curl /health → HTTP 200 OK',
+  evidence: 'curl /health �?HTTP 200 OK',
 })
 
 // Check if goal can complete
 const { allowed, reason } = engine.canComplete()
 console.log(allowed, reason)
-// → true, undefined
+// �?true, undefined
 ```
 
 ### MCP server (OpenClaw, Claude Code, Cursor, etc.)
 
 ```sh
-npm install @deepseek-ai/dsh-goal-acceptance-mcp
+npm install @cckyros/goal-acceptance-mcp
 ```
 
 Add to your MCP client config:
@@ -156,7 +142,7 @@ Add to your MCP client config:
     "goal-acceptance": {
       "type": "stdio",
       "command": "node",
-      "args": ["./node_modules/@deepseek-ai/dsh-goal-acceptance-mcp/bin/mcp-server.mjs"],
+      "args": ["./node_modules/@cckyros/goal-acceptance-mcp/bin/mcp-server.mjs"],
       "env": {
         "PLUGIN_DATA": "/path/to/persistent/data"
       }
@@ -169,10 +155,10 @@ Or run standalone:
 
 ```sh
 # In-memory (resets on restart)
-node ./node_modules/@deepseek-ai/dsh-goal-acceptance-mcp/bin/mcp-server.mjs
+node ./node_modules/@cckyros/goal-acceptance-mcp/bin/mcp-server.mjs
 
 # Persistent across restarts
-PLUGIN_DATA=/path/to/data node ./node_modules/@deepseek-ai/dsh-goal-acceptance-mcp/bin/mcp-server.mjs
+PLUGIN_DATA=/path/to/data node ./node_modules/@cckyros/goal-acceptance-mcp/bin/mcp-server.mjs
 ```
 
 The server writes `acceptance-events.json` under `$PLUGIN_DATA`. If `PLUGIN_DATA`
@@ -180,11 +166,11 @@ is not set, state is in-memory only (lost on restart).
 
 #### Typical workflow
 
-1. **Set criteria** — `set_acceptance_criteria` with `role=reviewer` (you verify) or `role=agent` (agent self-claims, you confirm later)
-2. **Set task plan** — `set_task_plan` to decompose the goal into atomic tasks with deliverables and dependencies
-3. **Execute** — `update_task_status` as tasks progress (`pending` → `in_progress` → `completed`)
-4. **Validate** — `validate_criterion` with `evidence_type=command` for high-confidence evidence
-5. **Check** — `can_complete_goal` to verify all required criteria are formally passed
+1. **Set criteria** �?`set_acceptance_criteria` with `role=reviewer` (you verify) or `role=agent` (agent self-claims, you confirm later)
+2. **Set task plan** �?`set_task_plan` to decompose the goal into atomic tasks with deliverables and dependencies
+3. **Execute** �?`update_task_status` as tasks progress (`pending` �?`in_progress` �?`completed`)
+4. **Validate** �?`validate_criterion` with `evidence_type=command` for high-confidence evidence
+5. **Check** �?`can_complete_goal` to verify all required criteria are formally passed
 
 ### Agent Plugin (portable format)
 
@@ -193,7 +179,7 @@ The MCP package doubles as an
 Plugins-capable client at the package root:
 
 ```
-node_modules/@deepseek-ai/dsh-goal-acceptance-mcp/
+node_modules/@cckyros/goal-acceptance-mcp/
 ├── plugin.json    # Agent Plugin manifest
 ├── mcp.json       # stdio MCP server config
 └── skills/        # Portable Agent Skills
@@ -215,7 +201,7 @@ working when it tries to stop early. It intercepts `agent/turn-stopping` and
 steers the agent back with dependency-aware priority ordering.
 
 ```sh
-npm install @deepseek-ai/dsh-goal-acceptance
+npm install @cckyros/goal-acceptance
 ```
 
 ```yaml
@@ -252,24 +238,8 @@ The plugin:
 ## Criterion Status Lifecycle
 
 ```
-                    ┌──────────┐
-                    │ pending  │ ← initial state after setCriteria
-                    └────┬─────┘
-                         │
-              ┌──────────┼──────────┐
-              │          │          │
-              ▼          ▼          ▼
-        ┌──────────┐ ┌────────┐ ┌────────┐
-        │in_progress│ │ passed │ │ failed │
-        └──────────┘ └────────┘ └────────┘
-              │          │          │
-              │          │     ┌────────┐
-              │          │     │blocked │
-              │          │     └────────┘
-              │          │     ┌────────┐
-              └──────────┘─────│not_run │
-                                └────────┘
-```
+                    ┌──────────�?                    �?pending  �?�?initial state after setCriteria
+                    └────┬─────�?                         �?              ┌──────────┼──────────�?              �?         �?         �?              �?         �?         �?        ┌──────────�?┌────────�?┌────────�?        │in_progress�?�?passed �?�?failed �?        └──────────�?└────────�?└────────�?              �?         �?         �?              �?         �?    ┌────────�?              �?         �?    │blocked �?              �?         �?    └────────�?              �?         �?    ┌────────�?              └──────────┘─────│not_run �?                                └────────�?```
 
 | Status | Meaning | Evidence required |
 |--------|---------|-------------------|
@@ -295,11 +265,11 @@ The plugin:
 
 The engine is event-sourced. The store holds an append-only list of:
 
-- `goal-acceptance/set` — locks the criteria list (with role)
-- `goal-acceptance/task-plan` — locks the task decomposition plan
-- `goal-acceptance/validate` — updates one criterion's status (with evidence type, self-claimed flag)
-- `goal-acceptance/task-update` — updates a linked task's status
-- `goal-acceptance/amend` — appends new criteria after the initial lock
+- `goal-acceptance/set` �?locks the criteria list (with role)
+- `goal-acceptance/task-plan` �?locks the task decomposition plan
+- `goal-acceptance/validate` �?updates one criterion's status (with evidence type, self-claimed flag)
+- `goal-acceptance/task-update` �?updates a linked task's status
+- `goal-acceptance/amend` �?appends new criteria after the initial lock
 
 On every read, the engine replays events from the store. This enables:
 
@@ -312,7 +282,7 @@ On every read, the engine replays events from the store. This enables:
 Implement `GoalAcceptanceStore` for your persistence backend:
 
 ```typescript
-import type { GoalAcceptanceStore, GoalAcceptanceEvent } from '@deepseek-ai/dsh-goal-acceptance-core'
+import type { GoalAcceptanceStore, GoalAcceptanceEvent } from '@cckyros/goal-acceptance-core'
 
 class MyDbStore implements GoalAcceptanceStore {
   get events(): readonly GoalAcceptanceEvent[] {
@@ -348,35 +318,35 @@ the model voluntarily calling the tools and following skill instructions.
 ```
 packages/
 ├── goal-acceptance-core/       # Zero-dependency state machine
-│   ├── src/
-│   │   ├── engine.ts           # GoalAcceptanceEngine (criteria + tasks + deps + amend)
-│   │   ├── store.ts            # GoalAcceptanceStore + InMemoryAcceptanceStore
-│   │   ├── types.ts            # GoalCriterion, AcceptanceSummary, events, task types
-│   │   ├── errors.ts           # GoalAcceptanceError
-│   │   └── index.ts            # Public exports
-│   └── tests/
-│       ├── engine.spec.ts      # 51 tests
-│       └── standalone.spec.ts  # 1 test
+�?  ├── src/
+�?  �?  ├── engine.ts           # GoalAcceptanceEngine (criteria + tasks + deps + amend)
+�?  �?  ├── store.ts            # GoalAcceptanceStore + InMemoryAcceptanceStore
+�?  �?  ├── types.ts            # GoalCriterion, AcceptanceSummary, events, task types
+�?  �?  ├── errors.ts           # GoalAcceptanceError
+�?  �?  └── index.ts            # Public exports
+�?  └── tests/
+�?      ├── engine.spec.ts      # 51 tests
+�?      └── standalone.spec.ts  # 1 test
 ├── goal-acceptance-mcp/        # MCP server + Agent Plugin
-│   ├── src/
-│   │   ├── mcp-server.ts       # stdio MCP server, 8 tools
-│   │   ├── store.ts            # FileAcceptanceStore
-│   │   └── index.ts
-│   ├── bin/mcp-server.mjs      # Built stdio entry point
-│   ├── plugin.json             # Agent Plugins manifest
-│   ├── mcp.json                # MCP server config
-│   ├── skills/                 # Portable Agent Skills (8 skills)
-│   └── tests/
-│       └── mcp-server.spec.ts  # 22 tests
+�?  ├── src/
+�?  �?  ├── mcp-server.ts       # stdio MCP server, 8 tools
+�?  �?  ├── store.ts            # FileAcceptanceStore
+�?  �?  └── index.ts
+�?  ├── bin/mcp-server.mjs      # Built stdio entry point
+�?  ├── plugin.json             # Agent Plugins manifest
+�?  ├── mcp.json                # MCP server config
+�?  ├── skills/                 # Portable Agent Skills (8 skills)
+�?  └── tests/
+�?      └── mcp-server.spec.ts  # 22 tests
 └── goal-acceptance/            # DeepSeek Harness Cordis plugin
     ├── src/
-    │   ├── index.ts            # apply(): service + tools + prompt + dependency-aware steering
-    │   ├── service.ts          # GoalAcceptanceService (per-agent engine)
-    │   ├── store.ts            # SessionAcceptanceStore (dsh-session adapter)
-    │   ├── tools.ts            # 5 model tools
-    │   ├── prompt.ts           # System prompt section with task progress
-    │   ├── types.ts            # SessionEventMap declarations
-    │   └── invariant.ts        # Runtime invariant
+    �?  ├── index.ts            # apply(): service + tools + prompt + dependency-aware steering
+    �?  ├── service.ts          # GoalAcceptanceService (per-agent engine)
+    �?  ├── store.ts            # SessionAcceptanceStore (dsh-session adapter)
+    �?  ├── tools.ts            # 5 model tools
+    �?  ├── prompt.ts           # System prompt section with task progress
+    �?  ├── types.ts            # SessionEventMap declarations
+    �?  └── invariant.ts        # Runtime invariant
     └── tests/
         ├── service.spec.ts     # 5 tests
         ├── tools.spec.ts       # 3 tests

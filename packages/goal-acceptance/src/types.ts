@@ -1,6 +1,6 @@
 /**
  * Types and event declarations for the generic goal-acceptance plugin.
- * @module @deepseek-ai/dsh-goal-acceptance/types
+ * @module @cckyros/goal-acceptance/types
  */
 
 export type {
@@ -19,14 +19,14 @@ export type {
   TaskStatus,
   TaskUpdateSpec,
   ValidateCriterionSpec,
-} from '@deepseek-ai/dsh-goal-acceptance-core'
+} from '@cckyros/goal-acceptance-core'
 
-export { GoalAcceptanceError } from '@deepseek-ai/dsh-goal-acceptance-core'
+export { GoalAcceptanceError } from '@cckyros/goal-acceptance-core'
 
-type GoalAcceptanceSetPayload = Omit<import('@deepseek-ai/dsh-goal-acceptance-core').GoalAcceptanceSetEvent, 'type'>
-type GoalAcceptanceValidatePayload = Omit<import('@deepseek-ai/dsh-goal-acceptance-core').GoalAcceptanceValidateEvent, 'type'>
-type GoalAcceptanceTaskUpdatePayload = Omit<import('@deepseek-ai/dsh-goal-acceptance-core').GoalAcceptanceTaskUpdateEvent, 'type'>
-type GoalAcceptanceAmendPayload = Omit<import('@deepseek-ai/dsh-goal-acceptance-core').GoalAcceptanceAmendEvent, 'type'>
+type GoalAcceptanceSetPayload = Omit<import('@cckyros/goal-acceptance-core').GoalAcceptanceSetEvent, 'type'>
+type GoalAcceptanceValidatePayload = Omit<import('@cckyros/goal-acceptance-core').GoalAcceptanceValidateEvent, 'type'>
+type GoalAcceptanceTaskUpdatePayload = Omit<import('@cckyros/goal-acceptance-core').GoalAcceptanceTaskUpdateEvent, 'type'>
+type GoalAcceptanceAmendPayload = Omit<import('@cckyros/goal-acceptance-core').GoalAcceptanceAmendEvent, 'type'>
 
 declare module '@deepseek-ai/dsh-session/types' {
   interface SessionEventMap {

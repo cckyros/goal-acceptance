@@ -25,7 +25,7 @@ importers:
 
   packages/goal-acceptance-mcp:
     dependencies:
-      '@deepseek-ai/dsh-goal-acceptance-core':
+      '@cckyros/goal-acceptance-core':
         specifier: workspace:^
         version: link:../goal-acceptance-core
       '@modelcontextprotocol/sdk':

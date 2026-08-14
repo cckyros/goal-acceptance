@@ -1,5 +1,5 @@
 /**
- * @module @deepseek-ai/dsh-goal-acceptance-core
+ * @module @cckyros/goal-acceptance-core
  */
 
 export type * from './types.ts'

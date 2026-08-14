@@ -5,7 +5,7 @@ import process from "node:process";
 import { Server } from "@modelcontextprotocol/sdk/server/index.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { CallToolRequestSchema, ListToolsRequestSchema } from "@modelcontextprotocol/sdk/types.js";
-import { GoalAcceptanceEngine, InMemoryAcceptanceStore } from "@deepseek-ai/dsh-goal-acceptance-core";
+import { GoalAcceptanceEngine, InMemoryAcceptanceStore } from "@cckyros/goal-acceptance-core";
 import { existsSync, readFileSync } from "node:fs";
 //#region lib/types/store.js
 /** File-backed event store using a JSON file. */
@@ -117,8 +117,8 @@ const TASK_PLAN_ITEM_SCHEMA = {
 function createMcpServer() {
 	const engine = new GoalAcceptanceEngine(resolveStore());
 	const server = new Server({
-		name: "dsh-goal-acceptance-mcp",
-		version: "0.1.0-rc.5"
+		name: "@cckyros/goal-acceptance-mcp",
+		version: "0.1.0-rc.6"
 	}, { capabilities: { tools: {} } });
 	server.setRequestHandler(ListToolsRequestSchema, async () => ({ tools: [
 		{

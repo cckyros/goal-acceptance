@@ -1,6 +1,6 @@
 /**
  * Core state machine for goal acceptance criteria.
- * @module @deepseek-ai/dsh-goal-acceptance-core/engine
+ * @module @cckyros/goal-acceptance-core/engine
  */
 
 import { GoalAcceptanceError } from './errors.ts'

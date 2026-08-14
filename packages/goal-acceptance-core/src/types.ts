@@ -1,6 +1,6 @@
 /**
  * Pure types for the generic goal-acceptance state machine.
- * @module @deepseek-ai/dsh-goal-acceptance-core/types
+ * @module @cckyros/goal-acceptance-core/types
  */
 
 /** Status of an individual acceptance criterion. */
@@ -139,7 +139,7 @@ export interface CriterionTaskProgress {
   readonly pendingTasks: number
   /** Failed tasks. */
   readonly failedTasks: number
-  /** True when all linked tasks are 'completed'. Empty task list â†’ false. */
+  /** True when all linked tasks are 'completed'. Empty task list â†?false. */
   readonly readyToValidate: boolean
 }
 

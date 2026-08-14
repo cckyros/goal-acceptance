@@ -1,5 +1,5 @@
 {
-  "name": "@deepseek-ai/dsh-goal-acceptance-core",
+  "name": "@cckyros/goal-acceptance-core",
   "description": "Framework-agnostic core for goal acceptance criteria and validation",
   "version": "0.1.0-rc.5",
   "publishConfig": {
