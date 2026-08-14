@@ -1,18 +1,12 @@
 {
   "id": "goal-acceptance",
   "name": "Goal Acceptance",
-  "description": "Acceptance-criteria-driven goal completion for autonomous agents. Lock criteria before work, track evidence-based validation, gate completion.",
-  "version": "0.1.0-rc.1",
+  "description": "Acceptance-criteria-driven goal completion for autonomous agents.",
+  "version": "0.1.0-rc.3",
   "configSchema": {
     "type": "object",
-    "additionalProperties": false,
-    "properties": {
-      "dataDir": {
-        "type": "string",
-        "default": "",
-        "description": "Directory for persistent event store. Empty = in-memory only."
-      }
-    }
+    "properties": {},
+    "additionalProperties": false
   },
   "activation": {
     "onStartup": true
