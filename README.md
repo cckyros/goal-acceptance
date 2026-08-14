@@ -1,5 +1,7 @@
 # goal-acceptance
 
+English | [中文](README.zh-CN.md)
+
 Acceptance-criteria-driven goal completion for autonomous AI agents.
 
 Prevents agents from prematurely declaring "done" by locking immutable acceptance
