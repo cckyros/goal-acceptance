@@ -22,7 +22,7 @@ Plugins. One package, multiple runtimes:
 | **Cursor** | MCP stdio server | Model voluntarily calls tools |
 | **Devin** | MCP stdio server | Model voluntarily calls tools |
 | **OpenClaw** | Native plugin (`@cckyros/goal-acceptance-openclaw`) or Agent Plugin bundle | Model voluntarily calls tools |
-| **DeepSeek Harness** | Cordis plugin (`@cckyros/goal-acceptance`) | **Yes** — `agent.steer()` forces continuation |
+| **DeepSeek Harness** | Cordis plugin (`@cckyros/dsh-goal-acceptance`) | **Yes** — `agent.steer()` forces continuation |
 | **Any MCP client** | stdio MCP server | Model voluntarily calls tools |
 | **Any Agent Plugins client** | plugin.json + mcp.json + skills | Model voluntarily calls tools |
 | **Any JS/TS runtime** | Core library (`@cckyros/goal-acceptance-core`) | Programmatic — you control it |
@@ -83,7 +83,7 @@ for the full summary. This minimizes token overhead during normal operation.
 | [`@cckyros/goal-acceptance-core`](packages/goal-acceptance-core) | Framework-agnostic state machine, types, errors, abstract store | None |
 | [`@cckyros/goal-acceptance-mcp`](packages/goal-acceptance-mcp) | MCP stdio server + Agent Plugin bundle (plugin.json, mcp.json, skills) | core, MCP SDK |
 | [`@cckyros/goal-acceptance-openclaw`](packages/goal-acceptance-openclaw) | OpenClaw native plugin (in-process tools, no stdio) | core, typebox; peer: openclaw |
-| [`@cckyros/goal-acceptance`](packages/goal-acceptance) | DeepSeek Harness Cordis plugin with turn-stopping steering | core, Cordis, Harness |
+| [`@cckyros/dsh-goal-acceptance`](packages/goal-acceptance) | DeepSeek Harness Cordis plugin with turn-stopping steering | core, schemastery; peer: dsh-* packages |
 
 ## Architecture
 
@@ -91,18 +91,18 @@ for the full summary. This minimizes token overhead during normal operation.
                     ┌─────────────────────────────────────────────────┐
                     │ @cckyros/goal-acceptance-core                   │
                     │ (zero-dep state machine, event-sourced)         │
-                    └────────────┬──────────────────┬─────────────────┘
-                                 │                  │
-                    ┌────────────┴────────┐ ┌──────┴──────────────────┐
-                    │ @cckyros/goal-      │ │ @cckyros/goal-          │
-                    │ acceptance-mcp      │ │ acceptance-openclaw     │
-                    │ (MCP stdio server + │ │ (OpenClaw native plugin │
-                    │  Agent Plugin bundle)│ │  — in-process tools)   │
-                    │ turn-stopping       │ │ defineToolPlugin        │
-                    │ agent.steer()       │ │ 8 tools, no stdio       │
-                    │ system prompt       │ │ skills/ included        │
-                    │ tool registration   │ │                         │
-                    └─────────────────────┘ └─────────────────────────┘
+                    └──┬──────────────┬───────────────┬───────────────┘
+                       │              │               │
+          ┌────────────┴───────┐ ┌───┴──────────┐ ┌──┴──────────────────────┐
+          │ @cckyros/goal-     │ │ @cckyros/    │ │ @cckyros/dsh-goal-      │
+          │ acceptance-mcp     │ │ goal-        │ │ acceptance              │
+          │ (MCP stdio server +│ │ acceptance-  │ │ (DeepSeek Harness       │
+          │  Agent Plugin      │ │ openclaw     │ │  Cordis plugin)         │
+          │  bundle)           │ │ (OpenClaw    │ │ turn-stopping           │
+          │ 8 tools, stdio     │ │  native)     │ │ agent.steer()           │
+          │ skills/ included   │ │ 8 tools,     │ │ system prompt           │
+          │                    │ │ in-process   │ │ tool registration       │
+          └────────────────────┘ └──────────────┘ └─────────────────────────┘
 ```
 
 ## Quick Start
@@ -292,7 +292,7 @@ working when it tries to stop early. It intercepts `agent/turn-stopping` and
 steers the agent back with dependency-aware priority ordering.
 
 ```sh
-npm install @cckyros/goal-acceptance
+npm install @cckyros/dsh-goal-acceptance
 ```
 
 ```yaml
@@ -310,8 +310,10 @@ The plugin:
   priority ordering when required criteria are still pending
 
 > **Note**: The Cordis plugin requires DeepSeek Harness packages as peer
-> dependencies. It will not build standalone without the Harness workspace. The
-> core and MCP packages build independently.
+> dependencies (`@deepseek-ai/dsh-agent`, `dsh-llm`, `dsh-session`, `dsh-tools`,
+> `dsh-system-prompt`, `dsh-goal`, `dsh-invariants`, `cordis`). Install it inside
+> a DeepSeek Harness project where these are already present. The core and MCP
+> packages build independently.
 
 ## MCP Tools
 

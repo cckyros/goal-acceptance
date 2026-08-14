@@ -19,7 +19,7 @@ goal-acceptance 兼容**任何**支持 MCP 或 Agent Plugins 的 AI agent 平台
 | **Cursor** | MCP stdio server | 模型自觉调用工具 |
 | **Devin** | MCP stdio server | 模型自觉调用工具 |
 | **OpenClaw** | 原生插件 (`@cckyros/goal-acceptance-openclaw`) 或 Agent Plugin bundle | 模型自觉调用工具 |
-| **DeepSeek Harness** | Cordis 插件 (`@cckyros/goal-acceptance`) | **是** — `agent.steer()` 强制继续 |
+| **DeepSeek Harness** | Cordis 插件 (`@cckyros/dsh-goal-acceptance`) | **是** — `agent.steer()` 强制继续 |
 | **任何 MCP 客户端** | stdio MCP server | 模型自觉调用工具 |
 | **任何 Agent Plugins 客户端** | plugin.json + mcp.json + skills | 模型自觉调用工具 |
 | **任何 JS/TS 运行时** | 核心库 (`@cckyros/goal-acceptance-core`) | 编程式 — 你自己控制 |
@@ -74,7 +74,7 @@ MCP 工具响应默认精简（4 字段摘要）。传 `verbose=true` 获取完�
 | [`@cckyros/goal-acceptance-core`](packages/goal-acceptance-core) | 框架无关状态机、类型、错误码、抽象 store | 无 |
 | [`@cckyros/goal-acceptance-mcp`](packages/goal-acceptance-mcp) | MCP stdio server + Agent Plugin 打包（plugin.json、mcp.json、skills） | core、MCP SDK |
 | [`@cckyros/goal-acceptance-openclaw`](packages/goal-acceptance-openclaw) | OpenClaw 原生插件（进程内工具，无 stdio 开销） | core、typebox；peer: openclaw |
-| [`@cckyros/goal-acceptance`](packages/goal-acceptance) | DeepSeek Harness Cordis 插件，带 turn-stopping 强制 steering | core、Cordis、Harness |
+| [`@cckyros/dsh-goal-acceptance`](packages/goal-acceptance) | DeepSeek Harness Cordis 插件，带 turn-stopping 强制 steering | core、schemastery；peer: dsh-* 包 |
 
 ## 架构
 
@@ -82,18 +82,18 @@ MCP 工具响应默认精简（4 字段摘要）。传 `verbose=true` 获取完�
                     ┌─────────────────────────────────────────────────┐
                     │ @cckyros/goal-acceptance-core                   │
                     │ (零依赖状态机，事件溯源)                         │
-                    └────────────┬──────────────────┬─────────────────┘
-                                 │                  │
-                    ┌────────────┴────────┐ ┌──────┴──────────────────┐
-                    │ @cckyros/goal-      │ │ @cckyros/goal-          │
-                    │ acceptance-mcp      │ │ acceptance-openclaw     │
-                    │ (MCP stdio server + │ │ (OpenClaw 原生插件      │
-                    │  Agent Plugin 打包) │ │  — 进程内工具)          │
-                    │ turn-stopping       │ │ defineToolPlugin        │
-                    │ agent.steer()       │ │ 8 个工具，无 stdio      │
-                    │ 系统提示词          │ │ skills/ 包含             │
-                    │ 工具注册            │ │                         │
-                    └─────────────────────┘ └─────────────────────────┘
+                    └──┬──────────────┬───────────────┬───────────────┘
+                       │              │               │
+          ┌────────────┴───────┐ ┌───┴──────────┐ ┌──┴──────────────────────┐
+          │ @cckyros/goal-     │ │ @cckyros/    │ │ @cckyros/dsh-goal-      │
+          │ acceptance-mcp     │ │ goal-        │ │ acceptance              │
+          │ (MCP stdio server +│ │ acceptance-  │ │ (DeepSeek Harness       │
+          │  Agent Plugin      │ │ openclaw     │ │  Cordis 插件)           │
+          │  打包)             │ │ (OpenClaw    │ │ turn-stopping           │
+          │ 8 个工具，stdio    │ │  原生)       │ │ agent.steer()           │
+          │ skills/ 包含       │ │ 8 个工具，   │ │ 系统提示词              │
+          │                    │ │ 进程内       │ │ 工具注册                │
+          └────────────────────┘ └──────────────┘ └─────────────────────────┘
 ```
 
 ## 快速开始
@@ -272,7 +272,7 @@ Cordis 插件是唯一能**强制** Agent 在尝试提前停止时继续工作�
 它拦截 `agent/turn-stopping`，按依赖优先级 steer Agent 继续。
 
 ```sh
-npm install @cckyros/goal-acceptance
+npm install @cckyros/dsh-goal-acceptance
 ```
 
 ```yaml
@@ -288,8 +288,10 @@ plugins:
 - 注入 `policy:goal-acceptance` 系统提示词，含任务进度和下一步行动排序
 - 拦截 `agent/turn-stopping`，当 required 标准未完成时按依赖优先级 steer Agent 继续
 
-> **注意**：Cordis 插件需要 DeepSeek Harness 包作为 peer 依赖。
-> 在没有 Harness workspace 的独立仓库中无法构建。core 和 mcp 包可独立构建。
+> **注意**：Cordis 插件需要 DeepSeek Harness 包作为 peer 依赖
+>（`@deepseek-ai/dsh-agent`、`dsh-llm`、`dsh-session`、`dsh-tools`、
+> `dsh-system-prompt`、`dsh-goal`、`dsh-invariants`、`cordis`）。
+> 需在 DeepSeek Harness 项目中安装（这些 peer 已存在）。core 和 mcp 包可独立构建。
 
 ## MCP 工具
 
