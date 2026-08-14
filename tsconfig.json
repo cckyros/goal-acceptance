@@ -1,0 +1,8 @@
+{
+  "files": [],
+  "references": [
+    { "path": "./packages/goal-acceptance-core" },
+    { "path": "./packages/goal-acceptance-mcp" },
+    { "path": "./packages/goal-acceptance" }
+  ]
+}

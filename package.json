@@ -1,0 +1,18 @@
+{
+  "name": "goal-acceptance",
+  "private": true,
+  "description": "Acceptance-criteria-driven goal completion for autonomous agents — core library, MCP server, and Cordis plugin",
+  "license": "MIT",
+  "type": "module",
+  "packageManager": "pnpm@11.7.0",
+  "scripts": {
+    "build": "tsc -b && tsdown",
+    "test": "vitest run",
+    "typecheck": "tsc -b --noEmit"
+  },
+  "devDependencies": {
+    "tsdown": "^0.22.2",
+    "typescript": "^5.8.0",
+    "vitest": "^4.1.0"
+  }
+}

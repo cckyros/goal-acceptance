@@ -1,0 +1,42 @@
+{
+  "name": "@deepseek-ai/dsh-goal-acceptance-mcp",
+  "description": "MCP server and Agent Plugin packaging for goal-acceptance criteria",
+  "version": "0.1.0-rc.5",
+  "publishConfig": {
+    "access": "public"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/cckyros/goal-acceptance.git",
+    "directory": "packages/goal-acceptance-mcp"
+  },
+  "type": "module",
+  "main": "lib/index.js",
+  "types": "lib/types/index.d.ts",
+  "bin": {
+    "dsh-goal-acceptance-mcp": "./bin/mcp-server.mjs"
+  },
+  "exports": {
+    ".": {
+      "types": "./lib/types/index.d.ts",
+      "default": "./lib/index.js"
+    },
+    "./src/*": "./src/*",
+    "./package.json": "./package.json"
+  },
+  "files": [
+    "lib/index.js",
+    "lib/types/**/*.js",
+    "lib/types/**/*.d.ts",
+    "bin/mcp-server.mjs",
+    "plugin.json",
+    "mcp.json",
+    "skills"
+  ],
+  "license": "MIT",
+  "dependencies": {
+    "@deepseek-ai/dsh-goal-acceptance-core": "workspace:^",
+    "@modelcontextprotocol/sdk": "^1.12.0"
+  },
+  "devDependencies": {}
+}

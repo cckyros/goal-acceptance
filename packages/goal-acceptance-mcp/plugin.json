@@ -1,0 +1,8 @@
+{
+  "$schema": "https://agent-plugins.org/schemas/1.0.0/plugin.schema.json",
+  "name": "dsh-goal-acceptance",
+  "version": "0.1.0-rc.5",
+  "description": "Acceptance-criteria management for autonomous agent goals.",
+  "license": "MIT",
+  "keywords": ["goal", "acceptance", "criteria", "validation"]
+}

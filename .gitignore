@@ -1,0 +1,11 @@
+node_modules/
+lib/
+bin/*.mjs
+*.tsbuildinfo
+.DS_Store
+*.log
+.env
+.env.*
+!.env.example
+dist/
+coverage/
