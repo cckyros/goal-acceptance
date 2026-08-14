@@ -17,7 +17,8 @@ goal-acceptance 兼容**任何**支持 MCP 或 Agent Plugins 的 AI agent 平台
 |------|---------|----------------------|
 | **Claude Code** | MCP stdio server | 模型自觉调用工具 |
 | **Cursor** | MCP stdio server | 模型自觉调用工具 |
-| **OpenClaw** | Agent Plugin (plugin.json + mcp.json + skills) | 模型自觉调用工具 |
+| **Devin** | MCP stdio server | 模型自觉调用工具 |
+| **OpenClaw** | 原生插件 (`@cckyros/goal-acceptance-openclaw`) 或 Agent Plugin bundle | 模型自觉调用工具 |
 | **DeepSeek Harness** | Cordis 插件 (`@cckyros/goal-acceptance`) | **是** — `agent.steer()` 强制继续 |
 | **任何 MCP 客户端** | stdio MCP server | 模型自觉调用工具 |
 | **任何 Agent Plugins 客户端** | plugin.json + mcp.json + skills | 模型自觉调用工具 |
@@ -72,6 +73,7 @@ MCP 工具响应默认精简（4 字段摘要）。传 `verbose=true` 获取完�
 |----|------|------|
 | [`@cckyros/goal-acceptance-core`](packages/goal-acceptance-core) | 框架无关状态机、类型、错误码、抽象 store | 无 |
 | [`@cckyros/goal-acceptance-mcp`](packages/goal-acceptance-mcp) | MCP stdio server + Agent Plugin 打包（plugin.json、mcp.json、skills） | core、MCP SDK |
+| [`@cckyros/goal-acceptance-openclaw`](packages/goal-acceptance-openclaw) | OpenClaw 原生插件（进程内工具，无 stdio 开销） | core、typebox；peer: openclaw |
 | [`@cckyros/goal-acceptance`](packages/goal-acceptance) | DeepSeek Harness Cordis 插件，带 turn-stopping 强制 steering | core、Cordis、Harness |
 
 ## 架构
@@ -84,13 +86,13 @@ MCP 工具响应默认精简（4 字段摘要）。传 `verbose=true` 获取完�
                                  │                  │
                     ┌────────────┴────────┐ ┌──────┴──────────────────┐
                     │ @cckyros/goal-      │ │ @cckyros/goal-          │
-                    │ acceptance          │ │ acceptance-mcp          │
-                    │ (Cordis 插件)       │ │ (MCP server + Agent     │
-                    │                     │ │  Plugin 打包)           │
-                    │ turn-stopping       │ │ stdio MCP server        │
-                    │ agent.steer()       │ │ plugin.json + mcp.json  │
-                    │ 系统提示词          │ │ skills/ (Agent Skills)  │
-                    │ 工具注册            │ │ FileAcceptanceStore     │
+                    │ acceptance-mcp      │ │ acceptance-openclaw     │
+                    │ (MCP stdio server + │ │ (OpenClaw 原生插件      │
+                    │  Agent Plugin 打包) │ │  — 进程内工具)          │
+                    │ turn-stopping       │ │ defineToolPlugin        │
+                    │ agent.steer()       │ │ 8 个工具，无 stdio      │
+                    │ 系统提示词          │ │ skills/ 包含             │
+                    │ 工具注册            │ │                         │
                     └─────────────────────┘ └─────────────────────────┘
 ```
 
@@ -126,19 +128,64 @@ console.log(allowed, reason)
 // → true, undefined
 ```
 
-### MCP server（OpenClaw、Claude Code、Cursor 等）
+### MCP server（Devin、Claude Code、Cursor 等）
+
+三种安装方式，任选其一：
+
+#### 方式 A：全局安装（推荐）
 
 ```sh
-npm install @cckyros/goal-acceptance-mcp
+npm install -g @cckyros/goal-acceptance-mcp
 ```
 
-在你的 MCP 客户端配置中添加：
+找到安装路径，然后添加到 MCP 客户端配置：
 
 ```json
 {
   "mcpServers": {
     "goal-acceptance": {
-      "type": "stdio",
+      "command": "node",
+      "args": ["/path/to/global/node_modules/@cckyros/goal-acceptance-mcp/bin/mcp-server.mjs"],
+      "env": {
+        "PLUGIN_DATA": "/path/to/persistent/data"
+      }
+    }
+  }
+}
+```
+
+> **查找全局路径**：`npm root -g`（Windows 如 `C:\nvm4w\nodejs\node_modules`，macOS/Linux 如 `/usr/local/lib/node_modules`）。
+
+#### 方式 B：npx（无需预装）
+
+npx 按需下载到临时缓存，无需全局安装，但首次启动有几秒下载延迟。
+
+```json
+{
+  "mcpServers": {
+    "goal-acceptance": {
+      "command": "npx",
+      "args": ["-y", "@cckyros/goal-acceptance-mcp"],
+      "env": {
+        "PLUGIN_DATA": "/path/to/persistent/data"
+      }
+    }
+  }
+}
+```
+
+> **Windows + nvm 用户**：如果 npx 启动失败，改用方式 A。nvm 的 junction 符号链接可能导致 `import.meta.url` 路径不匹配。
+
+#### 方式 C：项目级安装
+
+```sh
+npm install @cckyros/goal-acceptance-mcp
+```
+
+```json
+{
+  "mcpServers": {
+    "goal-acceptance": {
       "command": "node",
       "args": ["./node_modules/@cckyros/goal-acceptance-mcp/bin/mcp-server.mjs"],
       "env": {
@@ -149,7 +196,11 @@ npm install @cckyros/goal-acceptance-mcp
 }
 ```
 
-或直接运行：
+#### Devin CLI 配置
+
+Devin 的配置文件在 `%APPDATA%\devin\mcp_config.json`（Windows）或 `~/.config/devin/mcp_config.json`（macOS/Linux）。用上述任一方式添加 `goal-acceptance` 到 `mcpServers`，然后重启 Devin。
+
+#### 直接运行
 
 ```sh
 # 内存模式（重启后重置）
@@ -170,7 +221,32 @@ server 在 `$PLUGIN_DATA` 下写入 `acceptance-events.json`。未设置 `PLUGIN
 4. **验证** — `validate_criterion`，用 `evidence_type=command` 提供高可信证据
 5. **检查** — `can_complete_goal` 确认所有 required 标准正式通过
 
-### Agent Plugin（可移植格式）
+### OpenClaw 原生插件
+
+`@cckyros/goal-acceptance-openclaw` 是 OpenClaw 原生插件，直接在进程内注册全部 8 个工具（无 MCP stdio 开销）。
+
+```sh
+openclaw plugins install "npm:@cckyros/goal-acceptance-openclaw@rc"
+```
+
+> **注意**：`@rc` 标签是必须的，因为包处于预发布阶段。发布稳定版后可省略标签。
+
+安装后重启 gateway：
+
+```sh
+openclaw gateway restart
+```
+
+验证：
+
+```sh
+openclaw plugins inspect goal-acceptance
+# Status: loaded, Format: openclaw
+```
+
+8 个工具现在在 OpenClaw 会话中可用。`Shape: non-capability` 是 tool 插件的正常状态——工具通过 `defineToolPlugin` 注册，不走 capability 系统。
+
+### Agent Plugin（可移植 bundle 格式）
 
 MCP 包同时也是符合 [Agent Plugins](https://agent-plugins.org) 标准的插件包。
 将任何支持 Agent Plugins 的客户端指向包根目录即可：
@@ -303,17 +379,18 @@ class MyDbStore implements GoalAcceptanceStore {
 
 ## 三方兼容性
 
-| 能力 | Cordis 插件 | MCP server | Agent Plugin |
-|------|:---:|:---:|:---:|
-| 模型工具 | `set/get/validate/update_task/amend` | 8 个工具（见 [MCP 工具](#mcp-工具)） | 同 MCP |
-| 系统提示词 / Skills | `policy:goal-acceptance` | `skills/` | `skills/` |
-| Turn-stopping 强制拦截 | 是（`agent.steer()`） | 否 | 否 |
-| 跨客户端可移植 | 否（仅 Harness） | 是（任何 MCP 客户端） | 是（任何 Agent Plugins 客户端） |
-| 持久化状态 | `dsh-session` 日志 | `$PLUGIN_DATA/acceptance-events.json` | 同 MCP |
-| 双角色验证 | 否 | 是（`role` 参数） | 是 |
-| 类型化证据 | 否 | 是（`evidence_type` 参数） | 是 |
-| 任务分解计划 | 否 | 是（`set_task_plan` / `get_task_plan`） | 是 |
-| 精简响应 | 否 | 是（`verbose` 参数） | 是 |
+| 能力 | Cordis 插件 | MCP server | Agent Plugin | OpenClaw 原生插件 |
+|------|:---:|:---:|:---:|:---:|
+| 模型工具 | `set/get/validate/update_task/amend` | 8 个工具（见 [MCP 工具](#mcp-工具)） | 同 MCP | 同 MCP（进程内） |
+| 系统提示词 / Skills | `policy:goal-acceptance` | `skills/` | `skills/` | `skills/` |
+| Turn-stopping 强制拦截 | 是（`agent.steer()`） | 否 | 否 | 否 |
+| 跨客户端可移植 | 否（仅 Harness） | 是（任何 MCP 客户端） | 是（任何 Agent Plugins 客户端） | 否（仅 OpenClaw） |
+| 持久化状态 | `dsh-session` 日志 | `$PLUGIN_DATA/acceptance-events.json` | 同 MCP | 同 MCP |
+| 双角色验证 | 否 | 是（`role` 参数） | 是 | 是 |
+| 类型化证据 | 否 | 是（`evidence_type` 参数） | 是 | 是 |
+| 任务分解计划 | 否 | 是（`set_task_plan` / `get_task_plan`） | 是 | 是 |
+| 精简响应 | 否 | 是（`verbose` 参数） | 是 | 是 |
+| 进程内调用（无 stdio） | 是 | 否 | 否 | 是 |
 
 Cordis 插件是唯一能**强制** Agent 在尝试提前停止时继续工作的变体。
 MCP 和 Agent Plugin 变体依赖模型自觉调用工具并遵循 skill 指令。
@@ -343,6 +420,12 @@ packages/
 │   ├── skills/                 # 可移植 Agent Skills（6 个 skill）
 │   └── tests/
 │       └── mcp-server.spec.ts  # 22 个测试
+├── goal-acceptance-openclaw/   # OpenClaw 原生插件
+│   ├── src/
+│   │   └── index.ts            # defineToolPlugin，8 个工具（进程内）
+│   ├── dist/index.js           # 构建后的入口
+│   ├── openclaw.plugin.json    # OpenClaw 插件清单
+│   └── skills/                 # 可移植 Agent Skills（8 个 skill）
 └── goal-acceptance/            # DeepSeek Harness Cordis 插件
     ├── src/
     │   ├── index.ts            # apply(): service + tools + prompt + turn-stopping

@@ -20,7 +20,8 @@ Plugins. One package, multiple runtimes:
 |----------|----------------|--------------------------|
 | **Claude Code** | MCP stdio server | Model voluntarily calls tools |
 | **Cursor** | MCP stdio server | Model voluntarily calls tools |
-| **OpenClaw** | Agent Plugin (plugin.json + mcp.json + skills) | Model voluntarily calls tools |
+| **Devin** | MCP stdio server | Model voluntarily calls tools |
+| **OpenClaw** | Native plugin (`@cckyros/goal-acceptance-openclaw`) or Agent Plugin bundle | Model voluntarily calls tools |
 | **DeepSeek Harness** | Cordis plugin (`@cckyros/goal-acceptance`) | **Yes** — `agent.steer()` forces continuation |
 | **Any MCP client** | stdio MCP server | Model voluntarily calls tools |
 | **Any Agent Plugins client** | plugin.json + mcp.json + skills | Model voluntarily calls tools |
@@ -80,7 +81,8 @@ for the full summary. This minimizes token overhead during normal operation.
 | Package | Description | Dependencies |
 |---------|-------------|--------------|
 | [`@cckyros/goal-acceptance-core`](packages/goal-acceptance-core) | Framework-agnostic state machine, types, errors, abstract store | None |
-| [`@cckyros/goal-acceptance-mcp`](packages/goal-acceptance-mcp) | MCP stdio server + Agent Plugin packaging (plugin.json, mcp.json, skills) | core, MCP SDK |
+| [`@cckyros/goal-acceptance-mcp`](packages/goal-acceptance-mcp) | MCP stdio server + Agent Plugin bundle (plugin.json, mcp.json, skills) | core, MCP SDK |
+| [`@cckyros/goal-acceptance-openclaw`](packages/goal-acceptance-openclaw) | OpenClaw native plugin (in-process tools, no stdio) | core, typebox; peer: openclaw |
 | [`@cckyros/goal-acceptance`](packages/goal-acceptance) | DeepSeek Harness Cordis plugin with turn-stopping steering | core, Cordis, Harness |
 
 ## Architecture
@@ -93,13 +95,13 @@ for the full summary. This minimizes token overhead during normal operation.
                                  │                  │
                     ┌────────────┴────────┐ ┌──────┴──────────────────┐
                     │ @cckyros/goal-      │ │ @cckyros/goal-          │
-                    │ acceptance          │ │ acceptance-mcp          │
-                    │ (Cordis plugin)     │ │ (MCP server + Agent     │
-                    │                     │ │  Plugin packaging)      │
-                    │ turn-stopping       │ │ stdio MCP server        │
-                    │ agent.steer()       │ │ plugin.json + mcp.json  │
-                    │ system prompt       │ │ skills/ (Agent Skills)  │
-                    │ tool registration   │ │ FileAcceptanceStore     │
+                    │ acceptance-mcp      │ │ acceptance-openclaw     │
+                    │ (MCP stdio server + │ │ (OpenClaw native plugin │
+                    │  Agent Plugin bundle)│ │  — in-process tools)   │
+                    │ turn-stopping       │ │ defineToolPlugin        │
+                    │ agent.steer()       │ │ 8 tools, no stdio       │
+                    │ system prompt       │ │ skills/ included        │
+                    │ tool registration   │ │                         │
                     └─────────────────────┘ └─────────────────────────┘
 ```
 
@@ -143,19 +145,64 @@ console.log(allowed, reason)
 // → true, undefined
 ```
 
-### MCP server (OpenClaw, Claude Code, Cursor, etc.)
+### MCP server (Devin, Claude Code, Cursor, etc.)
+
+Three installation methods, pick one:
+
+#### Method A: Global install (recommended)
 
 ```sh
-npm install @cckyros/goal-acceptance-mcp
+npm install -g @cckyros/goal-acceptance-mcp
 ```
 
-Add to your MCP client config:
+Find the installed bin path, then add to your MCP client config:
 
 ```json
 {
   "mcpServers": {
     "goal-acceptance": {
-      "type": "stdio",
+      "command": "node",
+      "args": ["/path/to/global/node_modules/@cckyros/goal-acceptance-mcp/bin/mcp-server.mjs"],
+      "env": {
+        "PLUGIN_DATA": "/path/to/persistent/data"
+      }
+    }
+  }
+}
+```
+
+> **Find the global path**: `npm root -g` (e.g. `C:\nvm4w\nodejs\node_modules` on Windows, `/usr/local/lib/node_modules` on macOS/Linux).
+
+#### Method B: npx (no pre-install needed)
+
+npx downloads the package on-demand to a temporary cache. No global install required, but adds a few seconds of startup latency on first run.
+
+```json
+{
+  "mcpServers": {
+    "goal-acceptance": {
+      "command": "npx",
+      "args": ["-y", "@cckyros/goal-acceptance-mcp"],
+      "env": {
+        "PLUGIN_DATA": "/path/to/persistent/data"
+      }
+    }
+  }
+}
+```
+
+> **Windows + nvm users**: If npx fails to start the server, use Method A instead. nvm junctions can cause `import.meta.url` path mismatch in some Node.js versions.
+
+#### Method C: Local install (project-level)
+
+```sh
+npm install @cckyros/goal-acceptance-mcp
+```
+
+```json
+{
+  "mcpServers": {
+    "goal-acceptance": {
       "command": "node",
       "args": ["./node_modules/@cckyros/goal-acceptance-mcp/bin/mcp-server.mjs"],
       "env": {
@@ -166,7 +213,11 @@ Add to your MCP client config:
 }
 ```
 
-Or run standalone:
+#### Devin CLI config
+
+Devin uses `%APPDATA%\devin\mcp_config.json` (Windows) or `~/.config/devin/mcp_config.json` (macOS/Linux). Add the `goal-acceptance` entry to `mcpServers` using any method above, then restart Devin.
+
+#### Standalone usage
 
 ```sh
 # In-memory (resets on restart)
@@ -187,7 +238,32 @@ is not set, state is in-memory only (lost on restart).
 4. **Validate** — `validate_criterion` with `evidence_type=command` for high-confidence evidence
 5. **Check** — `can_complete_goal` to verify all required criteria are formally passed
 
-### Agent Plugin (portable format)
+### OpenClaw native plugin
+
+The `@cckyros/goal-acceptance-openclaw` package is an OpenClaw native plugin that registers all 8 tools directly in-process (no MCP stdio overhead).
+
+```sh
+openclaw plugins install "npm:@cckyros/goal-acceptance-openclaw@rc"
+```
+
+> **Note**: The `@rc` tag is required because the package is in pre-release. Once a stable version is published, the tag can be omitted.
+
+After install, restart the gateway:
+
+```sh
+openclaw gateway restart
+```
+
+Verify:
+
+```sh
+openclaw plugins inspect goal-acceptance
+# Status: loaded, Format: openclaw
+```
+
+The 8 tools are now available in OpenClaw sessions. `Shape: non-capability` is normal for tool plugins — tools are registered via `defineToolPlugin`, not the capability system.
+
+### Agent Plugin (portable bundle format)
 
 The MCP package doubles as an
 [Agent Plugin](https://agent-plugins.org) package. Point any Agent
@@ -326,23 +402,25 @@ class MyDbStore implements GoalAcceptanceStore {
 }
 ```
 
-## Three-Way Compatibility
+## Four-Way Compatibility
 
-| Capability | Cordis plugin | MCP server | Agent Plugin |
-|------------|:---:|:---:|:---:|
-| Model tools | `set/get/validate/update_task/amend` | 8 tools (see [MCP Tools](#mcp-tools)) | same as MCP |
-| System prompt / Skills | `policy:goal-acceptance` | `skills/` | `skills/` |
-| Turn-stopping enforcement | yes (`agent.steer()`, dependency-aware) | no | no |
-| Cross-client portable | no (Harness only) | yes (any MCP client) | yes (any Agent Plugins client) |
-| Persistent state | `dsh-session` log | `$PLUGIN_DATA/acceptance-events.json` | same as MCP |
-| Dual-role validation | no | yes (`role` parameter) | yes |
-| Typed evidence | no | yes (`evidence_type` parameter) | yes |
-| Task decomposition plan | no | yes (`set_task_plan` / `get_task_plan`) | yes |
-| Slim responses | no | yes (`verbose` parameter) | yes |
+| Capability | Cordis plugin | MCP server | Agent Plugin | OpenClaw native |
+|------------|:---:|:---:|:---:|:---:|
+| Model tools | `set/get/validate/update_task/amend` | 8 tools (see [MCP Tools](#mcp-tools)) | same as MCP | same as MCP (in-process) |
+| System prompt / Skills | `policy:goal-acceptance` | `skills/` | `skills/` | `skills/` |
+| Turn-stopping enforcement | yes (`agent.steer()`, dependency-aware) | no | no | no |
+| Cross-client portable | no (Harness only) | yes (any MCP client) | yes (any Agent Plugins client) | no (OpenClaw only) |
+| Persistent state | `dsh-session` log | `$PLUGIN_DATA/acceptance-events.json` | same as MCP | same as MCP |
+| Dual-role validation | no | yes (`role` parameter) | yes | yes |
+| Typed evidence | no | yes (`evidence_type` parameter) | yes | yes |
+| Task decomposition plan | no | yes (`set_task_plan` / `get_task_plan`) | yes | yes |
+| Slim responses | no | yes (`verbose` parameter) | yes | yes |
+| In-process calls (no stdio) | yes | no | no | yes |
 
 The Cordis plugin is the only variant that can **force** the agent to continue
-working when it tries to stop early. The MCP and Agent Plugin variants rely on
-the model voluntarily calling the tools and following skill instructions.
+working when it tries to stop early. The MCP, Agent Plugin, and OpenClaw native
+variants rely on the model voluntarily calling the tools and following skill
+instructions.
 
 ## Repository Layout
 
@@ -369,6 +447,12 @@ packages/
 │   ├── skills/                 # Portable Agent Skills (8 skills)
 │   └── tests/
 │       └── mcp-server.spec.ts  # 22 tests
+├── goal-acceptance-openclaw/   # OpenClaw native plugin
+│   ├── src/
+│   │   └── index.ts            # defineToolPlugin, 8 tools (in-process)
+│   ├── dist/index.js           # Built entry point
+│   ├── openclaw.plugin.json    # OpenClaw plugin manifest
+│   └── skills/                 # Portable Agent Skills (8 skills)
 └── goal-acceptance/            # DeepSeek Harness Cordis plugin
     ├── src/
     │   ├── index.ts            # apply(): service + tools + prompt + dependency-aware steering
