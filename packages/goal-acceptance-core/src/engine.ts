@@ -7,11 +7,17 @@ import { GoalAcceptanceError } from './errors.ts'
 import type { GoalAcceptanceStore } from './store.ts'
 import type {
   AcceptanceSummary,
+  AmendSpec,
   CriterionSpec,
+  CriterionTaskProgress,
   GoalAcceptanceEvent,
   GoalAcceptanceSetEvent,
   GoalAcceptanceValidateEvent,
+  GoalAcceptanceTaskUpdateEvent,
+  GoalAcceptanceAmendEvent,
   GoalCriterion,
+  TaskStatus,
+  TaskUpdateSpec,
   ValidateCriterionSpec,
 } from './types.ts'
 
@@ -20,6 +26,7 @@ interface AcceptanceState {
   order: string[]
   locked: boolean
   observedCount: number
+  taskStatuses: Map<string, TaskStatus>
 }
 
 function initialState(): AcceptanceState {
@@ -28,10 +35,83 @@ function initialState(): AcceptanceState {
     order: [],
     locked: false,
     observedCount: 0,
+    taskStatuses: new Map(),
   }
 }
 
-/** Engine that manages immutable criteria and their validation lifecycle. */
+/** Normalize a CriterionSpec into a stored GoalCriterion. */
+function toCriterion(spec: CriterionSpec, now: number, defaults: { addedAfterLock?: boolean; addedAt?: number }): GoalCriterion {
+  return {
+    id: spec.id.trim(),
+    description: spec.description.trim(),
+    required: spec.required !== false,
+    method: typeof spec.method === 'string' && spec.method.trim().length > 0 ? spec.method.trim() : 'manual',
+    status: 'pending',
+    updatedAt: now,
+    taskIds: Array.isArray(spec.taskIds) ? spec.taskIds.map(t => t.trim()).filter(t => t.length > 0) : [],
+    dependsOn: Array.isArray(spec.dependsOn) ? spec.dependsOn.map(d => d.trim()).filter(d => d.length > 0) : [],
+    ...defaults.addedAfterLock === true ? { addedAfterLock: true, addedAt: defaults.addedAt ?? now } : {},
+  }
+}
+
+/** Validate a list of CriterionSpecs for unique ids and non-empty fields. */
+function validateSpecs(specs: readonly CriterionSpec[], existingIds: Set<string>): void {
+  const seenIds = new Set<string>()
+  for (const spec of specs) {
+    if (typeof spec.id !== 'string' || spec.id.trim().length === 0) {
+      throw new GoalAcceptanceError('each criterion must have a non-empty id', 'GOAL_ACCEPTANCE_INVALID_CRITERIA')
+    }
+    const id = spec.id.trim()
+    if (seenIds.has(id)) {
+      throw new GoalAcceptanceError(`duplicate criterion id "${id}"`, 'GOAL_ACCEPTANCE_INVALID_CRITERIA')
+    }
+    if (existingIds.has(id)) {
+      throw new GoalAcceptanceError(`criterion id "${id}" already exists`, 'GOAL_ACCEPTANCE_DUPLICATE_AMEND_ID')
+    }
+    seenIds.add(id)
+    if (typeof spec.description !== 'string' || spec.description.trim().length === 0) {
+      throw new GoalAcceptanceError(`criterion "${id}" must have a non-empty description`, 'GOAL_ACCEPTANCE_INVALID_CRITERIA')
+    }
+  }
+}
+
+/** Check whether all dependencies of a criterion are 'passed'. */
+function dependenciesMet(criterion: GoalCriterion, criteria: Map<string, GoalCriterion>): boolean {
+  if (criterion.dependsOn.length === 0) return true
+  return criterion.dependsOn.every(depId => {
+    const dep = criteria.get(depId)
+    return dep !== undefined && dep.status === 'passed'
+  })
+}
+
+/** Compute per-criterion task progress from the task status map. */
+function computeTaskProgress(criterion: GoalCriterion, taskStatuses: Map<string, TaskStatus>): CriterionTaskProgress {
+  let completed = 0
+  let inProgress = 0
+  let pending = 0
+  let failed = 0
+  for (const taskId of criterion.taskIds) {
+    const status = taskStatuses.get(taskId) ?? 'pending'
+    switch (status) {
+      case 'completed': completed += 1; break
+      case 'in_progress': inProgress += 1; break
+      case 'pending': pending += 1; break
+      case 'failed': failed += 1; break
+    }
+  }
+  const total = criterion.taskIds.length
+  return {
+    criterionId: criterion.id,
+    totalTasks: total,
+    completedTasks: completed,
+    inProgressTasks: inProgress,
+    pendingTasks: pending,
+    failedTasks: failed,
+    readyToValidate: total > 0 && completed === total,
+  }
+}
+
+/** Engine that manages immutable criteria, task progress, amendments, and their validation lifecycle. */
 export class GoalAcceptanceEngine {
   private readonly state: AcceptanceState = initialState()
 
@@ -43,42 +123,15 @@ export class GoalAcceptanceEngine {
       throw new GoalAcceptanceError('criteria list must be a non-empty array', 'GOAL_ACCEPTANCE_INVALID_CRITERIA')
     }
 
-    if (this.state.locked) {
-      throw new GoalAcceptanceError('acceptance criteria are already locked', 'GOAL_ACCEPTANCE_ALREADY_LOCKED')
-    }
-
     this.sync()
     if (this.state.locked) {
       throw new GoalAcceptanceError('acceptance criteria are already locked', 'GOAL_ACCEPTANCE_ALREADY_LOCKED')
     }
 
+    validateSpecs(specs, new Set())
+
     const now = Date.now()
-    const seenIds = new Set<string>()
-    const criteria: GoalCriterion[] = []
-
-    for (const spec of specs) {
-      if (typeof spec.id !== 'string' || spec.id.trim().length === 0) {
-        throw new GoalAcceptanceError('each criterion must have a non-empty id', 'GOAL_ACCEPTANCE_INVALID_CRITERIA')
-      }
-      const id = spec.id.trim()
-      if (seenIds.has(id)) {
-        throw new GoalAcceptanceError(`duplicate criterion id "${id}"`, 'GOAL_ACCEPTANCE_INVALID_CRITERIA')
-      }
-      seenIds.add(id)
-
-      if (typeof spec.description !== 'string' || spec.description.trim().length === 0) {
-        throw new GoalAcceptanceError(`criterion "${id}" must have a non-empty description`, 'GOAL_ACCEPTANCE_INVALID_CRITERIA')
-      }
-
-      criteria.push({
-        id,
-        description: spec.description.trim(),
-        required: spec.required !== false,
-        method: typeof spec.method === 'string' && spec.method.trim().length > 0 ? spec.method.trim() : 'manual',
-        status: 'pending',
-        updatedAt: now,
-      })
-    }
+    const criteria = specs.map(spec => toCriterion(spec, now, {}))
 
     const event: GoalAcceptanceSetEvent = {
       type: 'goal-acceptance/set',
@@ -90,6 +143,41 @@ export class GoalAcceptanceEngine {
     this.applyEvent(event)
 
     return this.getCriteria()
+  }
+
+  /** Append new criteria after the initial lock. Existing criteria are not modified. */
+  async amendCriteria(spec: AmendSpec): Promise<GoalCriterion[]> {
+    this.sync()
+
+    if (!this.state.locked) {
+      throw new GoalAcceptanceError('cannot amend before criteria are locked', 'GOAL_ACCEPTANCE_NOT_LOCKED')
+    }
+
+    if (typeof spec.reason !== 'string' || spec.reason.trim().length === 0) {
+      throw new GoalAcceptanceError('amend reason is required', 'GOAL_ACCEPTANCE_AMEND_REASON_REQUIRED')
+    }
+
+    if (!Array.isArray(spec.criteria) || spec.criteria.length === 0) {
+      throw new GoalAcceptanceError('amend criteria list must be a non-empty array', 'GOAL_ACCEPTANCE_INVALID_CRITERIA')
+    }
+
+    const existingIds = new Set(this.state.order)
+    validateSpecs(spec.criteria, existingIds)
+
+    const now = Date.now()
+    const addedCriteria = spec.criteria.map(s => toCriterion(s, now, { addedAfterLock: true, addedAt: now }))
+
+    const event: GoalAcceptanceAmendEvent = {
+      type: 'goal-acceptance/amend',
+      addedCriteria,
+      reason: spec.reason.trim(),
+      amendedAt: now,
+    }
+
+    await this.store.append(event)
+    this.applyEvent(event)
+
+    return addedCriteria
   }
 
   /** Record verification status and evidence for one criterion. */
@@ -124,6 +212,22 @@ export class GoalAcceptanceEngine {
     return updated
   }
 
+  /** Update the status of a linked task. The host calls this when its task system changes. */
+  async updateTaskStatus(spec: TaskUpdateSpec): Promise<void> {
+    this.sync()
+
+    const now = Date.now()
+    const event: GoalAcceptanceTaskUpdateEvent = {
+      type: 'goal-acceptance/task-update',
+      taskId: spec.taskId,
+      taskStatus: spec.status,
+      updatedAt: now,
+    }
+
+    await this.store.append(event)
+    this.applyEvent(event)
+  }
+
   /** Get all criteria in declaration order. */
   getCriteria(): GoalCriterion[] {
     this.sync()
@@ -136,7 +240,7 @@ export class GoalAcceptanceEngine {
     return this.state.criteria.get(id)
   }
 
-  /** Compute aggregate summary of criteria validation. */
+  /** Compute aggregate summary of criteria validation with task progress and actionable ordering. */
   summarize(): AcceptanceSummary {
     const list = this.getCriteria()
     const passed: GoalCriterion[] = []
@@ -172,6 +276,39 @@ export class GoalAcceptanceEngine {
       }
     }
 
+    // Per-criterion task progress
+    const criterionTaskProgress: CriterionTaskProgress[] = []
+    let totalTasks = 0
+    let completedTasks = 0
+    let inProgressTasks = 0
+    let pendingTasks = 0
+    let failedTasks = 0
+
+    for (const c of list) {
+      if (c.taskIds.length > 0) {
+        const progress = computeTaskProgress(c, this.state.taskStatuses)
+        criterionTaskProgress.push(progress)
+        totalTasks += progress.totalTasks
+        completedTasks += progress.completedTasks
+        inProgressTasks += progress.inProgressTasks
+        pendingTasks += progress.pendingTasks
+        failedTasks += progress.failedTasks
+      }
+    }
+
+    // readyToValidate: tasks all completed, criterion not yet validated
+    const readyToValidate = list
+      .filter(c => c.taskIds.length > 0 && (c.status === 'pending' || c.status === 'in_progress'))
+      .filter(c => computeTaskProgress(c, this.state.taskStatuses).readyToValidate)
+      .filter(c => dependenciesMet(c, this.state.criteria))
+      .sort((a, b) => topologicalCompare(a, b, this.state.criteria))
+
+    // nextActionable: required, pending/in_progress, dependencies satisfied
+    const nextActionable = list
+      .filter(c => c.required && (c.status === 'pending' || c.status === 'in_progress'))
+      .filter(c => dependenciesMet(c, this.state.criteria))
+      .sort((a, b) => topologicalCompare(a, b, this.state.criteria))
+
     return {
       allRequiredPassed: list.length > 0 ? allRequiredPassed : true,
       totalCount: list.length,
@@ -185,6 +322,16 @@ export class GoalAcceptanceEngine {
       blockers,
       pending,
       notRun,
+      taskProgress: {
+        totalTasks,
+        completedTasks,
+        inProgressTasks,
+        pendingTasks,
+        failedTasks,
+      },
+      criterionTaskProgress,
+      readyToValidate,
+      nextActionable,
     }
   }
 
@@ -234,6 +381,40 @@ export class GoalAcceptanceEngine {
           updatedAt: data.validatedAt,
         })
       }
+    } else if (event.type === 'goal-acceptance/task-update') {
+      const data = event as GoalAcceptanceTaskUpdateEvent
+      this.state.taskStatuses.set(data.taskId, data.taskStatus)
+    } else if (event.type === 'goal-acceptance/amend') {
+      const data = event as GoalAcceptanceAmendEvent
+      for (const criterion of data.addedCriteria) {
+        // Idempotent: skip if already present (sync may replay this event)
+        if (!this.state.criteria.has(criterion.id)) {
+          this.state.criteria.set(criterion.id, criterion)
+          this.state.order.push(criterion.id)
+        }
+      }
     }
   }
+}
+
+/** Compare two criteria for topological ordering: a comes first if b depends on a. */
+function topologicalCompare(a: GoalCriterion, b: GoalCriterion, criteria: Map<string, GoalCriterion>): number {
+  // If b depends on a (directly or transitively), a should come first
+  if (dependsOnTransitive(b, a.id, criteria, new Set())) return -1
+  // If a depends on b (directly or transitively), b should come first
+  if (dependsOnTransitive(a, b.id, criteria, new Set())) return 1
+  // No dependency relationship: stable by declaration order
+  return 0
+}
+
+/** Check if criterion depends on targetId directly or transitively. */
+function dependsOnTransitive(criterion: GoalCriterion, targetId: string, criteria: Map<string, GoalCriterion>, visited: Set<string>): boolean {
+  if (criterion.dependsOn.includes(targetId)) return true
+  for (const depId of criterion.dependsOn) {
+    if (visited.has(depId)) continue
+    visited.add(depId)
+    const dep = criteria.get(depId)
+    if (dep !== undefined && dependsOnTransitive(dep, targetId, criteria, visited)) return true
+  }
+  return false
 }

@@ -8,8 +8,10 @@ import type { Agent } from '@deepseek-ai/dsh-agent'
 import {
   GoalAcceptanceEngine,
   type AcceptanceSummary,
+  type AmendSpec,
   type CriterionSpec,
   type GoalCriterion,
+  type TaskUpdateSpec,
   type ValidateCriterionSpec,
 } from '@deepseek-ai/dsh-goal-acceptance-core'
 import { SessionAcceptanceStore } from './store.ts'
@@ -50,10 +52,24 @@ export class GoalAcceptanceService extends Service {
   }
 
   /**
+   * Append new criteria after the initial lock.
+   */
+  amendCriteria(agent: Agent, spec: AmendSpec): Promise<GoalCriterion[]> {
+    return this.getEngine(agent).amendCriteria(spec)
+  }
+
+  /**
    * Record verification status and evidence for one criterion.
    */
   validateCriterion(agent: Agent, spec: ValidateCriterionSpec): Promise<GoalCriterion> {
     return this.getEngine(agent).validateCriterion(spec)
+  }
+
+  /**
+   * Update the status of a linked task.
+   */
+  updateTaskStatus(agent: Agent, spec: TaskUpdateSpec): Promise<void> {
+    return this.getEngine(agent).updateTaskStatus(spec)
   }
 
   /**

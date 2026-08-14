@@ -5,8 +5,9 @@ English | [中文](README.zh-CN.md)
 Acceptance-criteria-driven goal completion for autonomous AI agents.
 
 Prevents agents from prematurely declaring "done" by locking immutable acceptance
-criteria before work begins, tracking validation status with evidence, and
-enforcing completion checks.
+criteria before work begins, tracking validation status with evidence, linking
+criteria to task progress, respecting dependency ordering, and enforcing
+completion checks.
 
 ## Why?
 
@@ -63,9 +64,17 @@ const engine = new GoalAcceptanceEngine(new InMemoryAcceptanceStore())
 
 // Lock criteria before work begins
 await engine.setCriteria([
-  { id: 'api-200', description: 'GET /health returns 200', required: true, method: 'test' },
-  { id: 'docs', description: 'README updated', required: false, method: 'manual' },
+  { id: 'api-200', description: 'GET /health returns 200', required: true, method: 'test', taskIds: ['task-1', 'task-2'] },
+  { id: 'docs', description: 'README updated', required: false, method: 'manual', dependsOn: ['api-200'] },
 ])
+
+// Update task progress as work proceeds
+await engine.updateTaskStatus({ taskId: 'task-1', status: 'completed' })
+await engine.updateTaskStatus({ taskId: 'task-2', status: 'completed' })
+
+// When all linked tasks are done, the criterion is "ready to validate"
+const summary = engine.summarize()
+console.log(summary.readyToValidate.map(c => c.id)) // → ['api-200']
 
 // Record validation with evidence
 await engine.validateCriterion({
@@ -144,18 +153,20 @@ plugins:
 ```
 
 The plugin:
-- Registers 3 model tools (`set/get/validate_acceptance_criteria`)
-- Injects a `policy:goal-acceptance` system prompt section
-- Intercepts `agent/turn-stopping` and steers the agent back when required
-  criteria are still pending
+- Registers 5 model tools (`set/get/validate_acceptance_criteria`, `update_task_status`, `amend_acceptance_criteria`)
+- Injects a `policy:goal-acceptance` system prompt section with task progress and next-actionable ordering
+- Intercepts `agent/turn-stopping` and steers the agent back with dependency-aware
+  priority ordering when required criteria are still pending
 
 ## MCP Tools
 
 | Tool | Description |
 |------|-------------|
-| `set_acceptance_criteria` | Lock the criteria list. Must be called before implementation. |
-| `get_acceptance_criteria` | Read current criteria and summary. |
+| `set_acceptance_criteria` | Lock the criteria list. Each criterion may link to task IDs and declare dependencies. Must be called before implementation. |
+| `get_acceptance_criteria` | Read current criteria, task progress, summary, ready-to-validate list, and next-actionable ordering. |
 | `validate_criterion` | Record status (`pending`/`in_progress`/`passed`/`failed`/`blocked`/`not_run`) and evidence. `passed` and `failed` require evidence. |
+| `update_task_status` | Update a linked task's status (`pending`/`in_progress`/`completed`/`failed`). When all tasks linked to a criterion are completed, it becomes ready to validate. |
+| `amend_acceptance_criteria` | Append new criteria after the initial lock. Requires a reason. Existing criteria are not modified. |
 | `can_complete_goal` | Check whether all required criteria are passed. |
 
 ## Criterion Status Lifecycle
@@ -203,6 +214,8 @@ The engine is event-sourced. The store holds an append-only list of:
 
 - `goal-acceptance/set` — locks the criteria list
 - `goal-acceptance/validate` — updates one criterion's status
+- `goal-acceptance/task-update` — updates a linked task's status
+- `goal-acceptance/amend` — appends new criteria after the initial lock
 
 On every read, the engine replays events from the store. This enables:
 
@@ -232,9 +245,9 @@ class MyDbStore implements GoalAcceptanceStore {
 
 | Capability | Cordis plugin | MCP server | Agent Plugin |
 |------------|:---:|:---:|:---:|
-| Model tools | `set/get/validate` | `set/get/validate/can_complete` | same as MCP |
+| Model tools | `set/get/validate/update_task/amend` | `set/get/validate/update_task/amend/can_complete` | same as MCP |
 | System prompt / Skills | `policy:goal-acceptance` | `skills/` | `skills/` |
-| Turn-stopping enforcement | yes (`agent.steer()`) | no | no |
+| Turn-stopping enforcement | yes (`agent.steer()`, dependency-aware) | no | no |
 | Cross-client portable | no (Harness only) | yes (any MCP client) | yes (any Agent Plugins client) |
 | Persistent state | `dsh-session` log | `$PLUGIN_DATA/acceptance-events.json` | same as MCP |
 
@@ -248,17 +261,17 @@ the model voluntarily calling the tools and following skill instructions.
 packages/
 ├── goal-acceptance-core/       # Zero-dependency state machine
 │   ├── src/
-│   │   ├── engine.ts           # GoalAcceptanceEngine
+│   │   ├── engine.ts           # GoalAcceptanceEngine (criteria + tasks + deps + amend)
 │   │   ├── store.ts            # GoalAcceptanceStore + InMemoryAcceptanceStore
-│   │   ├── types.ts            # GoalCriterion, AcceptanceSummary, events
+│   │   ├── types.ts            # GoalCriterion, AcceptanceSummary, events, task types
 │   │   ├── errors.ts           # GoalAcceptanceError
 │   │   └── index.ts            # Public exports
 │   └── tests/
-│       ├── engine.spec.ts      # 11 tests
+│       ├── engine.spec.ts      # 27 tests
 │       └── standalone.spec.ts  # 1 test
 ├── goal-acceptance-mcp/        # MCP server + Agent Plugin
 │   ├── src/
-│   │   ├── mcp-server.ts       # stdio MCP server, 4 tools
+│   │   ├── mcp-server.ts       # stdio MCP server, 6 tools
 │   │   ├── store.ts            # FileAcceptanceStore
 │   │   └── index.ts
 │   ├── bin/mcp-server.mjs      # Built stdio entry point
@@ -266,14 +279,14 @@ packages/
 │   ├── mcp.json                # MCP server config
 │   ├── skills/                 # Portable Agent Skills
 │   └── tests/
-│       └── mcp-server.spec.ts  # 3 tests
+│       └── mcp-server.spec.ts  # 6 tests
 └── goal-acceptance/            # DeepSeek Harness Cordis plugin
     ├── src/
-    │   ├── index.ts            # apply(): service + tools + prompt + turn-stopping
+    │   ├── index.ts            # apply(): service + tools + prompt + dependency-aware steering
     │   ├── service.ts          # GoalAcceptanceService (per-agent engine)
     │   ├── store.ts            # SessionAcceptanceStore (dsh-session adapter)
-    │   ├── tools.ts            # 3 model tools
-    │   ├── prompt.ts           # System prompt section
+    │   ├── tools.ts            # 5 model tools
+    │   ├── prompt.ts           # System prompt section with task progress
     │   ├── types.ts            # SessionEventMap declarations
     │   └── invariant.ts        # Runtime invariant
     └── tests/

@@ -1,11 +1,11 @@
 /**
- * Model-facing tools for setting, reading, and validating acceptance criteria.
+ * Model-facing tools for setting, reading, validating, and amending acceptance criteria.
  * @module @deepseek-ai/dsh-goal-acceptance/tools
  */
 
 import type { Context } from '@deepseek-ai/cordis'
 import { defineTool, type GenericCallView, type ToolDefinition } from '@deepseek-ai/dsh-tools'
-import type { GoalCriterionStatus } from './types.ts'
+import type { GoalCriterionStatus, TaskStatus } from './types.ts'
 
 const STATUSES: GoalCriterionStatus[] = [
   'pending',
@@ -14,6 +14,13 @@ const STATUSES: GoalCriterionStatus[] = [
   'failed',
   'blocked',
   'not_run',
+]
+
+const TASK_STATUSES: TaskStatus[] = [
+  'pending',
+  'in_progress',
+  'completed',
+  'failed',
 ]
 
 function present(title: string, kind: 'read' | 'other', rawInput?: unknown): GenericCallView {
@@ -28,6 +35,16 @@ const CRITERION_ITEM_SCHEMA = {
     description: { type: 'string', required: true, description: 'Concrete requirement description.' },
     required: { type: 'boolean', description: 'Whether required for goal completion. Defaults to true.' },
     method: { type: 'string', description: 'Verification method: "test", "command", "browser", "manual".' },
+    task_ids: {
+      type: 'array',
+      items: { type: 'string' },
+      description: 'Task IDs linked to this criterion. When all linked tasks are completed, the criterion is ready to validate.',
+    },
+    depends_on: {
+      type: 'array',
+      items: { type: 'string' },
+      description: 'IDs of criteria that must be passed before this criterion should be validated. Affects steering priority.',
+    },
   },
 } as const
 
@@ -40,7 +57,7 @@ const OUTPUT_OBJECT_SCHEMA = {
 export function createAcceptanceTools(ctx: Context): ToolDefinition[] {
   const getTool = defineTool({
     name: 'get_acceptance_criteria',
-    description: 'Read the current Goal acceptance criteria, individual statuses, evidence, and evaluation summary.',
+    description: 'Read the current Goal acceptance criteria, individual statuses, evidence, task progress, and evaluation summary.',
     parameters: {},
     output: {
       schema: OUTPUT_OBJECT_SCHEMA,
@@ -63,12 +80,12 @@ export function createAcceptanceTools(ctx: Context): ToolDefinition[] {
 
   const setTool = defineTool({
     name: 'set_acceptance_criteria',
-    description: 'Set and lock the initial acceptance criteria for the current Goal. Must be called after user confirmation and before implementation.',
+    description: 'Set and lock the initial acceptance criteria for the current Goal. Must be called after user confirmation and before implementation. Each criterion may link to task IDs and declare dependencies on other criteria.',
     parameters: {
       criteria: {
         type: 'array',
         required: true,
-        description: 'Array of criteria definitions with id, description, required flag, and verification method.',
+        description: 'Array of criteria definitions with id, description, required flag, verification method, optional task IDs, and optional dependencies.',
         items: CRITERION_ITEM_SCHEMA,
       },
     },
@@ -81,8 +98,15 @@ export function createAcceptanceTools(ctx: Context): ToolDefinition[] {
       if (agent === undefined) throw new Error('acceptance tools require a calling agent')
       const service = ctx.get('goalAcceptance')
       if (service === undefined) throw new Error('goalAcceptance service is not mounted')
-      const rawCriteria = args.criteria as Array<{ id: string; description: string; required?: boolean; method?: string }>
-      return service.setCriteria(agent, rawCriteria).then(criteria => ({
+      const rawCriteria = args.criteria as Array<{ id: string; description: string; required?: boolean; method?: string; task_ids?: string[]; depends_on?: string[] }>
+      return service.setCriteria(agent, rawCriteria.map(c => ({
+        id: c.id,
+        description: c.description,
+        ...c.required !== undefined ? { required: c.required } : {},
+        ...c.method !== undefined ? { method: c.method } : {},
+        ...c.task_ids !== undefined ? { taskIds: c.task_ids } : {},
+        ...c.depends_on !== undefined ? { dependsOn: c.depends_on } : {},
+      }))).then(criteria => ({
         criteria,
         summary: service.summarize(agent),
       })) as never
@@ -131,5 +155,86 @@ export function createAcceptanceTools(ctx: Context): ToolDefinition[] {
     presentCall: args => present(`Validate criterion "${String(args.criterion_id)}"`, 'other', args),
   })
 
-  return [getTool, setTool, validateTool]
+  const updateTaskTool = defineTool({
+    name: 'update_task_status',
+    description: 'Update the status of a task linked to one or more acceptance criteria. When all tasks linked to a criterion are completed, that criterion becomes ready to validate.',
+    parameters: {
+      task_id: {
+        type: 'string',
+        required: true,
+        description: 'The task ID to update.',
+      },
+      status: {
+        type: 'string',
+        required: true,
+        enum: TASK_STATUSES,
+        description: 'New task status: pending | in_progress | completed | failed',
+      },
+    },
+    output: {
+      schema: OUTPUT_OBJECT_SCHEMA,
+      render: (_args: unknown, value: unknown) => [{ type: 'text' as const, text: JSON.stringify(value, null, 2) }],
+    },
+    execute(args, exec) {
+      const agent = exec.agent
+      if (agent === undefined) throw new Error('acceptance tools require a calling agent')
+      const service = ctx.get('goalAcceptance')
+      if (service === undefined) throw new Error('goalAcceptance service is not mounted')
+      return service.updateTaskStatus(agent, {
+        taskId: args.task_id as string,
+        status: args.status as TaskStatus,
+      }).then(() => ({
+        taskId: args.task_id,
+        status: args.status,
+        summary: service.summarize(agent),
+      })) as never
+    },
+    presentCall: args => present(`Update task "${String(args.task_id)}" → ${String(args.status)}`, 'other', args),
+  })
+
+  const amendTool = defineTool({
+    name: 'amend_acceptance_criteria',
+    description: 'Append new acceptance criteria after the initial lock. Existing criteria are not modified. Use when requirements expand during execution.',
+    parameters: {
+      criteria: {
+        type: 'array',
+        required: true,
+        description: 'New criteria to append. Each must have a unique id not already present.',
+        items: CRITERION_ITEM_SCHEMA,
+      },
+      reason: {
+        type: 'string',
+        required: true,
+        description: 'Human-readable reason for the amendment (recorded in audit trail).',
+      },
+    },
+    output: {
+      schema: OUTPUT_OBJECT_SCHEMA,
+      render: (_args: unknown, value: unknown) => [{ type: 'text' as const, text: JSON.stringify(value, null, 2) }],
+    },
+    execute(args, exec) {
+      const agent = exec.agent
+      if (agent === undefined) throw new Error('acceptance tools require a calling agent')
+      const service = ctx.get('goalAcceptance')
+      if (service === undefined) throw new Error('goalAcceptance service is not mounted')
+      const rawCriteria = args.criteria as Array<{ id: string; description: string; required?: boolean; method?: string; task_ids?: string[]; depends_on?: string[] }>
+      return service.amendCriteria(agent, {
+        criteria: rawCriteria.map(c => ({
+          id: c.id,
+          description: c.description,
+          ...c.required !== undefined ? { required: c.required } : {},
+          ...c.method !== undefined ? { method: c.method } : {},
+          ...c.task_ids !== undefined ? { taskIds: c.task_ids } : {},
+          ...c.depends_on !== undefined ? { dependsOn: c.depends_on } : {},
+        })),
+        reason: args.reason as string,
+      }).then(added => ({
+        addedCriteria: added,
+        summary: service.summarize(agent),
+      })) as never
+    },
+    presentCall: args => present('Amend acceptance criteria', 'other', args),
+  })
+
+  return [getTool, setTool, validateTool, updateTaskTool, amendTool]
 }
