@@ -1,3 +1,4 @@
+import { realpathSync } from 'node:fs'
 import { mkdir } from 'node:fs/promises'
 import { dirname } from 'node:path'
 import { pathToFileURL } from 'node:url'
@@ -81,7 +82,7 @@ export function createMcpServer(): Server {
   const server = new Server(
     {
       name: '@cckyros/goal-acceptance-mcp',
-      version: '0.1.0-rc.6',
+      version: '0.1.0-rc.10',
     },
     {
       capabilities: {
@@ -358,8 +359,28 @@ export async function main(): Promise<void> {
   const server = createMcpServer()
   const transport = new StdioServerTransport()
   await server.connect(transport)
+
+  // Keep the process alive until stdin closes. Without this, Node.js may exit
+  // immediately after connect() resolves when launched via npx or other wrappers
+  // that don't hold the stdin pipe write end open.
+  const keepAlive = setInterval(() => {}, 1 << 30)
+  process.stdin.on('close', () => clearInterval(keepAlive))
 }
 
-if (import.meta.url === pathToFileURL(process.argv[1]!).href) {
+// Auto-start when run directly. Use realpath to handle symlinks/junctions
+// (e.g. nvm4w on Windows) where import.meta.url and process.argv[1] resolve
+// to different paths for the same file.
+function isMainEntry(): boolean {
+  try {
+    const argv1 = process.argv[1]
+    if (!argv1) return false
+    const realArgv = realpathSync(argv1)
+    return import.meta.url === pathToFileURL(realArgv).href
+  } catch {
+    return false
+  }
+}
+
+if (isMainEntry()) {
   void main()
 }

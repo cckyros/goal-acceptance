@@ -1,3 +1,4 @@
+import { existsSync, readFileSync, realpathSync } from "node:fs";
 import { mkdir, readFile, writeFile } from "node:fs/promises";
 import { dirname } from "node:path";
 import { pathToFileURL } from "node:url";
@@ -6,7 +7,6 @@ import { Server } from "@modelcontextprotocol/sdk/server/index.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { CallToolRequestSchema, ListToolsRequestSchema } from "@modelcontextprotocol/sdk/types.js";
 import { GoalAcceptanceEngine, InMemoryAcceptanceStore } from "@cckyros/goal-acceptance-core";
-import { existsSync, readFileSync } from "node:fs";
 //#region lib/types/store.js
 /** File-backed event store using a JSON file. */
 var FileAcceptanceStore = class {
@@ -118,7 +118,7 @@ function createMcpServer() {
 	const engine = new GoalAcceptanceEngine(resolveStore());
 	const server = new Server({
 		name: "@cckyros/goal-acceptance-mcp",
-		version: "0.1.0-rc.6"
+		version: "0.1.0-rc.10"
 	}, { capabilities: { tools: {} } });
 	server.setRequestHandler(ListToolsRequestSchema, async () => ({ tools: [
 		{
@@ -430,7 +430,19 @@ async function main() {
 	const server = createMcpServer();
 	const transport = new StdioServerTransport();
 	await server.connect(transport);
+	const keepAlive = setInterval(() => {}, 1 << 30);
+	process.stdin.on("close", () => clearInterval(keepAlive));
 }
-if (import.meta.url === pathToFileURL(process.argv[1]).href) main();
+function isMainEntry() {
+	try {
+		const argv1 = process.argv[1];
+		if (!argv1) return false;
+		const realArgv = realpathSync(argv1);
+		return import.meta.url === pathToFileURL(realArgv).href;
+	} catch {
+		return false;
+	}
+}
+if (isMainEntry()) main();
 //#endregion
 export { createMcpServer, main };
