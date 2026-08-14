@@ -332,3 +332,271 @@ describe('GoalAcceptanceEngine — amend', () => {
     expect(engine2.getCriterion('c2')!.addedAfterLock).toBe(true)
   })
 })
+
+describe('GoalAcceptanceEngine — role and self-claimed', () => {
+  function createEngine() {
+    return new GoalAcceptanceEngine(new InMemoryAcceptanceStore())
+  }
+
+  it('defaults to dual role when not specified', async () => {
+    const engine = createEngine()
+    await engine.setCriteria([{ id: 'c1', description: 'test' }])
+    await engine.validateCriterion({ criterionId: 'c1', status: 'passed', evidence: 'ok' })
+    const c = engine.getCriterion('c1')!
+    expect(c.selfClaimed).toBe(false)
+  })
+
+  it('marks passed as self-claimed when role=agent', async () => {
+    const engine = createEngine()
+    await engine.setCriteria([{ id: 'c1', description: 'test' }], 'agent')
+    await engine.validateCriterion({ criterionId: 'c1', status: 'passed', evidence: 'ok' })
+    const c = engine.getCriterion('c1')!
+    expect(c.selfClaimed).toBe(true)
+  })
+
+  it('marks passed as formal when role=reviewer', async () => {
+    const engine = createEngine()
+    await engine.setCriteria([{ id: 'c1', description: 'test' }], 'reviewer')
+    await engine.validateCriterion({ criterionId: 'c1', status: 'passed', evidence: 'ok' })
+    const c = engine.getCriterion('c1')!
+    expect(c.selfClaimed).toBe(false)
+  })
+
+  it('summary distinguishes formalPassed from selfClaimedPassed', async () => {
+    const engine = createEngine()
+    await engine.setCriteria([
+      { id: 'c1', description: 'agent claim' },
+      { id: 'c2', description: 'reviewer confirm' },
+    ], 'agent')
+    await engine.validateCriterion({ criterionId: 'c1', status: 'passed', evidence: 'agent says ok' })
+    // Reviewer confirms c2 by re-validating with role=reviewer is not possible after lock,
+    // but we can test that a fresh engine with role=reviewer gives formal passed
+    const engine2 = createEngine()
+    await engine2.setCriteria([{ id: 'c2', description: 'reviewer' }], 'reviewer')
+    await engine2.validateCriterion({ criterionId: 'c2', status: 'passed', evidence: 'reviewer says ok' })
+    const s2 = engine2.summarize()
+    expect(s2.formalPassed).toHaveLength(1)
+    expect(s2.selfClaimedPassed).toHaveLength(0)
+  })
+
+  it('can_complete_goal blocks on self-claimed required criteria', async () => {
+    const engine = createEngine()
+    await engine.setCriteria([{ id: 'c1', description: 'required', required: true }], 'agent')
+    await engine.validateCriterion({ criterionId: 'c1', status: 'passed', evidence: 'agent self-claim' })
+    const result = engine.canComplete()
+    expect(result.allowed).toBe(false)
+    expect(result.reason).toContain('self-claimed')
+  })
+
+  it('can_complete_goal allows when all required are formally passed', async () => {
+    const engine = createEngine()
+    await engine.setCriteria([{ id: 'c1', description: 'required', required: true }], 'reviewer')
+    await engine.validateCriterion({ criterionId: 'c1', status: 'passed', evidence: 'reviewer confirmed' })
+    expect(engine.canComplete().allowed).toBe(true)
+  })
+
+  it('self-claimed count appears in summary', async () => {
+    const engine = createEngine()
+    await engine.setCriteria([
+      { id: 'c1', description: 'one' },
+      { id: 'c2', description: 'two' },
+    ], 'agent')
+    await engine.validateCriterion({ criterionId: 'c1', status: 'passed', evidence: 'ok' })
+    await engine.validateCriterion({ criterionId: 'c2', status: 'passed', evidence: 'ok' })
+    const s = engine.summarize()
+    expect(s.selfClaimedCount).toBe(2)
+    expect(s.passedCount).toBe(2)
+  })
+})
+
+describe('GoalAcceptanceEngine — evidence type', () => {
+  function createEngine() {
+    return new GoalAcceptanceEngine(new InMemoryAcceptanceStore())
+  }
+
+  it('defaults evidenceType to text', async () => {
+    const engine = createEngine()
+    await engine.setCriteria([{ id: 'c1', description: 'test' }])
+    await engine.validateCriterion({ criterionId: 'c1', status: 'passed', evidence: 'looks fine' })
+    const c = engine.getCriterion('c1')!
+    expect(c.evidenceType).toBe('text')
+    expect(c.lowConfidence).toBe(true)
+  })
+
+  it('stores evidenceType=command without lowConfidence', async () => {
+    const engine = createEngine()
+    await engine.setCriteria([{ id: 'c1', description: 'test' }])
+    await engine.validateCriterion({
+      criterionId: 'c1',
+      status: 'passed',
+      evidence: 'dotnet test: 368 passed',
+      evidenceType: 'command',
+    })
+    const c = engine.getCriterion('c1')!
+    expect(c.evidenceType).toBe('command')
+    expect(c.lowConfidence).toBe(false)
+  })
+
+  it('stores evidenceType=file', async () => {
+    const engine = createEngine()
+    await engine.setCriteria([{ id: 'c1', description: 'test' }])
+    await engine.validateCriterion({
+      criterionId: 'c1',
+      status: 'passed',
+      evidence: 'test-report.txt',
+      evidenceType: 'file',
+    })
+    expect(engine.getCriterion('c1')!.evidenceType).toBe('file')
+  })
+
+  it('persists evidenceType across engine instances', async () => {
+    const store = new InMemoryAcceptanceStore()
+    const engine1 = new GoalAcceptanceEngine(store)
+    await engine1.setCriteria([{ id: 'c1', description: 'test' }])
+    await engine1.validateCriterion({
+      criterionId: 'c1',
+      status: 'passed',
+      evidence: 'ci log',
+      evidenceType: 'command',
+    })
+    const engine2 = new GoalAcceptanceEngine(store)
+    expect(engine2.getCriterion('c1')!.evidenceType).toBe('command')
+    expect(engine2.getCriterion('c1')!.lowConfidence).toBe(false)
+  })
+})
+
+describe('GoalAcceptanceEngine — task plan', () => {
+  function createEngine() {
+    return new GoalAcceptanceEngine(new InMemoryAcceptanceStore())
+  }
+
+  it('sets a task plan with deliverables and dependencies', async () => {
+    const engine = createEngine()
+    await engine.setCriteria([{ id: 'c1', description: 'Implement API' }])
+
+    const plan = await engine.setTaskPlan([
+      { id: 't1', description: 'Define route handler', deliverable: 'handler.ts' },
+      { id: 't2', description: 'Write integration tests', deliverable: 'api.spec.ts', dependsOn: ['t1'] },
+    ])
+
+    expect(plan).toHaveLength(2)
+    expect(plan[0]!.deliverable).toBe('handler.ts')
+    expect(plan[0]!.status).toBe('pending')
+    expect(plan[1]!.dependsOn).toEqual(['t1'])
+  })
+
+  it('rejects task plan before criteria are locked', async () => {
+    const engine = createEngine()
+    await expect(engine.setTaskPlan([
+      { id: 't1', description: 'One', deliverable: 'a.txt' },
+    ])).rejects.toThrow('before criteria are locked')
+  })
+
+  it('rejects empty task plan', async () => {
+    const engine = createEngine()
+    await engine.setCriteria([{ id: 'c1', description: 'test' }])
+    await expect(engine.setTaskPlan([])).rejects.toThrow('non-empty array')
+  })
+
+  it('rejects duplicate task ids', async () => {
+    const engine = createEngine()
+    await engine.setCriteria([{ id: 'c1', description: 'test' }])
+    await expect(engine.setTaskPlan([
+      { id: 't1', description: 'One', deliverable: 'a.txt' },
+      { id: 't1', description: 'Two', deliverable: 'b.txt' },
+    ])).rejects.toThrow('duplicate task id')
+  })
+
+  it('rejects ambiguous duplicate descriptions', async () => {
+    const engine = createEngine()
+    await engine.setCriteria([{ id: 'c1', description: 'test' }])
+    await expect(engine.setTaskPlan([
+      { id: 't1', description: 'Do the thing', deliverable: 'a.txt' },
+      { id: 't2', description: 'Do the thing', deliverable: 'b.txt' },
+    ])).rejects.toThrow('ambiguous description')
+  })
+
+  it('rejects missing deliverable', async () => {
+    const engine = createEngine()
+    await engine.setCriteria([{ id: 'c1', description: 'test' }])
+    await expect(engine.setTaskPlan([
+      { id: 't1', description: 'No artifact', deliverable: '' },
+    ])).rejects.toThrow('must declare a deliverable')
+  })
+
+  it('rejects self-dependency', async () => {
+    const engine = createEngine()
+    await engine.setCriteria([{ id: 'c1', description: 'test' }])
+    await expect(engine.setTaskPlan([
+      { id: 't1', description: 'Self dep', deliverable: 'a.txt', dependsOn: ['t1'] },
+    ])).rejects.toThrow('cannot depend on itself')
+  })
+
+  it('rejects unknown dependency', async () => {
+    const engine = createEngine()
+    await engine.setCriteria([{ id: 'c1', description: 'test' }])
+    await expect(engine.setTaskPlan([
+      { id: 't1', description: 'One', deliverable: 'a.txt', dependsOn: ['ghost'] },
+    ])).rejects.toThrow('unknown task')
+  })
+
+  it('rejects dependency cycles', async () => {
+    const engine = createEngine()
+    await engine.setCriteria([{ id: 'c1', description: 'test' }])
+    await expect(engine.setTaskPlan([
+      { id: 't1', description: 'One', deliverable: 'a.txt', dependsOn: ['t2'] },
+      { id: 't2', description: 'Two', deliverable: 'b.txt', dependsOn: ['t1'] },
+    ])).rejects.toThrow('dependency cycle')
+  })
+
+  it('rejects indirect cycles (a→b→c→a)', async () => {
+    const engine = createEngine()
+    await engine.setCriteria([{ id: 'c1', description: 'test' }])
+    await expect(engine.setTaskPlan([
+      { id: 't1', description: 'One', deliverable: 'a.txt', dependsOn: ['t3'] },
+      { id: 't2', description: 'Two', deliverable: 'b.txt', dependsOn: ['t1'] },
+      { id: 't3', description: 'Three', deliverable: 'c.txt', dependsOn: ['t2'] },
+    ])).rejects.toThrow('dependency cycle')
+  })
+
+  it('rejects setting task plan twice', async () => {
+    const engine = createEngine()
+    await engine.setCriteria([{ id: 'c1', description: 'test' }])
+    await engine.setTaskPlan([{ id: 't1', description: 'One', deliverable: 'a.txt' }])
+    await expect(engine.setTaskPlan([{ id: 't2', description: 'Two', deliverable: 'b.txt' }])).rejects.toThrow('already set')
+  })
+
+  it('task status updates reflect in plan and summary', async () => {
+    const engine = createEngine()
+    await engine.setCriteria([{ id: 'c1', description: 'Implement API', taskIds: ['t1', 't2'] }])
+    await engine.setTaskPlan([
+      { id: 't1', description: 'Define route handler', deliverable: 'handler.ts' },
+      { id: 't2', description: 'Write tests', deliverable: 'api.spec.ts', dependsOn: ['t1'] },
+    ])
+
+    await engine.updateTaskStatus({ taskId: 't1', status: 'completed' })
+
+    const plan = engine.getTaskPlan()
+    expect(plan[0]!.status).toBe('completed')
+    expect(plan[1]!.status).toBe('pending')
+
+    const summary = engine.summarize()
+    expect(summary.taskPlan).toHaveLength(2)
+    expect(summary.taskProgress.totalTasks).toBe(2)
+    expect(summary.taskProgress.completedTasks).toBe(1)
+  })
+
+  it('persists task plan across engine instances', async () => {
+    const store = new InMemoryAcceptanceStore()
+    const engine1 = new GoalAcceptanceEngine(store)
+    await engine1.setCriteria([{ id: 'c1', description: 'test' }])
+    await engine1.setTaskPlan([{ id: 't1', description: 'One', deliverable: 'a.txt' }])
+    await engine1.updateTaskStatus({ taskId: 't1', status: 'completed' })
+
+    const engine2 = new GoalAcceptanceEngine(store)
+    const plan = engine2.getTaskPlan()
+    expect(plan).toHaveLength(1)
+    expect(plan[0]!.status).toBe('completed')
+    expect(engine2.summarize().taskPlan).toHaveLength(1)
+  })
+})

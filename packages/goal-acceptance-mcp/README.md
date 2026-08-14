@@ -28,7 +28,8 @@ The client will:
 - Discover the `skills/*`.
 - Start the stdio MCP server defined in `mcp.json`.
 - Surface the tools `set_acceptance_criteria`, `get_acceptance_criteria`,
-  `validate_criterion`, and `can_complete_goal`.
+  `set_task_plan`, `get_task_plan`, `validate_criterion`, `update_task_status`,
+  `amend_acceptance_criteria`, and `can_complete_goal`.
 
 ## Usage as a standalone MCP server
 
@@ -46,10 +47,14 @@ The server writes `acceptance-events.json` under `$PLUGIN_DATA`.
 
 ## Tools
 
-- `set_acceptance_criteria` — lock the criteria list.
-- `get_acceptance_criteria` — read current criteria and summary.
-- `validate_criterion` — record status and evidence.
-- `can_complete_goal` — check whether all required criteria passed.
+- `set_acceptance_criteria` — lock the criteria list. Optional `role` parameter (`agent`/`reviewer`/`dual`).
+- `get_acceptance_criteria` — read current criteria, task progress, task plan, and summary. Optional `verbose` (default `true`).
+- `set_task_plan` — set and lock the task decomposition plan. Each task needs id, description, deliverable. Dependency cycles rejected.
+- `get_task_plan` — read the task decomposition plan with live task statuses.
+- `validate_criterion` — record status and evidence for one criterion. Optional `evidence_type` (`command`/`file`/`url`/`text`). Optional `verbose` (default `false`).
+- `update_task_status` — update a linked task's status. Optional `verbose` (default `false`).
+- `amend_acceptance_criteria` — append new criteria after the initial lock (requires a reason).
+- `can_complete_goal` — check whether all required criteria are formally passed (self-claimed does not count).
 
 ## DeepSeek Harness
 

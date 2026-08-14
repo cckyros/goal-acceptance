@@ -10,12 +10,17 @@ import type {
   AmendSpec,
   CriterionSpec,
   CriterionTaskProgress,
+  EvidenceType,
   GoalAcceptanceEvent,
   GoalAcceptanceSetEvent,
   GoalAcceptanceValidateEvent,
   GoalAcceptanceTaskUpdateEvent,
   GoalAcceptanceAmendEvent,
+  GoalAcceptanceTaskPlanEvent,
   GoalCriterion,
+  GoalRole,
+  GoalTask,
+  TaskPlanSpec,
   TaskStatus,
   TaskUpdateSpec,
   ValidateCriterionSpec,
@@ -27,6 +32,10 @@ interface AcceptanceState {
   locked: boolean
   observedCount: number
   taskStatuses: Map<string, TaskStatus>
+  role: GoalRole
+  taskPlan: Map<string, GoalTask>
+  taskPlanOrder: string[]
+  taskPlanLocked: boolean
 }
 
 function initialState(): AcceptanceState {
@@ -36,6 +45,10 @@ function initialState(): AcceptanceState {
     locked: false,
     observedCount: 0,
     taskStatuses: new Map(),
+    role: 'dual',
+    taskPlan: new Map(),
+    taskPlanOrder: [],
+    taskPlanLocked: false,
   }
 }
 
@@ -71,6 +84,83 @@ function validateSpecs(specs: readonly CriterionSpec[], existingIds: Set<string>
     seenIds.add(id)
     if (typeof spec.description !== 'string' || spec.description.trim().length === 0) {
       throw new GoalAcceptanceError(`criterion "${id}" must have a non-empty description`, 'GOAL_ACCEPTANCE_INVALID_CRITERIA')
+    }
+  }
+}
+
+/** Validate a task plan for atomicity: unique ids, unambiguous descriptions, deliverables, valid deps, no cycles. */
+function validateTaskPlan(specs: readonly TaskPlanSpec[]): void {
+  if (!Array.isArray(specs) || specs.length === 0) {
+    throw new GoalAcceptanceError('task plan must be a non-empty array', 'GOAL_ACCEPTANCE_INVALID_TASK_PLAN')
+  }
+  const ids = new Set<string>()
+  const descriptions = new Set<string>()
+  for (const spec of specs) {
+    if (typeof spec.id !== 'string' || spec.id.trim().length === 0) {
+      throw new GoalAcceptanceError('each task must have a non-empty id', 'GOAL_ACCEPTANCE_INVALID_TASK_PLAN')
+    }
+    const id = spec.id.trim()
+    if (ids.has(id)) {
+      throw new GoalAcceptanceError(`duplicate task id "${id}"`, 'GOAL_ACCEPTANCE_INVALID_TASK_PLAN')
+    }
+    ids.add(id)
+    if (typeof spec.description !== 'string' || spec.description.trim().length === 0) {
+      throw new GoalAcceptanceError(`task "${id}" must have a non-empty description`, 'GOAL_ACCEPTANCE_INVALID_TASK_PLAN')
+    }
+    const description = spec.description.trim()
+    if (descriptions.has(description)) {
+      throw new GoalAcceptanceError(`task "${id}" has an ambiguous description (duplicate of another task)`, 'GOAL_ACCEPTANCE_INVALID_TASK_PLAN')
+    }
+    descriptions.add(description)
+    if (typeof spec.deliverable !== 'string' || spec.deliverable.trim().length === 0) {
+      throw new GoalAcceptanceError(`task "${id}" must declare a deliverable`, 'GOAL_ACCEPTANCE_INVALID_TASK_PLAN')
+    }
+  }
+  // Dependency references must exist within the plan
+  for (const spec of specs) {
+    const id = spec.id.trim()
+    for (const dep of (spec.dependsOn ?? [])) {
+      const depId = dep.trim()
+      if (depId.length === 0) {
+        throw new GoalAcceptanceError(`task "${id}" has an empty dependency id`, 'GOAL_ACCEPTANCE_INVALID_TASK_PLAN')
+      }
+      if (depId === id) {
+        throw new GoalAcceptanceError(`task "${id}" cannot depend on itself`, 'GOAL_ACCEPTANCE_INVALID_TASK_PLAN')
+      }
+      if (!ids.has(depId)) {
+        throw new GoalAcceptanceError(`task "${id}" depends on unknown task "${depId}"`, 'GOAL_ACCEPTANCE_INVALID_TASK_PLAN')
+      }
+    }
+  }
+  // Cycle detection via DFS
+  const deps = new Map<string, string[]>()
+  for (const spec of specs) {
+    deps.set(spec.id.trim(), (spec.dependsOn ?? []).map((d: string) => d.trim()))
+  }
+  const visiting = new Set<string>()
+  const visited = new Set<string>()
+  const visit = (id: string): string[] => {
+    if (visiting.has(id)) {
+      return [id]
+    }
+    if (visited.has(id)) {
+      return []
+    }
+    visiting.add(id)
+    for (const dep of deps.get(id) ?? []) {
+      const cycle = visit(dep)
+      if (cycle.length > 0) {
+        return [id, ...cycle]
+      }
+    }
+    visiting.delete(id)
+    visited.add(id)
+    return []
+  }
+  for (const id of ids) {
+    const cycle = visit(id)
+    if (cycle.length > 0) {
+      throw new GoalAcceptanceError(`dependency cycle detected: ${cycle.join(' -> ')}`, 'GOAL_ACCEPTANCE_INVALID_TASK_PLAN')
     }
   }
 }
@@ -118,7 +208,7 @@ export class GoalAcceptanceEngine {
   constructor(private readonly store: GoalAcceptanceStore) {}
 
   /** Set and lock the acceptance criteria. Returns the resolved criteria list. */
-  async setCriteria(specs: readonly CriterionSpec[]): Promise<GoalCriterion[]> {
+  async setCriteria(specs: readonly CriterionSpec[], role: GoalRole = 'dual'): Promise<GoalCriterion[]> {
     if (!Array.isArray(specs) || specs.length === 0) {
       throw new GoalAcceptanceError('criteria list must be a non-empty array', 'GOAL_ACCEPTANCE_INVALID_CRITERIA')
     }
@@ -137,6 +227,7 @@ export class GoalAcceptanceEngine {
       type: 'goal-acceptance/set',
       criteria,
       lockedAt: now,
+      role,
     }
 
     await this.store.append(event)
@@ -194,6 +285,9 @@ export class GoalAcceptanceEngine {
       throw new GoalAcceptanceError(`evidence is required when setting criterion to "${spec.status}"`, 'GOAL_ACCEPTANCE_EVIDENCE_REQUIRED')
     }
 
+    const evidenceType: EvidenceType = spec.evidenceType ?? 'text'
+    const selfClaimed = spec.status === 'passed' && this.state.role === 'agent'
+
     const now = Date.now()
     const event: GoalAcceptanceValidateEvent = {
       type: 'goal-acceptance/validate',
@@ -201,6 +295,8 @@ export class GoalAcceptanceEngine {
       status: spec.status,
       evidence: spec.evidence !== undefined && spec.evidence.trim().length > 0 ? spec.evidence.trim() : undefined,
       validatedAt: now,
+      evidenceType,
+      ...selfClaimed ? { selfClaimed: true } : {},
     }
 
     await this.store.append(event)
@@ -228,6 +324,50 @@ export class GoalAcceptanceEngine {
     this.applyEvent(event)
   }
 
+  /** Set and lock the task decomposition plan. Requires criteria to be locked first. */
+  async setTaskPlan(specs: readonly TaskPlanSpec[]): Promise<GoalTask[]> {
+    this.sync()
+
+    if (!this.state.locked) {
+      throw new GoalAcceptanceError('cannot set a task plan before criteria are locked', 'GOAL_ACCEPTANCE_NOT_LOCKED')
+    }
+    if (this.state.taskPlanLocked) {
+      throw new GoalAcceptanceError('task plan is already set', 'GOAL_ACCEPTANCE_TASK_PLAN_ALREADY_SET')
+    }
+
+    validateTaskPlan(specs)
+
+    const now = Date.now()
+    const tasks: GoalTask[] = specs.map(spec => ({
+      id: spec.id.trim(),
+      description: spec.description.trim(),
+      deliverable: spec.deliverable.trim(),
+      dependsOn: (spec.dependsOn ?? []).map(d => d.trim()).filter(d => d.length > 0),
+      status: 'pending',
+      updatedAt: now,
+    }))
+
+    const event: GoalAcceptanceTaskPlanEvent = {
+      type: 'goal-acceptance/task-plan',
+      tasks,
+      plannedAt: now,
+    }
+
+    await this.store.append(event)
+    this.applyEvent(event)
+
+    return this.getTaskPlan()
+  }
+
+  /** Get the task decomposition plan in declaration order. Empty array if no plan set. */
+  getTaskPlan(): GoalTask[] {
+    this.sync()
+    return this.state.taskPlanOrder.map(id => ({
+      ...this.state.taskPlan.get(id)!,
+      status: this.state.taskStatuses.get(id) ?? this.state.taskPlan.get(id)!.status,
+    }))
+  }
+
   /** Get all criteria in declaration order. */
   getCriteria(): GoalCriterion[] {
     this.sync()
@@ -244,6 +384,8 @@ export class GoalAcceptanceEngine {
   summarize(): AcceptanceSummary {
     const list = this.getCriteria()
     const passed: GoalCriterion[] = []
+    const formalPassed: GoalCriterion[] = []
+    const selfClaimedPassed: GoalCriterion[] = []
     const failures: GoalCriterion[] = []
     const blockers: GoalCriterion[] = []
     const pending: GoalCriterion[] = []
@@ -255,6 +397,12 @@ export class GoalAcceptanceEngine {
       switch (c.status) {
         case 'passed':
           passed.push(c)
+          if (c.selfClaimed === true) {
+            selfClaimedPassed.push(c)
+            if (c.required) allRequiredPassed = false
+          } else {
+            formalPassed.push(c)
+          }
           break
         case 'failed':
           failures.push(c)
@@ -284,15 +432,30 @@ export class GoalAcceptanceEngine {
     let pendingTasks = 0
     let failedTasks = 0
 
-    for (const c of list) {
-      if (c.taskIds.length > 0) {
-        const progress = computeTaskProgress(c, this.state.taskStatuses)
-        criterionTaskProgress.push(progress)
-        totalTasks += progress.totalTasks
-        completedTasks += progress.completedTasks
-        inProgressTasks += progress.inProgressTasks
-        pendingTasks += progress.pendingTasks
-        failedTasks += progress.failedTasks
+    // Aggregate over task plan when present, otherwise over criteria-linked tasks
+    const planTasks = this.state.taskPlanOrder.map(id => this.state.taskPlan.get(id)!)
+    if (planTasks.length > 0) {
+      for (const task of planTasks) {
+        const status = this.state.taskStatuses.get(task.id) ?? 'pending'
+        switch (status) {
+          case 'completed': completedTasks += 1; break
+          case 'in_progress': inProgressTasks += 1; break
+          case 'pending': pendingTasks += 1; break
+          case 'failed': failedTasks += 1; break
+        }
+      }
+      totalTasks = planTasks.length
+    } else {
+      for (const c of list) {
+        if (c.taskIds.length > 0) {
+          const progress = computeTaskProgress(c, this.state.taskStatuses)
+          criterionTaskProgress.push(progress)
+          totalTasks += progress.totalTasks
+          completedTasks += progress.completedTasks
+          inProgressTasks += progress.inProgressTasks
+          pendingTasks += progress.pendingTasks
+          failedTasks += progress.failedTasks
+        }
       }
     }
 
@@ -317,7 +480,10 @@ export class GoalAcceptanceEngine {
       blockedCount: blockers.length,
       pendingCount: pending.length,
       notRunCount: notRun.length,
+      selfClaimedCount: selfClaimedPassed.length,
       passed,
+      formalPassed,
+      selfClaimedPassed,
       failures,
       blockers,
       pending,
@@ -332,6 +498,10 @@ export class GoalAcceptanceEngine {
       criterionTaskProgress,
       readyToValidate,
       nextActionable,
+      taskPlan: planTasks.map(task => ({
+        ...task,
+        status: this.state.taskStatuses.get(task.id) ?? task.status,
+      })),
     }
   }
 
@@ -345,7 +515,14 @@ export class GoalAcceptanceEngine {
     if (summary.allRequiredPassed) {
       return { allowed: true }
     }
+    const selfClaimedRequired = summary.selfClaimedPassed.filter(c => c.required).length
     const unresolvedCount = summary.failedCount + summary.blockedCount + summary.pendingCount + summary.notRunCount
+    if (selfClaimedRequired > 0 && unresolvedCount === 0) {
+      return {
+        allowed: false,
+        reason: `Cannot complete goal: ${selfClaimedRequired} required criterion are self-claimed by agent, awaiting reviewer confirmation`,
+      }
+    }
     return {
       allowed: false,
       reason: `Cannot complete goal: ${unresolvedCount} required acceptance criteria are not passed`,
@@ -370,15 +547,21 @@ export class GoalAcceptanceEngine {
         this.state.order.push(criterion.id)
       }
       this.state.locked = true
+      this.state.role = data.role ?? 'dual'
     } else if (event.type === 'goal-acceptance/validate') {
       const data = event as GoalAcceptanceValidateEvent
       const existing = this.state.criteria.get(data.criterionId)
       if (existing !== undefined) {
+        const evidenceType = data.evidenceType ?? 'text'
         this.state.criteria.set(data.criterionId, {
           ...existing,
           status: data.status,
           ...data.evidence !== undefined ? { evidence: data.evidence } : {},
           updatedAt: data.validatedAt,
+          evidenceType,
+          lowConfidence: evidenceType === 'text',
+          ...data.selfClaimed === true ? { selfClaimed: true } : {},
+          ...data.selfClaimed !== true ? { selfClaimed: false } : {},
         })
       }
     } else if (event.type === 'goal-acceptance/task-update') {
@@ -391,6 +574,21 @@ export class GoalAcceptanceEngine {
         if (!this.state.criteria.has(criterion.id)) {
           this.state.criteria.set(criterion.id, criterion)
           this.state.order.push(criterion.id)
+        }
+      }
+    } else if (event.type === 'goal-acceptance/task-plan') {
+      const data = event as GoalAcceptanceTaskPlanEvent
+      this.state.taskPlan.clear()
+      this.state.taskPlanOrder = []
+      for (const task of data.tasks) {
+        this.state.taskPlan.set(task.id, task)
+        this.state.taskPlanOrder.push(task.id)
+      }
+      this.state.taskPlanLocked = true
+      // Seed task statuses for plan tasks so progress starts at 'pending'
+      for (const task of data.tasks) {
+        if (!this.state.taskStatuses.has(task.id)) {
+          this.state.taskStatuses.set(task.id, 'pending')
         }
       }
     }

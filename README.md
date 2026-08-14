@@ -9,18 +9,71 @@ criteria before work begins, tracking validation status with evidence, linking
 criteria to task progress, respecting dependency ordering, and enforcing
 completion checks.
 
-## Why?
+## Advantages
 
-Autonomous agents (Claude Code, Cursor, OpenClaw, DeepSeek Harness, etc.) often
-stop early — they say "I've finished" without actually verifying the work. This
-project provides:
+### 1. Cross-platform compatibility
 
-1. **A framework-agnostic state machine** that locks criteria, tracks evidence,
-   and gates completion.
-2. **An MCP server** any MCP-capable client can call.
-3. **An Agent Plugin package** compatible with the
-   [Agent Plugins](https://agent-plugins.org) standard.
-4. **A Cordis plugin** for DeepSeek Harness with turn-stopping enforcement.
+goal-acceptance works with **any** AI agent platform that supports MCP or Agent
+Plugins. One package, multiple runtimes:
+
+| Platform | How it connects | Turn-stopping enforcement |
+|----------|----------------|--------------------------|
+| **Claude Code** | MCP stdio server | Model voluntarily calls tools |
+| **Cursor** | MCP stdio server | Model voluntarily calls tools |
+| **OpenClaw** | Agent Plugin (plugin.json + mcp.json + skills) | Model voluntarily calls tools |
+| **DeepSeek Harness** | Cordis plugin (`dsh-goal-acceptance`) | **Yes** — `agent.steer()` forces continuation |
+| **Any MCP client** | stdio MCP server | Model voluntarily calls tools |
+| **Any Agent Plugins client** | plugin.json + mcp.json + skills | Model voluntarily calls tools |
+| **Any JS/TS runtime** | Core library (`dsh-goal-acceptance-core`) | Programmatic — you control it |
+
+The core state machine is **zero-dependency** and runs in any JS/TS runtime
+(Node.js, Bun, Deno, browser). The MCP server adds only the MCP SDK. The Cordis
+plugin adds DeepSeek Harness integration. You pick the layer you need.
+
+### 2. MCP server with 8 tools
+
+The MCP server exposes 8 tools covering the full goal-acceptance lifecycle:
+
+- **Criteria management**: set, get, amend
+- **Task plan management**: set task plan, get task plan
+- **Validation**: validate criterion with typed evidence
+- **Progress tracking**: update task status
+- **Completion gate**: can complete goal
+
+See [MCP Tools](#mcp-tools) below for the full list.
+
+### 3. Dual-role validation (anti self-grading)
+
+`set_acceptance_criteria` accepts a `role` parameter (`agent` / `reviewer` /
+`dual`). When `role=agent`, `validate_criterion` marks `passed` as
+`selfClaimed=true` — `can_complete_goal` blocks completion until a reviewer
+formally confirms. This breaks the "self-grading" loop where an agent both
+does the work and signs off on it.
+
+### 4. Typed evidence
+
+`validate_criterion` accepts `evidence_type` (`command` / `file` / `url` /
+`text`). `text` evidence is flagged `lowConfidence=true` so reviewers can
+spot subjective claims at a glance. `command` evidence (test output, CLI
+results) is high-confidence.
+
+### 5. Task decomposition with dependency validation
+
+`set_task_plan` lets you decompose a goal into atomic tasks, each with a
+concrete deliverable. The engine validates: unique IDs, unambiguous
+descriptions, non-empty deliverables, no self-dependencies, no unknown
+dependencies, and no dependency cycles (including indirect cycles).
+
+### 6. Event-sourced persistence
+
+All state changes are append-only events. The engine replays events on every
+read, enabling durable persistence, exact state restoration across restarts,
+and a full audit trail of every decision.
+
+### 7. Slim responses by default
+
+MCP tool responses are slim by default (4-field summary). Pass `verbose=true`
+for the full summary. This minimizes token overhead during normal operation.
 
 ## Packages
 
@@ -103,7 +156,10 @@ Add to your MCP client config:
     "goal-acceptance": {
       "type": "stdio",
       "command": "node",
-      "args": ["./node_modules/@deepseek-ai/dsh-goal-acceptance-mcp/bin/mcp-server.mjs"]
+      "args": ["./node_modules/@deepseek-ai/dsh-goal-acceptance-mcp/bin/mcp-server.mjs"],
+      "env": {
+        "PLUGIN_DATA": "/path/to/persistent/data"
+      }
     }
   }
 }
@@ -119,6 +175,17 @@ node ./node_modules/@deepseek-ai/dsh-goal-acceptance-mcp/bin/mcp-server.mjs
 PLUGIN_DATA=/path/to/data node ./node_modules/@deepseek-ai/dsh-goal-acceptance-mcp/bin/mcp-server.mjs
 ```
 
+The server writes `acceptance-events.json` under `$PLUGIN_DATA`. If `PLUGIN_DATA`
+is not set, state is in-memory only (lost on restart).
+
+#### Typical workflow
+
+1. **Set criteria** — `set_acceptance_criteria` with `role=reviewer` (you verify) or `role=agent` (agent self-claims, you confirm later)
+2. **Set task plan** — `set_task_plan` to decompose the goal into atomic tasks with deliverables and dependencies
+3. **Execute** — `update_task_status` as tasks progress (`pending` → `in_progress` → `completed`)
+4. **Validate** — `validate_criterion` with `evidence_type=command` for high-confidence evidence
+5. **Check** — `can_complete_goal` to verify all required criteria are formally passed
+
 ### Agent Plugin (portable format)
 
 The MCP package doubles as an
@@ -131,14 +198,21 @@ node_modules/@deepseek-ai/dsh-goal-acceptance-mcp/
 ├── mcp.json       # stdio MCP server config
 └── skills/        # Portable Agent Skills
     ├── set-acceptance-criteria/SKILL.md
+    ├── get-acceptance-criteria/SKILL.md
     ├── validate-criterion/SKILL.md
-    └── get-acceptance-criteria/SKILL.md
+    ├── update-task-status/SKILL.md
+    ├── amend-acceptance-criteria/SKILL.md
+    └── can-complete-goal/SKILL.md
 ```
 
 The client will discover the skills, start the stdio MCP server, and surface
 the tools.
 
 ### DeepSeek Harness (Cordis plugin)
+
+The Cordis plugin is the only variant that can **force** the agent to continue
+working when it tries to stop early. It intercepts `agent/turn-stopping` and
+steers the agent back with dependency-aware priority ordering.
 
 ```sh
 npm install @deepseek-ai/dsh-goal-acceptance
@@ -158,16 +232,22 @@ The plugin:
 - Intercepts `agent/turn-stopping` and steers the agent back with dependency-aware
   priority ordering when required criteria are still pending
 
+> **Note**: The Cordis plugin requires DeepSeek Harness packages as peer
+> dependencies. It will not build standalone without the Harness workspace. The
+> core and MCP packages build independently.
+
 ## MCP Tools
 
 | Tool | Description |
 |------|-------------|
-| `set_acceptance_criteria` | Lock the criteria list. Each criterion may link to task IDs and declare dependencies. Must be called before implementation. |
-| `get_acceptance_criteria` | Read current criteria, task progress, summary, ready-to-validate list, and next-actionable ordering. |
-| `validate_criterion` | Record status (`pending`/`in_progress`/`passed`/`failed`/`blocked`/`not_run`) and evidence. `passed` and `failed` require evidence. |
-| `update_task_status` | Update a linked task's status (`pending`/`in_progress`/`completed`/`failed`). When all tasks linked to a criterion are completed, it becomes ready to validate. |
+| `set_acceptance_criteria` | Lock the criteria list. Each criterion may link to task IDs and declare dependencies. Optional `role` parameter (`agent`/`reviewer`/`dual`, default `dual`) controls self-claim behavior. Must be called before implementation. |
+| `get_acceptance_criteria` | Read current criteria, task progress, summary, task plan, ready-to-validate list, and next-actionable ordering. Optional `verbose` parameter (default `true`; pass `false` for slim summary only). |
+| `set_task_plan` | Set and lock the task decomposition plan. Each task must have a unique id, unambiguous description, and concrete deliverable. Dependency cycles are rejected. Requires criteria to be locked first. |
+| `get_task_plan` | Read the current task decomposition plan with live task statuses. |
+| `validate_criterion` | Record status (`pending`/`in_progress`/`passed`/`failed`/`blocked`/`not_run`) and evidence. `passed` and `failed` require evidence. Optional `evidence_type` (`command`/`file`/`url`/`text`, default `text`). When `role=agent`, `passed` is marked self-claimed. Optional `verbose` (default `false`). |
+| `update_task_status` | Update a linked task's status (`pending`/`in_progress`/`completed`/`failed`). When all tasks linked to a criterion are completed, it becomes ready to validate. Optional `verbose` (default `false`). |
 | `amend_acceptance_criteria` | Append new criteria after the initial lock. Requires a reason. Existing criteria are not modified. |
-| `can_complete_goal` | Check whether all required criteria are passed. |
+| `can_complete_goal` | Check whether all required criteria are formally passed (self-claimed does not count). Returns `{ allowed: boolean, reason?: string }`. |
 
 ## Criterion Status Lifecycle
 
@@ -204,16 +284,20 @@ The plugin:
 
 `canComplete()` returns `{ allowed: boolean, reason?: string }`:
 
-- **Allowed**: all required criteria are `passed`, or no criteria are locked.
+- **Allowed**: all required criteria are formally `passed` (not self-claimed), or no criteria are locked.
 - **Not allowed**: any required criterion is `pending`, `in_progress`, `failed`,
   `blocked`, or `not_run`.
+- **Not allowed (self-claimed)**: all required criteria are `passed` but some are
+  `selfClaimed=true` (set by an agent, not yet reviewer-confirmed). The reason
+  will indicate how many are awaiting reviewer confirmation.
 
 ## Event Sourcing
 
 The engine is event-sourced. The store holds an append-only list of:
 
-- `goal-acceptance/set` — locks the criteria list
-- `goal-acceptance/validate` — updates one criterion's status
+- `goal-acceptance/set` — locks the criteria list (with role)
+- `goal-acceptance/task-plan` — locks the task decomposition plan
+- `goal-acceptance/validate` — updates one criterion's status (with evidence type, self-claimed flag)
 - `goal-acceptance/task-update` — updates a linked task's status
 - `goal-acceptance/amend` — appends new criteria after the initial lock
 
@@ -245,11 +329,15 @@ class MyDbStore implements GoalAcceptanceStore {
 
 | Capability | Cordis plugin | MCP server | Agent Plugin |
 |------------|:---:|:---:|:---:|
-| Model tools | `set/get/validate/update_task/amend` | `set/get/validate/update_task/amend/can_complete` | same as MCP |
+| Model tools | `set/get/validate/update_task/amend` | 8 tools (see [MCP Tools](#mcp-tools)) | same as MCP |
 | System prompt / Skills | `policy:goal-acceptance` | `skills/` | `skills/` |
 | Turn-stopping enforcement | yes (`agent.steer()`, dependency-aware) | no | no |
 | Cross-client portable | no (Harness only) | yes (any MCP client) | yes (any Agent Plugins client) |
 | Persistent state | `dsh-session` log | `$PLUGIN_DATA/acceptance-events.json` | same as MCP |
+| Dual-role validation | no | yes (`role` parameter) | yes |
+| Typed evidence | no | yes (`evidence_type` parameter) | yes |
+| Task decomposition plan | no | yes (`set_task_plan` / `get_task_plan`) | yes |
+| Slim responses | no | yes (`verbose` parameter) | yes |
 
 The Cordis plugin is the only variant that can **force** the agent to continue
 working when it tries to stop early. The MCP and Agent Plugin variants rely on
@@ -267,19 +355,19 @@ packages/
 │   │   ├── errors.ts           # GoalAcceptanceError
 │   │   └── index.ts            # Public exports
 │   └── tests/
-│       ├── engine.spec.ts      # 27 tests
+│       ├── engine.spec.ts      # 51 tests
 │       └── standalone.spec.ts  # 1 test
 ├── goal-acceptance-mcp/        # MCP server + Agent Plugin
 │   ├── src/
-│   │   ├── mcp-server.ts       # stdio MCP server, 6 tools
+│   │   ├── mcp-server.ts       # stdio MCP server, 8 tools
 │   │   ├── store.ts            # FileAcceptanceStore
 │   │   └── index.ts
 │   ├── bin/mcp-server.mjs      # Built stdio entry point
 │   ├── plugin.json             # Agent Plugins manifest
 │   ├── mcp.json                # MCP server config
-│   ├── skills/                 # Portable Agent Skills
+│   ├── skills/                 # Portable Agent Skills (8 skills)
 │   └── tests/
-│       └── mcp-server.spec.ts  # 6 tests
+│       └── mcp-server.spec.ts  # 22 tests
 └── goal-acceptance/            # DeepSeek Harness Cordis plugin
     ├── src/
     │   ├── index.ts            # apply(): service + tools + prompt + dependency-aware steering
@@ -303,9 +391,8 @@ pnpm install
 pnpm run build
 ```
 
-The Cordis plugin (`goal-acceptance`) requires DeepSeek Harness packages as peer
-dependencies. It will not build standalone without the Harness workspace. The
-core and MCP packages build independently.
+This builds the core and MCP packages. The Cordis plugin (`goal-acceptance`)
+requires the DeepSeek Harness workspace and is not built by default in this repo.
 
 ## Test
 

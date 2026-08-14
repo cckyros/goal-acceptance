@@ -10,3 +10,4 @@ bin/*.mjs
 dist/
 coverage/
 .devin/
+test-output/
