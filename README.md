@@ -31,17 +31,29 @@ The core state machine is **zero-dependency** and runs in any JS/TS runtime
 (Node.js, Bun, Deno, browser). The MCP server adds only the MCP SDK. The Cordis
 plugin adds DeepSeek Harness integration. You pick the layer you need.
 
-### 2. MCP server with 8 tools
+### 2. MCP server with 12 tools
 
-The MCP server exposes 8 tools covering the full goal-acceptance lifecycle:
+The MCP server exposes 12 tools covering the full goal-acceptance lifecycle:
 
 - **Criteria management**: set, get, amend
 - **Task plan management**: set task plan, get task plan
 - **Validation**: validate criterion with typed evidence
 - **Progress tracking**: update task status
 - **Completion gate**: can complete goal
+- **Multi-goal management**: start goal, list goals, switch goal, reset goal
 
 See [MCP Tools](#mcp-tools) below for the full list.
+
+### Multi-goal isolation
+
+Each goal has its own event file under `${PLUGIN_DATA}/goals/{goalId}.json` —
+multiple projects and windows can share one server without lock conflicts:
+
+- `set_acceptance_criteria` auto-creates a goal when none is active
+- `start_goal` begins a new independent goal (fresh criteria + task plan)
+- `switch_goal` moves between goals; `list_goals` shows all with status
+- `reset_goal` deletes a messed-up goal so you can start over
+- The active goal survives server restarts (`current-goal.txt`)
 
 ### 3. Dual-role validation (anti self-grading)
 
@@ -99,8 +111,8 @@ for the full summary. This minimizes token overhead during normal operation.
           │ (MCP stdio server +│ │ acceptance-  │ │ (DeepSeek Harness       │
           │  Agent Plugin      │ │ openclaw     │ │  Cordis plugin)         │
           │  bundle)           │ │ (OpenClaw    │ │ turn-stopping           │
-          │ 8 tools, stdio     │ │  native)     │ │ agent.steer()           │
-          │ skills/ included   │ │ 8 tools,     │ │ system prompt           │
+          │ 12 tools, stdio    │ │  native)     │ │ agent.steer()           │
+          │ skills/ included   │ │ 12 tools,    │ │ system prompt           │
           │                    │ │ in-process   │ │ tool registration       │
           └────────────────────┘ └──────────────┘ └─────────────────────────┘
 ```
@@ -240,7 +252,7 @@ is not set, state is in-memory only (lost on restart).
 
 ### OpenClaw native plugin
 
-The `@cckyros/goal-acceptance-openclaw` package is an OpenClaw native plugin that registers all 8 tools directly in-process (no MCP stdio overhead).
+The `@cckyros/goal-acceptance-openclaw` package is an OpenClaw native plugin that registers all 12 tools directly in-process (no MCP stdio overhead).
 
 ```sh
 openclaw plugins install "npm:@cckyros/goal-acceptance-openclaw@rc"
@@ -261,7 +273,7 @@ openclaw plugins inspect goal-acceptance
 # Status: loaded, Format: openclaw
 ```
 
-The 8 tools are now available in OpenClaw sessions. `Shape: non-capability` is normal for tool plugins — tools are registered via `defineToolPlugin`, not the capability system.
+The 12 tools are now available in OpenClaw sessions. `Shape: non-capability` is normal for tool plugins — tools are registered via `defineToolPlugin`, not the capability system.
 
 ### Agent Plugin (portable bundle format)
 
@@ -327,6 +339,10 @@ The plugin:
 | `update_task_status` | Update a linked task's status (`pending`/`in_progress`/`completed`/`failed`). When all tasks linked to a criterion are completed, it becomes ready to validate. Optional `verbose` (default `false`). |
 | `amend_acceptance_criteria` | Append new criteria after the initial lock. Requires a reason. Existing criteria are not modified. |
 | `can_complete_goal` | Check whether all required criteria are formally passed (self-claimed does not count). Returns `{ allowed: boolean, reason?: string }`. |
+| `start_goal` | Start a new independent goal with fresh state (optional `title`). The new goal becomes active. Use when the current goal is locked and you need a new task. |
+| `list_goals` | List all goals with ID, title, criteria counts, and active flag. |
+| `switch_goal` | Switch the active goal to an existing goal by ID. |
+| `reset_goal` | Delete the current goal and all its data permanently. |
 
 ## Criterion Status Lifecycle
 
@@ -408,7 +424,7 @@ class MyDbStore implements GoalAcceptanceStore {
 
 | Capability | Cordis plugin | MCP server | Agent Plugin | OpenClaw native |
 |------------|:---:|:---:|:---:|:---:|
-| Model tools | `set/get/validate/update_task/amend` | 8 tools (see [MCP Tools](#mcp-tools)) | same as MCP | same as MCP (in-process) |
+| Model tools | `set/get/validate/update_task/amend` | 12 tools (see [MCP Tools](#mcp-tools)) | same as MCP | same as MCP (in-process) |
 | System prompt / Skills | `policy:goal-acceptance` | `skills/` | `skills/` | `skills/` |
 | Turn-stopping enforcement | yes (`agent.steer()`, dependency-aware) | no | no | no |
 | Cross-client portable | no (Harness only) | yes (any MCP client) | yes (any Agent Plugins client) | no (OpenClaw only) |
@@ -440,7 +456,7 @@ packages/
 │       └── standalone.spec.ts  # 1 test
 ├── goal-acceptance-mcp/        # MCP server + Agent Plugin
 │   ├── src/
-│   │   ├── mcp-server.ts       # stdio MCP server, 8 tools
+│   │   ├── mcp-server.ts       # stdio MCP server, 12 tools
 │   │   ├── store.ts            # FileAcceptanceStore
 │   │   └── index.ts
 │   ├── bin/mcp-server.mjs      # Built stdio entry point
@@ -451,7 +467,7 @@ packages/
 │       └── mcp-server.spec.ts  # 22 tests
 ├── goal-acceptance-openclaw/   # OpenClaw native plugin
 │   ├── src/
-│   │   └── index.ts            # defineToolPlugin, 8 tools (in-process)
+│   │   └── index.ts            # defineToolPlugin, 12 tools (in-process)
 │   ├── dist/index.js           # Built entry point
 │   ├── openclaw.plugin.json    # OpenClaw plugin manifest
 │   └── skills/                 # Portable Agent Skills (8 skills)

@@ -27,17 +27,29 @@ goal-acceptance 兼容**任何**支持 MCP 或 Agent Plugins 的 AI agent 平台
 核心状态机**零依赖**，可在任何 JS/TS 运行时中运行（Node.js、Bun、Deno、浏览器）。
 MCP server 仅增加 MCP SDK。Cordis 插件增加 DeepSeek Harness 集成。按需选择层级。
 
-### 2. MCP server 提供 8 个工具
+### 2. MCP server 提供 12 个工具
 
-MCP server 暴露 8 个工具，覆盖完整的 goal-acceptance 生命周期：
+MCP server 暴露 12 个工具，覆盖完整的 goal-acceptance 生命周期：
 
 - **标准管理**：set、get、amend
 - **任务计划管理**：set task plan、get task plan
 - **验证**：validate criterion（带类型化证据）
 - **进度跟踪**：update task status
 - **完成门控**：can complete goal
+- **多 goal 管理**：start goal、list goals、switch goal、reset goal
 
 完整列表见下方 [MCP 工具](#mcp-工具)。
+
+### 多 goal 隔离
+
+每个 goal 有独立的事件文件 `${PLUGIN_DATA}/goals/{goalId}.json` —
+多个项目/窗口可以共享一个 server 而不冲突：
+
+- `set_acceptance_criteria` 在没有活跃 goal 时自动创建一个
+- `start_goal` 开启新的独立 goal（全新标准 + 任务计划）
+- `switch_goal` 在 goal 之间切换；`list_goals` 列出所有 goal 及状态
+- `reset_goal` 删除当前 goal，可以重新开始
+- 活跃 goal 跨重启保留（`current-goal.txt`）
 
 ### 3. 双角色验证（防自评）
 
@@ -90,8 +102,8 @@ MCP 工具响应默认精简（4 字段摘要）。传 `verbose=true` 获取完�
           │ (MCP stdio server +│ │ acceptance-  │ │ (DeepSeek Harness       │
           │  Agent Plugin      │ │ openclaw     │ │  Cordis 插件)           │
           │  打包)             │ │ (OpenClaw    │ │ turn-stopping           │
-          │ 8 个工具，stdio    │ │  原生)       │ │ agent.steer()           │
-          │ skills/ 包含       │ │ 8 个工具，   │ │ 系统提示词              │
+          │ 12 个工具，stdio    │ │  原生)       │ │ agent.steer()           │
+          │ skills/ 包含       │ │ 12 个工具，  │ │ 系统提示词              │
           │                    │ │ 进程内       │ │ 工具注册                │
           └────────────────────┘ └──────────────┘ └─────────────────────────┘
 ```
@@ -223,7 +235,7 @@ server 在 `$PLUGIN_DATA` 下写入 `acceptance-events.json`。未设置 `PLUGIN
 
 ### OpenClaw 原生插件
 
-`@cckyros/goal-acceptance-openclaw` 是 OpenClaw 原生插件，直接在进程内注册全部 8 个工具（无 MCP stdio 开销）。
+`@cckyros/goal-acceptance-openclaw` 是 OpenClaw 原生插件，直接在进程内注册全部 12 个工具（无 MCP stdio 开销）。
 
 ```sh
 openclaw plugins install "npm:@cckyros/goal-acceptance-openclaw@rc"
@@ -244,7 +256,7 @@ openclaw plugins inspect goal-acceptance
 # Status: loaded, Format: openclaw
 ```
 
-8 个工具现在在 OpenClaw 会话中可用。`Shape: non-capability` 是 tool 插件的正常状态——工具通过 `defineToolPlugin` 注册，不走 capability 系统。
+12 个工具现在在 OpenClaw 会话中可用。`Shape: non-capability` 是 tool 插件的正常状态——工具通过 `defineToolPlugin` 注册，不走 capability 系统。
 
 ### Agent Plugin（可移植 bundle 格式）
 
@@ -305,6 +317,10 @@ plugins:
 | `update_task_status` | 更新关联任务的状态（`pending`/`in_progress`/`completed`/`failed`）。当标准关联的所有任务完成时，该标准变为可验证。可选 `verbose`（默认 `false`）。 |
 | `amend_acceptance_criteria` | 在初始锁定后追加新标准。需要理由。已有标准不被修改。 |
 | `can_complete_goal` | 检查所有 required 标准是否正式通过（自评不算）。返回 `{ allowed: boolean, reason?: string }`。 |
+| `start_goal` | 开启新的独立 goal（可选 `title`），新 goal 成为活跃 goal。当前 goal 锁定后需要新任务时使用。 |
+| `list_goals` | 列出所有 goal，含 ID、标题、标准数、活跃标志。 |
+| `switch_goal` | 切换活跃 goal 到已有 goal（按 ID）。 |
+| `reset_goal` | 永久删除当前 goal 及其所有数据。 |
 
 ## 标准状态生命周期
 
@@ -383,7 +399,7 @@ class MyDbStore implements GoalAcceptanceStore {
 
 | 能力 | Cordis 插件 | MCP server | Agent Plugin | OpenClaw 原生插件 |
 |------|:---:|:---:|:---:|:---:|
-| 模型工具 | `set/get/validate/update_task/amend` | 8 个工具（见 [MCP 工具](#mcp-工具)） | 同 MCP | 同 MCP（进程内） |
+| 模型工具 | `set/get/validate/update_task/amend` | 12 个工具（见 [MCP 工具](#mcp-工具)） | 同 MCP | 同 MCP（进程内） |
 | 系统提示词 / Skills | `policy:goal-acceptance` | `skills/` | `skills/` | `skills/` |
 | Turn-stopping 强制拦截 | 是（`agent.steer()`） | 否 | 否 | 否 |
 | 跨客户端可移植 | 否（仅 Harness） | 是（任何 MCP 客户端） | 是（任何 Agent Plugins 客户端） | 否（仅 OpenClaw） |
@@ -413,7 +429,7 @@ packages/
 │       └── standalone.spec.ts  # 1 个测试
 ├── goal-acceptance-mcp/        # MCP server + Agent Plugin
 │   ├── src/
-│   │   ├── mcp-server.ts       # stdio MCP server，8 个工具
+│   │   ├── mcp-server.ts       # stdio MCP server，12 个工具
 │   │   ├── store.ts            # FileAcceptanceStore
 │   │   └── index.ts
 │   ├── bin/mcp-server.mjs      # 构建后的 stdio 入口
@@ -424,10 +440,10 @@ packages/
 │       └── mcp-server.spec.ts  # 22 个测试
 ├── goal-acceptance-openclaw/   # OpenClaw 原生插件
 │   ├── src/
-│   │   └── index.ts            # defineToolPlugin，8 个工具（进程内）
+│   │   └── index.ts            # defineToolPlugin，12 个工具（进程内）
 │   ├── dist/index.js           # 构建后的入口
 │   ├── openclaw.plugin.json    # OpenClaw 插件清单
-│   └── skills/                 # 可移植 Agent Skills（8 个 skill）
+│   └── skills/                 # 可移植 Agent Skills（12 个 skill）
 └── goal-acceptance/            # DeepSeek Harness Cordis 插件
     ├── src/
     │   ├── index.ts            # apply(): service + tools + prompt + turn-stopping

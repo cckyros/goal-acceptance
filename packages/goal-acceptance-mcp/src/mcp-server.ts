@@ -1,7 +1,7 @@
 import { realpathSync, existsSync, readFileSync, writeFileSync, mkdirSync, readdirSync, unlinkSync } from 'node:fs'
 import { mkdir } from 'node:fs/promises'
-import { join } from 'node:path'
-import { pathToFileURL } from 'node:url'
+import { dirname, join } from 'node:path'
+import { fileURLToPath, pathToFileURL } from 'node:url'
 import { randomUUID } from 'node:crypto'
 import process from 'node:process'
 import { Server } from '@modelcontextprotocol/sdk/server/index.js'
@@ -23,6 +23,16 @@ interface GoalMeta {
   readonly title: string
   readonly createdAt: number
 }
+
+/** Package version read from package.json (single source of truth). */
+const PACKAGE_VERSION: string = (() => {
+  try {
+    const pkgPath = join(dirname(fileURLToPath(import.meta.url)), '..', 'package.json')
+    return (JSON.parse(readFileSync(pkgPath, 'utf-8')) as { version: string }).version
+  } catch {
+    return '0.0.0'
+  }
+})()
 
 /** Compact one-line summary for default (non-verbose) responses. */
 function slimSummary(s: import('@cckyros/goal-acceptance-core').AcceptanceSummary) {
@@ -272,7 +282,7 @@ export function createMcpServer(): Server {
   const server = new Server(
     {
       name: '@cckyros/goal-acceptance-mcp',
-      version: '0.1.0-rc.12',
+      version: PACKAGE_VERSION,
     },
     {
       capabilities: {

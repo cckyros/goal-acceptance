@@ -1,10 +1,13 @@
 /**
  * OpenClaw native plugin entry for goal-acceptance.
- * Registers 8 tools that directly call the core engine (no MCP stdio needed).
+ * Registers 12 tools that directly call the core engine (no MCP stdio needed).
+ * Multi-goal: each goal has its own event file under ${dataDir}/goals/.
  */
 import { readFile, writeFile } from 'node:fs/promises'
-import { existsSync, readFileSync } from 'node:fs'
-import { GoalAcceptanceEngine, InMemoryAcceptanceStore } from '@cckyros/goal-acceptance-core'
+import { existsSync, readFileSync, writeFileSync, mkdirSync, readdirSync, unlinkSync } from 'node:fs'
+import { join } from 'node:path'
+import { randomUUID } from 'node:crypto'
+import { GoalAcceptanceEngine, GoalAcceptanceError, InMemoryAcceptanceStore } from '@cckyros/goal-acceptance-core'
 import type { GoalAcceptanceEvent, GoalAcceptanceStore } from '@cckyros/goal-acceptance-core'
 import { defineToolPlugin } from 'openclaw/plugin-sdk/tool-plugin'
 import { Type } from 'typebox'
@@ -39,18 +42,165 @@ class FileAcceptanceStore implements GoalAcceptanceStore {
   }
 }
 
-// --- Store resolution ---
+// --- Multi-goal manager (mirrors the MCP server design) ---
 
-let engine: GoalAcceptanceEngine | null = null
+interface GoalMeta {
+  readonly id: string
+  readonly title: string
+  readonly createdAt: number
+}
+
+let resolvedDataDir: string | null = null
+let currentGoalId: string | null = null
+const engineCache = new Map<string, GoalAcceptanceEngine>()
+const metaCache = new Map<string, GoalMeta>()
+
+function dataDir(cfg: { dataDir?: string } | undefined): string {
+  if (resolvedDataDir === null) {
+    resolvedDataDir = cfg?.dataDir || process.env.PLUGIN_DATA || ''
+    if (resolvedDataDir) {
+      mkdirSync(join(resolvedDataDir, 'goals'), { recursive: true })
+      loadCurrentGoal()
+    }
+  }
+  return resolvedDataDir
+}
+
+function goalsDir(): string {
+  return resolvedDataDir ? join(resolvedDataDir, 'goals') : ''
+}
+
+function currentGoalFile(): string {
+  return resolvedDataDir ? join(resolvedDataDir, 'current-goal.txt') : ''
+}
+
+function storeForGoal(goalId: string): GoalAcceptanceStore {
+  const dir = goalsDir()
+  return dir ? new FileAcceptanceStore(join(dir, `${goalId}.json`)) : new InMemoryAcceptanceStore()
+}
+
+function loadCurrentGoal(): void {
+  const f = currentGoalFile()
+  if (f && existsSync(f)) {
+    const id = readFileSync(f, 'utf-8').trim()
+    if (id.length > 0 && existsSync(join(goalsDir(), `${id}.meta.json`))) {
+      currentGoalId = id
+      loadGoalMeta(id)
+    }
+  }
+}
+
+function persistCurrentGoal(): void {
+  const f = currentGoalFile()
+  if (f) writeFileSync(f, currentGoalId ?? '')
+}
+
+function loadGoalMeta(id: string): GoalMeta | undefined {
+  const cached = metaCache.get(id)
+  if (cached) return cached
+  const dir = goalsDir()
+  if (!dir) return undefined
+  const metaPath = join(dir, `${id}.meta.json`)
+  if (!existsSync(metaPath)) return undefined
+  const meta = JSON.parse(readFileSync(metaPath, 'utf-8')) as GoalMeta
+  metaCache.set(id, meta)
+  return meta
+}
+
+function getOrCreateEngine(goalId: string): GoalAcceptanceEngine {
+  let engine = engineCache.get(goalId)
+  if (engine === undefined) {
+    engine = new GoalAcceptanceEngine(storeForGoal(goalId))
+    engineCache.set(goalId, engine)
+  }
+  return engine
+}
 
 function getEngine(cfg: { dataDir?: string } | undefined): GoalAcceptanceEngine {
-  if (engine) return engine
-  const dataDir = cfg?.dataDir || process.env.PLUGIN_DATA || ''
-  const store = dataDir
-    ? new FileAcceptanceStore(`${dataDir}/acceptance-events.json`)
-    : new InMemoryAcceptanceStore()
-  engine = new GoalAcceptanceEngine(store)
-  return engine
+  dataDir(cfg)
+  if (currentGoalId === null) {
+    throw new GoalAcceptanceError(
+      'no active goal. Call start_goal to create one, or set_acceptance_criteria to auto-create one.',
+      'GOAL_ACCEPTANCE_NO_ACTIVE_GOAL',
+    )
+  }
+  return getOrCreateEngine(currentGoalId)
+}
+
+function startGoal(cfg: { dataDir?: string } | undefined, title?: string): GoalMeta {
+  dataDir(cfg)
+  const id = randomUUID()
+  const meta: GoalMeta = { id, title: title ?? '', createdAt: Date.now() }
+  const dir = goalsDir()
+  if (dir) {
+    writeFileSync(join(dir, `${id}.meta.json`), JSON.stringify(meta, null, 2) + '\n')
+    writeFileSync(join(dir, `${id}.json`), '[]')
+  }
+  metaCache.set(id, meta)
+  currentGoalId = id
+  persistCurrentGoal()
+  engineCache.set(id, new GoalAcceptanceEngine(storeForGoal(id)))
+  return meta
+}
+
+function listGoals(cfg: { dataDir?: string } | undefined) {
+  dataDir(cfg)
+  const dir = goalsDir()
+  const metas: GoalMeta[] = dir
+    ? readdirSync(dir).filter(f => f.endsWith('.meta.json')).map(f => {
+        const meta = JSON.parse(readFileSync(join(dir, f), 'utf-8')) as GoalMeta
+        metaCache.set(meta.id, meta)
+        return meta
+      })
+    : Array.from(metaCache.values())
+  return metas.map(meta => {
+    const engine = getOrCreateEngine(meta.id)
+    const summary = engine.summarize()
+    return {
+      ...meta,
+      criteriaCount: summary.totalCount,
+      passedCount: summary.passedCount,
+      allRequiredPassed: summary.allRequiredPassed,
+      isActive: meta.id === currentGoalId,
+    }
+  }).sort((a, b) => b.createdAt - a.createdAt)
+}
+
+function switchGoal(cfg: { dataDir?: string } | undefined, id: string): GoalMeta {
+  dataDir(cfg)
+  const dir = goalsDir()
+  const exists = dir ? existsSync(join(dir, `${id}.meta.json`)) : metaCache.has(id)
+  if (!exists) {
+    throw new GoalAcceptanceError(`goal ${id} not found`, 'GOAL_ACCEPTANCE_NOT_FOUND')
+  }
+  currentGoalId = id
+  persistCurrentGoal()
+  return loadGoalMeta(id) ?? { id, title: '', createdAt: 0 }
+}
+
+function resetGoal(cfg: { dataDir?: string } | undefined): void {
+  dataDir(cfg)
+  if (currentGoalId === null) {
+    throw new GoalAcceptanceError('no active goal to reset', 'GOAL_ACCEPTANCE_NO_ACTIVE_GOAL')
+  }
+  const id = currentGoalId
+  const dir = goalsDir()
+  if (dir) {
+    try { unlinkSync(join(dir, `${id}.json`)) } catch { /* already removed */ }
+    try { unlinkSync(join(dir, `${id}.meta.json`)) } catch { /* already removed */ }
+  }
+  engineCache.delete(id)
+  metaCache.delete(id)
+  currentGoalId = null
+  persistCurrentGoal()
+}
+
+function ensureGoal(cfg: { dataDir?: string } | undefined): GoalAcceptanceEngine {
+  dataDir(cfg)
+  if (currentGoalId === null) {
+    startGoal(cfg)
+  }
+  return getEngine(cfg)
 }
 
 // --- Schemas ---
@@ -122,11 +272,21 @@ export default defineToolPlugin({
         ], { description: 'Role locking the criteria. agent: passed marks self-claimed. reviewer/dual: formal passed. Default: dual.' })),
       }),
       execute: async (params, ctx) => {
-        const eng = getEngine(ctx?.pluginConfig)
+        const eng = ensureGoal(ctx?.pluginConfig)
         const role = params.role || 'dual'
-        const list = await eng.setCriteria(params.criteria.map(mapCriterion), role)
-        const summary = eng.summarize()
-        return { criteria: list, summary }
+        try {
+          const list = await eng.setCriteria(params.criteria.map(mapCriterion), role)
+          const summary = eng.summarize()
+          return { goalId: currentGoalId, criteria: list, summary }
+        } catch (e) {
+          if (e instanceof GoalAcceptanceError && e.code === 'GOAL_ACCEPTANCE_ALREADY_LOCKED') {
+            throw new GoalAcceptanceError(
+              `criteria are already locked for goal ${currentGoalId}. Call start_goal to begin a new goal, or reset_goal to clear the current one.`,
+              'GOAL_ACCEPTANCE_ALREADY_LOCKED',
+            )
+          }
+          throw e
+        }
       },
     }),
 
@@ -260,7 +420,50 @@ export default defineToolPlugin({
       execute: async (_params, ctx) => {
         const eng = getEngine(ctx?.pluginConfig)
         const plan = eng.getTaskPlan()
-        return { taskPlan: plan }
+        return { goalId: currentGoalId, taskPlan: plan }
+      },
+    }),
+
+    tool({
+      name: 'start_goal',
+      description: 'Start a new goal with a fresh state. Use this when the current goal is locked and you need to begin a new independent task. Each goal has its own acceptance criteria and task plan. The new goal becomes the active goal.',
+      parameters: Type.Object({
+        title: Type.Optional(Type.String({ description: 'Optional human-readable title for the goal.' })),
+      }),
+      execute: async (params, ctx) => {
+        const meta = startGoal(ctx?.pluginConfig, params.title)
+        return { goal: meta, message: 'New goal started and set as active.' }
+      },
+    }),
+
+    tool({
+      name: 'list_goals',
+      description: 'List all goals with their status summaries. Shows goal ID, title, creation time, criteria counts, and which goal is currently active.',
+      parameters: Type.Object({}),
+      execute: async (_params, ctx) => {
+        return { goals: listGoals(ctx?.pluginConfig) }
+      },
+    }),
+
+    tool({
+      name: 'switch_goal',
+      description: 'Switch the active goal to an existing goal by ID. Use list_goals to find goal IDs.',
+      parameters: Type.Object({
+        goal_id: Type.String({ description: 'The goal ID to switch to (from list_goals).' }),
+      }),
+      execute: async (params, ctx) => {
+        const meta = switchGoal(ctx?.pluginConfig, params.goal_id)
+        return { goal: meta, message: 'Switched active goal.' }
+      },
+    }),
+
+    tool({
+      name: 'reset_goal',
+      description: 'Delete the current goal and all its data (criteria, task plan, validations). The goal is permanently removed. Use this to clear a messed-up goal and start fresh.',
+      parameters: Type.Object({}),
+      execute: async (_params, ctx) => {
+        resetGoal(ctx?.pluginConfig)
+        return { message: 'Current goal deleted. No active goal. Call set_acceptance_criteria to auto-create a new one, or start_goal.' }
       },
     }),
   ],
