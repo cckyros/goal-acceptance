@@ -272,7 +272,7 @@ export default defineToolPlugin({
         ], { description: 'Role locking the criteria. agent: passed marks self-claimed. reviewer/dual: formal passed. Default: dual.' })),
       }),
       execute: async (params, ctx) => {
-        const eng = ensureGoal(ctx?.pluginConfig)
+        let eng = ensureGoal(ctx?.pluginConfig)
         const role = params.role || 'dual'
         try {
           const list = await eng.setCriteria(params.criteria.map(mapCriterion), role)
@@ -280,6 +280,15 @@ export default defineToolPlugin({
           return { goalId: currentGoalId, criteria: list, summary }
         } catch (e) {
           if (e instanceof GoalAcceptanceError && e.code === 'GOAL_ACCEPTANCE_ALREADY_LOCKED') {
+            // Check if the current goal is already completed — if so, auto-start a new goal
+            const completedGoalId = currentGoalId
+            if (eng.canComplete().allowed) {
+              startGoal(ctx?.pluginConfig)
+              eng = getEngine(ctx?.pluginConfig)
+              const list = await eng.setCriteria(params.criteria.map(mapCriterion), role)
+              const summary = eng.summarize()
+              return { goalId: currentGoalId, previousGoalId: completedGoalId, autoStarted: true, criteria: list, summary }
+            }
             throw new GoalAcceptanceError(
               `criteria are already locked for goal ${currentGoalId}. Call start_goal to begin a new goal, or reset_goal to clear the current one.`,
               'GOAL_ACCEPTANCE_ALREADY_LOCKED',

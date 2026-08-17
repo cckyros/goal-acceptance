@@ -495,6 +495,36 @@ describe('GoalAcceptanceMcpServer', () => {
     })).rejects.toThrow('start_goal')
   })
 
+  it('auto-starts new goal when previous goal is completed', async () => {
+    const { client } = await createClient()
+    // Goal 1: set criteria, validate, complete
+    const res1 = await client.callTool({
+      name: 'set_acceptance_criteria',
+      arguments: { criteria: [{ id: 'c1', description: 'first goal', required: true }] },
+    })
+    const goal1Id = JSON.parse(String((res1.content as Array<{ type: string; text: string }>)[0]!.text)).goalId
+    await client.callTool({
+      name: 'validate_criterion',
+      arguments: { criterion_id: 'c1', status: 'passed', evidence: 'done', evidence_type: 'command' },
+    })
+    // Goal 1 is now completed
+    const canComplete = await client.callTool({ name: 'can_complete_goal', arguments: {} })
+    const canCompleteParsed = JSON.parse(String((canComplete.content as Array<{ type: string; text: string }>)[0]!.text))
+    expect(canCompleteParsed.allowed).toBe(true)
+
+    // Now set_acceptance_criteria for a new task — should auto-start a new goal
+    const res2 = await client.callTool({
+      name: 'set_acceptance_criteria',
+      arguments: { criteria: [{ id: 'c1', description: 'second goal', required: true }] },
+    })
+    const res2Parsed = JSON.parse(String((res2.content as Array<{ type: string; text: string }>)[0]!.text))
+    expect(res2Parsed.goalId).not.toBe(goal1Id)
+    expect(res2Parsed.autoStarted).toBe(true)
+    expect(res2Parsed.previousGoalId).toBe(goal1Id)
+    expect(res2Parsed.criteria).toHaveLength(1)
+    expect(res2Parsed.criteria[0].description).toBe('second goal')
+  })
+
   it('two goals have independent criteria locks', async () => {
     const { client } = await createClient()
     // Goal A

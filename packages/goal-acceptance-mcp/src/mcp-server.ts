@@ -486,7 +486,7 @@ export function createMcpServer(): Server {
         const criteria = input.criteria as Array<{ id: string; description: string; required?: boolean; method?: string; task_ids?: string[]; depends_on?: string[] }>
         const role = (input.role as GoalRole | undefined) ?? 'dual'
         // Auto-create a goal if none is active (backward compat: first call just works)
-        const engine = ensureGoal()
+        let engine = ensureGoal()
         try {
           const list = await engine.setCriteria(criteria.map(c => ({
             id: c.id,
@@ -502,6 +502,24 @@ export function createMcpServer(): Server {
           }
         } catch (e) {
           if (e instanceof GoalAcceptanceError && e.code === 'GOAL_ACCEPTANCE_ALREADY_LOCKED') {
+            // Check if the current goal is already completed — if so, auto-start a new goal
+            const completedGoalId = currentGoalId
+            if (engine.canComplete().allowed) {
+              startGoal()
+              engine = getEngine()
+              const list = await engine.setCriteria(criteria.map(c => ({
+                id: c.id,
+                description: c.description,
+                ...c.required !== undefined ? { required: c.required } : {},
+                ...c.method !== undefined ? { method: c.method } : {},
+                ...c.task_ids !== undefined ? { taskIds: c.task_ids } : {},
+                ...c.depends_on !== undefined ? { dependsOn: c.depends_on } : {},
+              })), role)
+              const summary = engine.summarize()
+              return {
+                content: [{ type: 'text', text: JSON.stringify({ goalId: currentGoalId, previousGoalId: completedGoalId, autoStarted: true, criteria: list, summary }, null, 2) }],
+              }
+            }
             throw new GoalAcceptanceError(
               `criteria are already locked for goal ${currentGoalId}. Call start_goal to begin a new goal, or reset_goal to clear the current one.`,
               'GOAL_ACCEPTANCE_ALREADY_LOCKED',
