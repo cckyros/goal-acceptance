@@ -14,6 +14,20 @@ describe('GoalAcceptanceMcpServer', () => {
     return { client, server }
   }
 
+  /** Call a tool and assert it returns an error response (isError: true) containing the expected substring. */
+  async function expectErrorResponse(
+    client: Client,
+    name: string,
+    args: Record<string, unknown>,
+    expected: string,
+  ): Promise<void> {
+    const result = await client.callTool({ name, arguments: args })
+    expect(result.isError).toBe(true)
+    const text = String((result.content as Array<{ type: string; text: string }>)[0]!.text)
+    const parsed = JSON.parse(text)
+    expect(parsed.error).toContain(expected)
+  }
+
   it('lists tools', async () => {
     const { client } = await createClient()
     const tools = await client.listTools()
@@ -323,15 +337,12 @@ describe('GoalAcceptanceMcpServer', () => {
       name: 'set_acceptance_criteria',
       arguments: { criteria: [{ id: 'c1', description: 'test' }] },
     })
-    await expect(client.callTool({
-      name: 'set_task_plan',
-      arguments: {
+    await expectErrorResponse(client, 'set_task_plan', {
         tasks: [
           { id: 't1', description: 'One', deliverable: 'a.txt' },
           { id: 't1', description: 'Two', deliverable: 'b.txt' },
         ],
-      },
-    })).rejects.toThrow('duplicate task id')
+      }, 'duplicate task id')
   })
 
   it('rejects task plan with missing deliverable', async () => {
@@ -340,14 +351,11 @@ describe('GoalAcceptanceMcpServer', () => {
       name: 'set_acceptance_criteria',
       arguments: { criteria: [{ id: 'c1', description: 'test' }] },
     })
-    await expect(client.callTool({
-      name: 'set_task_plan',
-      arguments: {
+    await expectErrorResponse(client, 'set_task_plan', {
         tasks: [
           { id: 't1', description: 'No deliverable', deliverable: '' },
         ],
-      },
-    })).rejects.toThrow('must declare a deliverable')
+      }, 'must declare a deliverable')
   })
 
   it('rejects task plan with dependency cycle', async () => {
@@ -356,15 +364,12 @@ describe('GoalAcceptanceMcpServer', () => {
       name: 'set_acceptance_criteria',
       arguments: { criteria: [{ id: 'c1', description: 'test' }] },
     })
-    await expect(client.callTool({
-      name: 'set_task_plan',
-      arguments: {
+    await expectErrorResponse(client, 'set_task_plan', {
         tasks: [
           { id: 't1', description: 'One', deliverable: 'a.txt', depends_on: ['t2'] },
           { id: 't2', description: 'Two', deliverable: 'b.txt', depends_on: ['t1'] },
         ],
-      },
-    })).rejects.toThrow('dependency cycle')
+      }, 'dependency cycle')
   })
 
   it('rejects task plan with unknown dependency', async () => {
@@ -373,25 +378,23 @@ describe('GoalAcceptanceMcpServer', () => {
       name: 'set_acceptance_criteria',
       arguments: { criteria: [{ id: 'c1', description: 'test' }] },
     })
-    await expect(client.callTool({
-      name: 'set_task_plan',
-      arguments: {
+    await expectErrorResponse(client, 'set_task_plan', {
         tasks: [
           { id: 't1', description: 'One', deliverable: 'a.txt', depends_on: ['ghost'] },
         ],
-      },
-    })).rejects.toThrow('unknown task')
+      }, 'unknown task')
   })
 
   it('rejects task plan before criteria are locked', async () => {
     const { client } = await createClient()
-    // No active goal yet — set_task_plan should fail
-    await expect(client.callTool({
+    // No active goal yet — set_task_plan should fail with structured error
+    const result = await client.callTool({
       name: 'set_task_plan',
       arguments: {
         tasks: [{ id: 't1', description: 'One', deliverable: 'a.txt' }],
       },
-    })).rejects.toThrow()
+    })
+    expect(result.isError).toBe(true)
   })
 
   it('rejects setting task plan twice', async () => {
@@ -404,10 +407,7 @@ describe('GoalAcceptanceMcpServer', () => {
       name: 'set_task_plan',
       arguments: { tasks: [{ id: 't1', description: 'One', deliverable: 'a.txt' }] },
     })
-    await expect(client.callTool({
-      name: 'set_task_plan',
-      arguments: { tasks: [{ id: 't2', description: 'Two', deliverable: 'b.txt' }] },
-    })).rejects.toThrow('already set')
+    await expectErrorResponse(client, 'set_task_plan', { tasks: [{ id: 't2', description: 'Two', deliverable: 'b.txt' }] }, 'already set')
   })
 
   it('task plan statuses flow through update_task_status and get_task_plan', async () => {
@@ -489,10 +489,7 @@ describe('GoalAcceptanceMcpServer', () => {
       name: 'set_acceptance_criteria',
       arguments: { criteria: [{ id: 'c1', description: 'first' }] },
     })
-    await expect(client.callTool({
-      name: 'set_acceptance_criteria',
-      arguments: { criteria: [{ id: 'c2', description: 'second' }] },
-    })).rejects.toThrow('start_goal')
+    await expectErrorResponse(client, 'set_acceptance_criteria', { criteria: [{ id: 'c2', description: 'second' }] }, 'start_goal')
   })
 
   it('auto-starts new goal when previous goal is completed', async () => {
@@ -619,17 +616,70 @@ describe('GoalAcceptanceMcpServer', () => {
 
   it('switch_goal rejects unknown goal id', async () => {
     const { client } = await createClient()
-    await expect(client.callTool({
-      name: 'switch_goal',
-      arguments: { goal_id: 'nonexistent-id' },
-    })).rejects.toThrow('not found')
+    await expectErrorResponse(client, 'switch_goal', { goal_id: 'nonexistent-id' }, 'not found')
   })
 
   it('reset_goal rejects when no active goal', async () => {
     const { client } = await createClient()
-    await expect(client.callTool({
-      name: 'reset_goal',
+    await expectErrorResponse(client, 'reset_goal', {}, 'no active goal')
+  })
+
+  // ─── Error handling: structured errors + fuzzy matching ───
+
+  it('validate_criterion with unknown id returns error with available IDs and suggestion', async () => {
+    const { client } = await createClient()
+    await client.callTool({
+      name: 'set_acceptance_criteria',
+      arguments: { criteria: [
+        { id: 'unit-tests', description: 'tests pass' },
+        { id: 'lint-check', description: 'lint clean' },
+      ] },
+    })
+    const result = await client.callTool({
+      name: 'validate_criterion',
+      arguments: { criterion_id: 'unit-test', status: 'passed', evidence: 'x', evidence_type: 'command' },
+    })
+    expect(result.isError).toBe(true)
+    const text = String((result.content as Array<{ type: string; text: string }>)[0]!.text)
+    const parsed = JSON.parse(text)
+    expect(parsed.error).toContain('not found')
+    expect(parsed.error).toContain('unit-tests')
+    expect(parsed.error).toContain('lint-check')
+    expect(parsed.error).toContain('Did you mean')
+  })
+
+  it('validate_criterion with unknown id lists all available IDs', async () => {
+    const { client } = await createClient()
+    await client.callTool({
+      name: 'set_acceptance_criteria',
+      arguments: { criteria: [
+        { id: 'core-published', description: 'a' },
+        { id: 'readme-updated', description: 'b' },
+        { id: 'tests-pass', description: 'c' },
+      ] },
+    })
+    const result = await client.callTool({
+      name: 'validate_criterion',
+      arguments: { criterion_id: 'totally-wrong-id', status: 'passed', evidence: 'x' },
+    })
+    expect(result.isError).toBe(true)
+    const text = String((result.content as Array<{ type: string; text: string }>)[0]!.text)
+    const parsed = JSON.parse(text)
+    expect(parsed.error).toContain('core-published')
+    expect(parsed.error).toContain('readme-updated')
+    expect(parsed.error).toContain('tests-pass')
+    expect(parsed.error).toContain('get_acceptance_criteria')
+  })
+
+  it('unknown tool returns structured error instead of crashing', async () => {
+    const { client } = await createClient()
+    const result = await client.callTool({
+      name: 'nonexistent_tool',
       arguments: {},
-    })).rejects.toThrow('no active goal')
+    })
+    expect(result.isError).toBe(true)
+    const text = String((result.content as Array<{ type: string; text: string }>)[0]!.text)
+    const parsed = JSON.parse(text)
+    expect(parsed.error).toContain('Unknown tool')
   })
 })

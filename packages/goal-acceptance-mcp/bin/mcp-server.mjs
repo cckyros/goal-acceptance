@@ -1,7 +1,7 @@
 import { existsSync, mkdirSync, readFileSync, readdirSync, realpathSync, unlinkSync, writeFileSync } from "node:fs";
 import { mkdir, readFile, writeFile } from "node:fs/promises";
-import { join } from "node:path";
-import { pathToFileURL } from "node:url";
+import { dirname, join } from "node:path";
+import { fileURLToPath, pathToFileURL } from "node:url";
 import { randomUUID } from "node:crypto";
 import process from "node:process";
 import { Server } from "@modelcontextprotocol/sdk/server/index.js";
@@ -38,6 +38,46 @@ var FileAcceptanceStore = class {
 };
 //#endregion
 //#region lib/types/mcp-server.js
+/** Levenshtein distance for fuzzy matching. */
+function levenshtein(a, b) {
+	const m = a.length, n = b.length;
+	if (m === 0) return n;
+	if (n === 0) return m;
+	const dp = new Array(n + 1);
+	for (let j = 0; j <= n; j++) dp[j] = j;
+	for (let i = 1; i <= m; i++) {
+		let prev = dp[0];
+		dp[0] = i;
+		for (let j = 1; j <= n; j++) {
+			const tmp = dp[j];
+			dp[j] = Math.min(dp[j] + 1, dp[j - 1] + 1, prev + (a[i - 1] === b[j - 1] ? 0 : 1));
+			prev = tmp;
+		}
+	}
+	return dp[n];
+}
+/** Find closest match from candidates. Returns suggestion if distance <= threshold. */
+function suggestClosest(input, candidates, threshold = 3) {
+	let best;
+	let bestDist = threshold + 1;
+	for (const c of candidates) {
+		const d = levenshtein(input.toLowerCase(), c.toLowerCase());
+		if (d < bestDist) {
+			bestDist = d;
+			best = c;
+		}
+	}
+	return best;
+}
+/** Package version read from package.json (single source of truth). */
+const PACKAGE_VERSION = (() => {
+	try {
+		const pkgPath = join(dirname(fileURLToPath(import.meta.url)), "..", "package.json");
+		return JSON.parse(readFileSync(pkgPath, "utf-8")).version;
+	} catch {
+		return "0.0.0";
+	}
+})();
 /** Compact one-line summary for default (non-verbose) responses. */
 function slimSummary(s) {
 	return {
@@ -276,7 +316,7 @@ function createMcpServer() {
 	loadCurrentGoal();
 	const server = new Server({
 		name: "@cckyros/goal-acceptance-mcp",
-		version: "0.1.0-rc.12"
+		version: PACKAGE_VERSION
 	}, { capabilities: { tools: {} } });
 	server.setRequestHandler(ListToolsRequestSchema, async () => ({ tools: [
 		{
@@ -489,200 +529,250 @@ function createMcpServer() {
 	server.setRequestHandler(CallToolRequestSchema, async (request) => {
 		const { name, arguments: args } = request.params;
 		const input = args;
-		switch (name) {
-			case "set_acceptance_criteria": {
-				const criteria = input.criteria;
-				const role = input.role ?? "dual";
-				const engine = ensureGoal();
-				try {
-					const list = await engine.setCriteria(criteria.map((c) => ({
-						id: c.id,
-						description: c.description,
-						...c.required !== void 0 ? { required: c.required } : {},
-						...c.method !== void 0 ? { method: c.method } : {},
-						...c.task_ids !== void 0 ? { taskIds: c.task_ids } : {},
-						...c.depends_on !== void 0 ? { dependsOn: c.depends_on } : {}
-					})), role);
+		try {
+			switch (name) {
+				case "set_acceptance_criteria": {
+					const criteria = input.criteria;
+					const role = input.role ?? "dual";
+					let engine = ensureGoal();
+					try {
+						const list = await engine.setCriteria(criteria.map((c) => ({
+							id: c.id,
+							description: c.description,
+							...c.required !== void 0 ? { required: c.required } : {},
+							...c.method !== void 0 ? { method: c.method } : {},
+							...c.task_ids !== void 0 ? { taskIds: c.task_ids } : {},
+							...c.depends_on !== void 0 ? { dependsOn: c.depends_on } : {}
+						})), role);
+						const summary = engine.summarize();
+						return { content: [{
+							type: "text",
+							text: JSON.stringify({
+								goalId: currentGoalId,
+								criteria: list,
+								summary
+							}, null, 2)
+						}] };
+					} catch (e) {
+						if (e instanceof GoalAcceptanceError && e.code === "GOAL_ACCEPTANCE_ALREADY_LOCKED") {
+							const completedGoalId = currentGoalId;
+							if (engine.canComplete().allowed) {
+								startGoal();
+								engine = getEngine();
+								const list = await engine.setCriteria(criteria.map((c) => ({
+									id: c.id,
+									description: c.description,
+									...c.required !== void 0 ? { required: c.required } : {},
+									...c.method !== void 0 ? { method: c.method } : {},
+									...c.task_ids !== void 0 ? { taskIds: c.task_ids } : {},
+									...c.depends_on !== void 0 ? { dependsOn: c.depends_on } : {}
+								})), role);
+								const summary = engine.summarize();
+								return { content: [{
+									type: "text",
+									text: JSON.stringify({
+										goalId: currentGoalId,
+										previousGoalId: completedGoalId,
+										autoStarted: true,
+										criteria: list,
+										summary
+									}, null, 2)
+								}] };
+							}
+							throw new GoalAcceptanceError(`criteria are already locked for goal ${currentGoalId}. Call start_goal to begin a new goal, or reset_goal to clear the current one.`, "GOAL_ACCEPTANCE_ALREADY_LOCKED");
+						}
+						throw e;
+					}
+				}
+				case "get_acceptance_criteria": {
+					const verbose = input.verbose !== false;
+					const engine = getEngine();
+					const summary = engine.summarize();
+					if (!verbose) return { content: [{
+						type: "text",
+						text: JSON.stringify({
+							goalId: currentGoalId,
+							summary: slimSummary(summary)
+						})
+					}] };
+					const criteria = engine.getCriteria();
+					return { content: [{
+						type: "text",
+						text: JSON.stringify({
+							goalId: currentGoalId,
+							criteria,
+							summary
+						}, null, 2)
+					}] };
+				}
+				case "validate_criterion": {
+					const engine = getEngine();
+					try {
+						const updated = await engine.validateCriterion({
+							criterionId: input.criterion_id,
+							status: input.status,
+							evidence: input.evidence,
+							...input.evidence_type !== void 0 ? { evidenceType: input.evidence_type } : {}
+						});
+						const verbose = input.verbose === true;
+						const summary = engine.summarize();
+						return { content: [{
+							type: "text",
+							text: JSON.stringify(verbose ? {
+								goalId: currentGoalId,
+								criterion: updated,
+								summary
+							} : {
+								goalId: currentGoalId,
+								criterion: updated,
+								summary: slimSummary(summary)
+							}, null, 2)
+						}] };
+					} catch (e) {
+						if (e instanceof GoalAcceptanceError && e.code === "GOAL_ACCEPTANCE_CRITERION_NOT_FOUND") {
+							const allIds = engine.getCriteria().map((c) => c.id);
+							const suggestion = suggestClosest(input.criterion_id, allIds);
+							throw new GoalAcceptanceError(`criterion_id "${input.criterion_id}" not found. Available IDs: [${allIds.join(", ")}].${suggestion ? ` Did you mean "${suggestion}"?` : ""} Call get_acceptance_criteria to see the full list.`, "GOAL_ACCEPTANCE_CRITERION_NOT_FOUND");
+						}
+						throw e;
+					}
+				}
+				case "update_task_status": {
+					const engine = getEngine();
+					await engine.updateTaskStatus({
+						taskId: input.task_id,
+						status: input.status
+					});
+					const verbose = input.verbose === true;
+					const summary = engine.summarize();
+					return { content: [{
+						type: "text",
+						text: JSON.stringify(verbose ? {
+							goalId: currentGoalId,
+							taskId: input.task_id,
+							status: input.status,
+							summary
+						} : {
+							goalId: currentGoalId,
+							taskId: input.task_id,
+							status: input.status,
+							summary: slimSummary(summary)
+						}, null, 2)
+					}] };
+				}
+				case "amend_acceptance_criteria": {
+					const engine = getEngine();
+					const criteria = input.criteria;
+					const added = await engine.amendCriteria({
+						criteria: criteria.map((c) => ({
+							id: c.id,
+							description: c.description,
+							...c.required !== void 0 ? { required: c.required } : {},
+							...c.method !== void 0 ? { method: c.method } : {},
+							...c.task_ids !== void 0 ? { taskIds: c.task_ids } : {},
+							...c.depends_on !== void 0 ? { dependsOn: c.depends_on } : {}
+						})),
+						reason: input.reason
+					});
 					const summary = engine.summarize();
 					return { content: [{
 						type: "text",
 						text: JSON.stringify({
 							goalId: currentGoalId,
-							criteria: list,
+							addedCriteria: added,
 							summary
 						}, null, 2)
 					}] };
-				} catch (e) {
-					if (e instanceof GoalAcceptanceError && e.code === "GOAL_ACCEPTANCE_ALREADY_LOCKED") throw new GoalAcceptanceError(`criteria are already locked for goal ${currentGoalId}. Call start_goal to begin a new goal, or reset_goal to clear the current one.`, "GOAL_ACCEPTANCE_ALREADY_LOCKED");
-					throw e;
 				}
+				case "can_complete_goal": {
+					const result = getEngine().canComplete();
+					return { content: [{
+						type: "text",
+						text: JSON.stringify({
+							goalId: currentGoalId,
+							...result
+						}, null, 2)
+					}] };
+				}
+				case "set_task_plan": {
+					const engine = getEngine();
+					const tasks = input.tasks;
+					const plan = await engine.setTaskPlan(tasks.map((t) => ({
+						id: t.id,
+						description: t.description,
+						deliverable: t.deliverable,
+						...t.depends_on !== void 0 ? { dependsOn: t.depends_on } : {}
+					})));
+					const summary = engine.summarize();
+					return { content: [{
+						type: "text",
+						text: JSON.stringify({
+							goalId: currentGoalId,
+							taskPlan: plan,
+							summary: slimSummary(summary)
+						}, null, 2)
+					}] };
+				}
+				case "get_task_plan": {
+					const plan = getEngine().getTaskPlan();
+					return { content: [{
+						type: "text",
+						text: JSON.stringify({
+							goalId: currentGoalId,
+							taskPlan: plan
+						}, null, 2)
+					}] };
+				}
+				case "start_goal": {
+					const title = input.title;
+					const meta = startGoal(title);
+					return { content: [{
+						type: "text",
+						text: JSON.stringify({
+							goal: meta,
+							message: "New goal started and set as active."
+						}, null, 2)
+					}] };
+				}
+				case "list_goals": {
+					const goals = listGoals();
+					return { content: [{
+						type: "text",
+						text: JSON.stringify({ goals }, null, 2)
+					}] };
+				}
+				case "switch_goal": {
+					const id = input.goal_id;
+					const meta = switchGoal(id);
+					return { content: [{
+						type: "text",
+						text: JSON.stringify({
+							goal: meta,
+							message: "Switched active goal."
+						}, null, 2)
+					}] };
+				}
+				case "reset_goal":
+					resetGoal();
+					return { content: [{
+						type: "text",
+						text: JSON.stringify({ message: "Current goal deleted. No active goal. Call set_acceptance_criteria to auto-create a new one, or start_goal." }, null, 2)
+					}] };
+				default: throw new Error(`Unknown tool: ${name}`);
 			}
-			case "get_acceptance_criteria": {
-				const verbose = input.verbose !== false;
-				const engine = getEngine();
-				const summary = engine.summarize();
-				if (!verbose) return { content: [{
+		} catch (e) {
+			const message = e instanceof Error ? e.message : String(e);
+			const code = e instanceof GoalAcceptanceError ? e.code : "GOAL_ACCEPTANCE_INTERNAL_ERROR";
+			return {
+				content: [{
 					type: "text",
 					text: JSON.stringify({
-						goalId: currentGoalId,
-						summary: slimSummary(summary)
-					})
-				}] };
-				const criteria = engine.getCriteria();
-				return { content: [{
-					type: "text",
-					text: JSON.stringify({
-						goalId: currentGoalId,
-						criteria,
-						summary
+						error: message,
+						code
 					}, null, 2)
-				}] };
-			}
-			case "validate_criterion": {
-				const engine = getEngine();
-				const updated = await engine.validateCriterion({
-					criterionId: input.criterion_id,
-					status: input.status,
-					evidence: input.evidence,
-					...input.evidence_type !== void 0 ? { evidenceType: input.evidence_type } : {}
-				});
-				const verbose = input.verbose === true;
-				const summary = engine.summarize();
-				return { content: [{
-					type: "text",
-					text: JSON.stringify(verbose ? {
-						goalId: currentGoalId,
-						criterion: updated,
-						summary
-					} : {
-						goalId: currentGoalId,
-						criterion: updated,
-						summary: slimSummary(summary)
-					}, null, 2)
-				}] };
-			}
-			case "update_task_status": {
-				const engine = getEngine();
-				await engine.updateTaskStatus({
-					taskId: input.task_id,
-					status: input.status
-				});
-				const verbose = input.verbose === true;
-				const summary = engine.summarize();
-				return { content: [{
-					type: "text",
-					text: JSON.stringify(verbose ? {
-						goalId: currentGoalId,
-						taskId: input.task_id,
-						status: input.status,
-						summary
-					} : {
-						goalId: currentGoalId,
-						taskId: input.task_id,
-						status: input.status,
-						summary: slimSummary(summary)
-					}, null, 2)
-				}] };
-			}
-			case "amend_acceptance_criteria": {
-				const engine = getEngine();
-				const criteria = input.criteria;
-				const added = await engine.amendCriteria({
-					criteria: criteria.map((c) => ({
-						id: c.id,
-						description: c.description,
-						...c.required !== void 0 ? { required: c.required } : {},
-						...c.method !== void 0 ? { method: c.method } : {},
-						...c.task_ids !== void 0 ? { taskIds: c.task_ids } : {},
-						...c.depends_on !== void 0 ? { dependsOn: c.depends_on } : {}
-					})),
-					reason: input.reason
-				});
-				const summary = engine.summarize();
-				return { content: [{
-					type: "text",
-					text: JSON.stringify({
-						goalId: currentGoalId,
-						addedCriteria: added,
-						summary
-					}, null, 2)
-				}] };
-			}
-			case "can_complete_goal": {
-				const result = getEngine().canComplete();
-				return { content: [{
-					type: "text",
-					text: JSON.stringify({
-						goalId: currentGoalId,
-						...result
-					}, null, 2)
-				}] };
-			}
-			case "set_task_plan": {
-				const engine = getEngine();
-				const tasks = input.tasks;
-				const plan = await engine.setTaskPlan(tasks.map((t) => ({
-					id: t.id,
-					description: t.description,
-					deliverable: t.deliverable,
-					...t.depends_on !== void 0 ? { dependsOn: t.depends_on } : {}
-				})));
-				const summary = engine.summarize();
-				return { content: [{
-					type: "text",
-					text: JSON.stringify({
-						goalId: currentGoalId,
-						taskPlan: plan,
-						summary: slimSummary(summary)
-					}, null, 2)
-				}] };
-			}
-			case "get_task_plan": {
-				const plan = getEngine().getTaskPlan();
-				return { content: [{
-					type: "text",
-					text: JSON.stringify({
-						goalId: currentGoalId,
-						taskPlan: plan
-					}, null, 2)
-				}] };
-			}
-			case "start_goal": {
-				const title = input.title;
-				const meta = startGoal(title);
-				return { content: [{
-					type: "text",
-					text: JSON.stringify({
-						goal: meta,
-						message: "New goal started and set as active."
-					}, null, 2)
-				}] };
-			}
-			case "list_goals": {
-				const goals = listGoals();
-				return { content: [{
-					type: "text",
-					text: JSON.stringify({ goals }, null, 2)
-				}] };
-			}
-			case "switch_goal": {
-				const id = input.goal_id;
-				const meta = switchGoal(id);
-				return { content: [{
-					type: "text",
-					text: JSON.stringify({
-						goal: meta,
-						message: "Switched active goal."
-					}, null, 2)
-				}] };
-			}
-			case "reset_goal":
-				resetGoal();
-				return { content: [{
-					type: "text",
-					text: JSON.stringify({ message: "Current goal deleted. No active goal. Call set_acceptance_criteria to auto-create a new one, or start_goal." }, null, 2)
-				}] };
-			default: throw new Error(`Unknown tool: ${name}`);
+				}],
+				isError: true
+			};
 		}
 	});
 	return server;

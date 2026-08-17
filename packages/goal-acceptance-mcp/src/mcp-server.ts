@@ -24,6 +24,39 @@ interface GoalMeta {
   readonly createdAt: number
 }
 
+/** Levenshtein distance for fuzzy matching. */
+function levenshtein(a: string, b: string): number {
+  const m = a.length, n = b.length
+  if (m === 0) return n
+  if (n === 0) return m
+  const dp: number[] = new Array<number>(n + 1)
+  for (let j = 0; j <= n; j++) dp[j] = j
+  for (let i = 1; i <= m; i++) {
+    let prev = dp[0]!
+    dp[0] = i
+    for (let j = 1; j <= n; j++) {
+      const tmp = dp[j]!
+      dp[j] = Math.min(dp[j]! + 1, dp[j - 1]! + 1, prev + (a[i - 1] === b[j - 1] ? 0 : 1))
+      prev = tmp
+    }
+  }
+  return dp[n]!
+}
+
+/** Find closest match from candidates. Returns suggestion if distance <= threshold. */
+function suggestClosest(input: string, candidates: readonly string[], threshold = 3): string | undefined {
+  let best: string | undefined
+  let bestDist = threshold + 1
+  for (const c of candidates) {
+    const d = levenshtein(input.toLowerCase(), c.toLowerCase())
+    if (d < bestDist) {
+      bestDist = d
+      best = c
+    }
+  }
+  return best
+}
+
 /** Package version read from package.json (single source of truth). */
 const PACKAGE_VERSION: string = (() => {
   try {
@@ -481,6 +514,7 @@ export function createMcpServer(): Server {
     const { name, arguments: args } = request.params
     const input = args as ToolInput
 
+    try {
     switch (name) {
       case 'set_acceptance_criteria': {
         const criteria = input.criteria as Array<{ id: string; description: string; required?: boolean; method?: string; task_ids?: string[]; depends_on?: string[] }>
@@ -544,21 +578,33 @@ export function createMcpServer(): Server {
       }
       case 'validate_criterion': {
         const engine = getEngine()
-        const updated = await engine.validateCriterion({
-          criterionId: input.criterion_id as string,
-          status: input.status as import('@cckyros/goal-acceptance-core').GoalCriterionStatus,
-          evidence: input.evidence as string | undefined,
-          ...input.evidence_type !== undefined ? { evidenceType: input.evidence_type as EvidenceType } : {},
-        })
-        const verbose = input.verbose === true
-        const summary = engine.summarize()
-        return {
-          content: [{ type: 'text', text: JSON.stringify(
-            verbose
-              ? { goalId: currentGoalId, criterion: updated, summary }
-              : { goalId: currentGoalId, criterion: updated, summary: slimSummary(summary) },
-            null, 2,
-          ) }],
+        try {
+          const updated = await engine.validateCriterion({
+            criterionId: input.criterion_id as string,
+            status: input.status as import('@cckyros/goal-acceptance-core').GoalCriterionStatus,
+            evidence: input.evidence as string | undefined,
+            ...input.evidence_type !== undefined ? { evidenceType: input.evidence_type as EvidenceType } : {},
+          })
+          const verbose = input.verbose === true
+          const summary = engine.summarize()
+          return {
+            content: [{ type: 'text', text: JSON.stringify(
+              verbose
+                ? { goalId: currentGoalId, criterion: updated, summary }
+                : { goalId: currentGoalId, criterion: updated, summary: slimSummary(summary) },
+              null, 2,
+            ) }],
+          }
+        } catch (e) {
+          if (e instanceof GoalAcceptanceError && e.code === 'GOAL_ACCEPTANCE_CRITERION_NOT_FOUND') {
+            const allIds = engine.getCriteria().map(c => c.id)
+            const suggestion = suggestClosest(input.criterion_id as string, allIds)
+            throw new GoalAcceptanceError(
+              `criterion_id "${input.criterion_id}" not found. Available IDs: [${allIds.join(', ')}].${suggestion ? ` Did you mean "${suggestion}"?` : ''} Call get_acceptance_criteria to see the full list.`,
+              'GOAL_ACCEPTANCE_CRITERION_NOT_FOUND',
+            )
+          }
+          throw e
         }
       }
       case 'update_task_status': {
@@ -653,6 +699,15 @@ export function createMcpServer(): Server {
       }
       default:
         throw new Error(`Unknown tool: ${name}`)
+    }
+    } catch (e) {
+      // Global error fallback: return structured error response instead of crashing
+      const message = e instanceof Error ? e.message : String(e)
+      const code = e instanceof GoalAcceptanceError ? e.code : 'GOAL_ACCEPTANCE_INTERNAL_ERROR'
+      return {
+        content: [{ type: 'text', text: JSON.stringify({ error: message, code }, null, 2) }],
+        isError: true,
+      }
     }
   })
 
