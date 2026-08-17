@@ -99,7 +99,7 @@ describe('GoalAcceptanceEngine', () => {
 
   it('canComplete allows when all required passed', async () => {
     const { engine } = createEngine()
-    await engine.setCriteria([{ id: 'c1', description: 'API returns 200' }])
+    await engine.setCriteria([{ id: 'c1', description: 'API returns 200' }], 'dual')
     await engine.validateCriterion({
       criterionId: 'c1',
       status: 'passed',
@@ -338,12 +338,12 @@ describe('GoalAcceptanceEngine — role and self-claimed', () => {
     return new GoalAcceptanceEngine(new InMemoryAcceptanceStore())
   }
 
-  it('defaults to dual role when not specified', async () => {
+  it('defaults to agent role when not specified (passed is self-claimed)', async () => {
     const engine = createEngine()
     await engine.setCriteria([{ id: 'c1', description: 'test' }])
     await engine.validateCriterion({ criterionId: 'c1', status: 'passed', evidence: 'ok' })
     const c = engine.getCriterion('c1')!
-    expect(c.selfClaimed).toBe(false)
+    expect(c.selfClaimed).toBe(true)
   })
 
   it('marks passed as self-claimed when role=agent', async () => {
@@ -393,6 +393,57 @@ describe('GoalAcceptanceEngine — role and self-claimed', () => {
     await engine.setCriteria([{ id: 'c1', description: 'required', required: true }], 'reviewer')
     await engine.validateCriterion({ criterionId: 'c1', status: 'passed', evidence: 'reviewer confirmed' })
     expect(engine.canComplete().allowed).toBe(true)
+  })
+
+  it('confirmCriterion converts self-claimed to formal pass and unblocks completion', async () => {
+    const engine = createEngine()
+    await engine.setCriteria([{ id: 'c1', description: 'required', required: true }], 'agent')
+    await engine.validateCriterion({ criterionId: 'c1', status: 'passed', evidence: 'agent claim', evidenceType: 'command' })
+    expect(engine.canComplete().allowed).toBe(false)
+
+    const confirmed = await engine.confirmCriterion({ criterionId: 'c1', evidence: 'reviewer re-ran tests: all green', evidenceType: 'command' })
+    expect(confirmed.selfClaimed).toBe(false)
+    expect(confirmed.status).toBe('passed')
+    expect(confirmed.evidence).toBe('reviewer re-ran tests: all green')
+    expect(engine.canComplete().allowed).toBe(true)
+  })
+
+  it('confirmCriterion rejects text evidence', async () => {
+    const engine = createEngine()
+    await engine.setCriteria([{ id: 'c1', description: 'test' }], 'agent')
+    await engine.validateCriterion({ criterionId: 'c1', status: 'passed', evidence: 'ok' })
+    await expect(engine.confirmCriterion({ criterionId: 'c1', evidence: 'looks fine to me', evidenceType: 'text' }))
+      .rejects.toThrow('high-confidence')
+  })
+
+  it('confirmCriterion rejects non-self-claimed criteria', async () => {
+    const engine = createEngine()
+    await engine.setCriteria([{ id: 'c1', description: 'test' }], 'reviewer')
+    await engine.validateCriterion({ criterionId: 'c1', status: 'passed', evidence: 'ok' })
+    await expect(engine.confirmCriterion({ criterionId: 'c1', evidence: 'x', evidenceType: 'command' }))
+      .rejects.toThrow('not a self-claimed pass')
+  })
+
+  it('confirmCriterion rejects pending criteria', async () => {
+    const engine = createEngine()
+    await engine.setCriteria([{ id: 'c1', description: 'test' }], 'agent')
+    await expect(engine.confirmCriterion({ criterionId: 'c1', evidence: 'x', evidenceType: 'command' }))
+      .rejects.toThrow('not a self-claimed pass')
+  })
+
+  it('confirmCriterion rejects unknown criterion id', async () => {
+    const engine = createEngine()
+    await engine.setCriteria([{ id: 'c1', description: 'test' }], 'agent')
+    await expect(engine.confirmCriterion({ criterionId: 'ghost', evidence: 'x', evidenceType: 'command' }))
+      .rejects.toThrow('not found')
+  })
+
+  it('confirmCriterion rejects empty evidence', async () => {
+    const engine = createEngine()
+    await engine.setCriteria([{ id: 'c1', description: 'test' }], 'agent')
+    await engine.validateCriterion({ criterionId: 'c1', status: 'passed', evidence: 'ok' })
+    await expect(engine.confirmCriterion({ criterionId: 'c1', evidence: '  ', evidenceType: 'command' }))
+      .rejects.toThrow('evidence is required')
   })
 
   it('self-claimed count appears in summary', async () => {

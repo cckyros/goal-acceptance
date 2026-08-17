@@ -342,7 +342,7 @@ export function createMcpServer(): Server {
             role: {
               type: 'string',
               enum: ['agent', 'reviewer', 'dual'],
-              description: 'Role locking the criteria. agent: passed marks self-claimed. reviewer/dual: formal passed. Default: dual.',
+              description: 'Role locking the criteria. agent (default): passed marks self-claimed, requiring confirm_criterion by an independent reviewer. reviewer/dual: formal passed immediately (use only when the user explicitly waives independent review).',
             },
           },
         },
@@ -384,6 +384,24 @@ export function createMcpServer(): Server {
             verbose: {
               type: 'boolean',
               description: 'Default false: returns criterion + slim summary. true: returns criterion + full summary.',
+            },
+          },
+        },
+      },
+      {
+        name: 'confirm_criterion',
+        description: 'Reviewer confirmation of a self-claimed passed criterion. MUST be called by an independent reviewer agent (e.g. a subagent that did not do the work), NOT by the agent that performed the task. The reviewer must independently re-verify the criterion (re-run tests, re-check files) and provide that fresh evidence here. Requires high-confidence evidence_type (command/file/url); text is rejected. Converts self-claimed to formal pass, unblocking can_complete_goal.',
+        inputSchema: {
+          type: 'object',
+          additionalProperties: false,
+          required: ['criterion_id', 'evidence', 'evidence_type'],
+          properties: {
+            criterion_id: { type: 'string', description: 'Criterion id to confirm. Must currently be passed and self-claimed.' },
+            evidence: { type: 'string', description: 'Independent re-verification evidence gathered by the reviewer (not copied from the original validation).' },
+            evidence_type: {
+              type: 'string',
+              enum: ['command', 'file', 'url'],
+              description: 'Type of evidence. Must be high-confidence; text is not accepted.',
             },
           },
         },
@@ -518,7 +536,7 @@ export function createMcpServer(): Server {
     switch (name) {
       case 'set_acceptance_criteria': {
         const criteria = input.criteria as Array<{ id: string; description: string; required?: boolean; method?: string; task_ids?: string[]; depends_on?: string[] }>
-        const role = (input.role as GoalRole | undefined) ?? 'dual'
+        const role = (input.role as GoalRole | undefined) ?? 'agent'
         // Auto-create a goal if none is active (backward compat: first call just works)
         let engine = ensureGoal()
         try {
@@ -605,6 +623,18 @@ export function createMcpServer(): Server {
             )
           }
           throw e
+        }
+      }
+      case 'confirm_criterion': {
+        const engine = getEngine()
+        const updated = await engine.confirmCriterion({
+          criterionId: input.criterion_id as string,
+          evidence: input.evidence as string,
+          evidenceType: input.evidence_type as EvidenceType,
+        })
+        const summary = engine.summarize()
+        return {
+          content: [{ type: 'text', text: JSON.stringify({ goalId: currentGoalId, criterion: updated, summary: slimSummary(summary) }, null, 2) }],
         }
       }
       case 'update_task_status': {

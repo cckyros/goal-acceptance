@@ -109,6 +109,16 @@ export interface ValidateCriterionSpec {
   readonly evidenceType?: EvidenceType
 }
 
+/** Input for reviewer confirmation of a self-claimed passed criterion. */
+export interface ConfirmCriterionSpec {
+  /** Criterion id to confirm. Must be passed and self-claimed. */
+  readonly criterionId: string
+  /** Independent re-verification evidence gathered by the reviewer. Required. */
+  readonly evidence: string
+  /** Type of evidence. Must be high-confidence: 'command', 'file', or 'url'. 'text' is rejected. */
+  readonly evidenceType: EvidenceType
+}
+
 /** Input for updating a linked task's status. */
 export interface TaskUpdateSpec {
   /** Task ID to update. */
@@ -208,6 +218,8 @@ export type GoalAcceptanceErrorCode =
   | 'GOAL_ACCEPTANCE_TASK_PLAN_ALREADY_SET'
   | 'GOAL_ACCEPTANCE_TASK_NOT_FOUND'
   | 'GOAL_ACCEPTANCE_NO_ACTIVE_GOAL'
+  | 'GOAL_ACCEPTANCE_NOT_SELF_CLAIMED'
+  | 'GOAL_ACCEPTANCE_LOW_CONFIDENCE_EVIDENCE'
 
 /** Event payload when initial criteria are locked. */
 export interface GoalAcceptanceSetEvent {

@@ -27,15 +27,15 @@ Plugins. One package, multiple runtimes:
 | **DeepSeek Harness** | Cordis plugin (`@cckyros/dsh-goal-acceptance`) | **Yes** — `agent.steer()` forces continuation |
 | **Any MCP client** | stdio MCP server | Model voluntarily calls tools |
 | **Any Agent Plugins client** | plugin.json + mcp.json + skills | Model voluntarily calls tools |
-| **Any JS/TS runtime** | Core library (`@cckyros/goal-acceptance-core`) | Programmatic — you control it |
+| **Any JS/TS runtime** | Core library (`@cckyros/goal-acceptance-core`) | Programmatic —you control it |
 
 The core state machine is **zero-dependency** and runs in any JS/TS runtime
 (Node.js, Bun, Deno, browser). The MCP server adds only the MCP SDK. The Cordis
 plugin adds DeepSeek Harness integration. You pick the layer you need.
 
-### 2. MCP server with 12 tools
+### 2. MCP server with 13 tools
 
-The MCP server exposes 12 tools covering the full goal-acceptance lifecycle:
+The MCP server exposes 13 tools covering the full goal-acceptance lifecycle:
 
 - **Criteria management**: set, get, amend
 - **Task plan management**: set task plan, get task plan
@@ -48,8 +48,7 @@ See [MCP Tools](#mcp-tools) below for the full list.
 
 ### Multi-goal isolation
 
-Each goal has its own event file under `${PLUGIN_DATA}/goals/{goalId}.json` —
-multiple projects and windows can share one server without lock conflicts:
+Each goal has its own event file under `${PLUGIN_DATA}/goals/{goalId}.json` —multiple projects and windows can share one server without lock conflicts:
 
 - `set_acceptance_criteria` auto-creates a goal when none is active
 - `start_goal` begins a new independent goal (fresh criteria + task plan)
@@ -102,22 +101,7 @@ for the full summary. This minimizes token overhead during normal operation.
 ## Architecture
 
 ```
-                    ┌─────────────────────────────────────────────────┐
-                    │ @cckyros/goal-acceptance-core                   │
-                    │ (zero-dep state machine, event-sourced)         │
-                    └──┬──────────────┬───────────────┬───────────────┘
-                       │              │               │
-          ┌────────────┴───────┐ ┌───┴──────────┐ ┌──┴──────────────────────┐
-          │ @cckyros/goal-     │ │ @cckyros/    │ │ @cckyros/dsh-goal-      │
-          │ acceptance-mcp     │ │ goal-        │ │ acceptance              │
-          │ (MCP stdio server +│ │ acceptance-  │ │ (DeepSeek Harness       │
-          │  Agent Plugin      │ │ openclaw     │ │  Cordis plugin)         │
-          │  bundle)           │ │ (OpenClaw    │ │ turn-stopping           │
-          │ 12 tools, stdio    │ │  native)     │ │ agent.steer()           │
-          │ skills/ included   │ │ 12 tools,    │ │ system prompt           │
-          │                    │ │ in-process   │ │ tool registration       │
-          └────────────────────┘ └──────────────┘ └─────────────────────────┘
-```
+                    ┌─────────────────────────────────────────────────—                    —@cckyros/goal-acceptance-core                   —                    —(zero-dep state machine, event-sourced)         —                    └──┬──────────────┬───────────────┬───────────────—                       —             —              —          ┌────────────┴───────—┌───┴──────────—┌──┴──────────────────────—          —@cckyros/goal-     ——@cckyros/    ——@cckyros/dsh-goal-      —          —acceptance-mcp     ——goal-        ——acceptance              —          —(MCP stdio server +——acceptance-  ——(DeepSeek Harness       —          — Agent Plugin      ——openclaw     —— Cordis plugin)         —          — bundle)           ——(OpenClaw    ——turn-stopping           —          —13 tools, stdio    —— native)     ——agent.steer()           —          —skills/ included   ——13 tools,    ——system prompt           —          —                   ——in-process   ——tool registration       —          └────────────────────—└──────────────—└─────────────────────────— ```
 
 ## Quick Start
 
@@ -144,19 +128,19 @@ await engine.updateTaskStatus({ taskId: 'task-2', status: 'completed' })
 
 // When all linked tasks are done, the criterion is "ready to validate"
 const summary = engine.summarize()
-console.log(summary.readyToValidate.map(c => c.id)) // → ['api-200']
+console.log(summary.readyToValidate.map(c => c.id)) // —['api-200']
 
 // Record validation with evidence
 await engine.validateCriterion({
   criterionId: 'api-200',
   status: 'passed',
-  evidence: 'curl /health → HTTP 200 OK',
+  evidence: 'curl /health —HTTP 200 OK',
 })
 
 // Check if goal can complete
 const { allowed, reason } = engine.canComplete()
 console.log(allowed, reason)
-// → true, undefined
+// —true, undefined
 ```
 
 ### MCP server (Devin, Claude Code, Cursor, etc.)
@@ -248,13 +232,14 @@ is not set, state is in-memory only (lost on restart).
 
 1. **Set criteria** — `set_acceptance_criteria` with `role=reviewer` (you verify) or `role=agent` (agent self-claims, you confirm later)
 2. **Set task plan** — `set_task_plan` to decompose the goal into atomic tasks with deliverables and dependencies
-3. **Execute** — `update_task_status` as tasks progress (`pending` → `in_progress` → `completed`)
-4. **Validate** — `validate_criterion` with `evidence_type=command` for high-confidence evidence
-5. **Check** — `can_complete_goal` to verify all required criteria are formally passed
+3. **Execute** — `update_task_status` as tasks progress (`pending` — `in_progress` — `completed`)
+4. **Validate** — `validate_criterion` with `evidence_type=command` for high-confidence evidence. Default `role=agent`: passed criteria are self-claimed.
+5. **Confirm** — `confirm_criterion` (independent reviewer agent only) with fresh `evidence_type=command`/`file`/`url` evidence. Converts self-claimed to formal pass.
+6. **Check** — `can_complete_goal` to verify all required criteria are formally passed
 
 ### OpenClaw native plugin
 
-The `@cckyros/goal-acceptance-openclaw` package is an OpenClaw native plugin that registers all 12 tools directly in-process (no MCP stdio overhead).
+The `@cckyros/goal-acceptance-openclaw` package is an OpenClaw native plugin that registers all 13 tools directly in-process (no MCP stdio overhead).
 
 ```sh
 openclaw plugins install "npm:@cckyros/goal-acceptance-openclaw@rc"
@@ -275,7 +260,7 @@ openclaw plugins inspect goal-acceptance
 # Status: loaded, Format: openclaw
 ```
 
-The 12 tools are now available in OpenClaw sessions. `Shape: non-capability` is normal for tool plugins — tools are registered via `defineToolPlugin`, not the capability system.
+The 13 tools are now available in OpenClaw sessions. `Shape: non-capability` is normal for tool plugins —tools are registered via `defineToolPlugin`, not the capability system.
 
 ### Agent Plugin (portable bundle format)
 
@@ -337,7 +322,8 @@ The plugin:
 | `get_acceptance_criteria` | Read current criteria, task progress, summary, task plan, ready-to-validate list, and next-actionable ordering. Optional `verbose` parameter (default `true`; pass `false` for slim summary only). |
 | `set_task_plan` | Set and lock the task decomposition plan. Each task must have a unique id, unambiguous description, and concrete deliverable. Dependency cycles are rejected. Requires criteria to be locked first. |
 | `get_task_plan` | Read the current task decomposition plan with live task statuses. |
-| `validate_criterion` | Record status (`pending`/`in_progress`/`passed`/`failed`/`blocked`/`not_run`) and evidence. `passed` and `failed` require evidence. Optional `evidence_type` (`command`/`file`/`url`/`text`, default `text`). When `role=agent`, `passed` is marked self-claimed. Optional `verbose` (default `false`). |
+| `validate_criterion` | Record status (`pending`/`in_progress`/`passed`/`failed`/`blocked`/`not_run`) and evidence. `passed` and `failed` require evidence. Optional `evidence_type` (`command`/`file`/`url`/`text`, default `text`). When `role=agent` (default), `passed` is marked self-claimed. Optional `verbose` (default `false`). |
+| `confirm_criterion` | **Reviewer-only.** Confirm a self-claimed passed criterion with independent re-verification evidence. Requires `evidence_type` of `command`/`file`/`url` (text rejected). Converts self-claimed to formal pass, unblocking `can_complete_goal`. Must be called by an independent reviewer agent, not the agent that did the work. |
 | `update_task_status` | Update a linked task's status (`pending`/`in_progress`/`completed`/`failed`). When all tasks linked to a criterion are completed, it becomes ready to validate. Optional `verbose` (default `false`). |
 | `amend_acceptance_criteria` | Append new criteria after the initial lock. Requires a reason. Existing criteria are not modified. |
 | `can_complete_goal` | Check whether all required criteria are formally passed (self-claimed does not count). Returns `{ allowed: boolean, reason?: string }`. |
@@ -349,24 +335,8 @@ The plugin:
 ## Criterion Status Lifecycle
 
 ```
-                    ┌──────────┐
-                    │ pending  │ ← initial state after setCriteria
-                    └────┬─────┘
-                         │
-              ┌──────────┼──────────┐
-              │          │          │
-              ▼          ▼          ▼
-        ┌──────────┐ ┌────────┐ ┌────────┐
-        │in_progress│ │ passed │ │ failed │
-        └──────────┘ └────────┘ └────────┘
-              │          │          │
-              │          │     ┌────────┐
-              │          │     │blocked │
-              │          │     └────────┘
-              │          │     ┌────────┐
-              └──────────┘─────│not_run │
-                                └────────┘
-```
+                    ┌──────────—                    —pending  ——initial state after setCriteria
+                    └────┬─────—                         —              ┌──────────┼──────────—              —         —         —              —         —         —        ┌──────────—┌────────—┌────────—        │in_progress——passed ——failed —        └──────────—└────────—└────────—              —         —         —              —         —    ┌────────—              —         —    │blocked —              —         —    └────────—              —         —    ┌────────—              └──────────┘─────│not_run —                                └────────— ```
 
 | Status | Meaning | Evidence required |
 |--------|---------|-------------------|
@@ -392,11 +362,11 @@ The plugin:
 
 The engine is event-sourced. The store holds an append-only list of:
 
-- `goal-acceptance/set` — locks the criteria list (with role)
-- `goal-acceptance/task-plan` — locks the task decomposition plan
-- `goal-acceptance/validate` — updates one criterion's status (with evidence type, self-claimed flag)
-- `goal-acceptance/task-update` — updates a linked task's status
-- `goal-acceptance/amend` — appends new criteria after the initial lock
+- `goal-acceptance/set` —locks the criteria list (with role)
+- `goal-acceptance/task-plan` —locks the task decomposition plan
+- `goal-acceptance/validate` —updates one criterion's status (with evidence type, self-claimed flag)
+- `goal-acceptance/task-update` —updates a linked task's status
+- `goal-acceptance/amend` —appends new criteria after the initial lock
 
 On every read, the engine replays events from the store. This enables:
 
@@ -426,7 +396,7 @@ class MyDbStore implements GoalAcceptanceStore {
 
 | Capability | Cordis plugin | MCP server | Agent Plugin | OpenClaw native |
 |------------|:---:|:---:|:---:|:---:|
-| Model tools | `set/get/validate/update_task/amend` | 12 tools (see [MCP Tools](#mcp-tools)) | same as MCP | same as MCP (in-process) |
+| Model tools | `set/get/validate/update_task/amend` | 13 tools (see [MCP Tools](#mcp-tools)) | same as MCP | same as MCP (in-process) |
 | System prompt / Skills | `policy:goal-acceptance` | `skills/` | `skills/` | `skills/` |
 | Turn-stopping enforcement | yes (`agent.steer()`, dependency-aware) | no | no | no |
 | Cross-client portable | no (Harness only) | yes (any MCP client) | yes (any Agent Plugins client) | no (OpenClaw only) |
@@ -447,41 +417,41 @@ instructions.
 ```
 packages/
 ├── goal-acceptance-core/       # Zero-dependency state machine
-│   ├── src/
-│   │   ├── engine.ts           # GoalAcceptanceEngine (criteria + tasks + deps + amend)
-│   │   ├── store.ts            # GoalAcceptanceStore + InMemoryAcceptanceStore
-│   │   ├── types.ts            # GoalCriterion, AcceptanceSummary, events, task types
-│   │   ├── errors.ts           # GoalAcceptanceError
-│   │   └── index.ts            # Public exports
-│   └── tests/
-│       ├── engine.spec.ts      # 51 tests
-│       └── standalone.spec.ts  # 1 test
+—  ├── src/
+—  —  ├── engine.ts           # GoalAcceptanceEngine (criteria + tasks + deps + amend)
+—  —  ├── store.ts            # GoalAcceptanceStore + InMemoryAcceptanceStore
+—  —  ├── types.ts            # GoalCriterion, AcceptanceSummary, events, task types
+—  —  ├── errors.ts           # GoalAcceptanceError
+—  —  └── index.ts            # Public exports
+—  └── tests/
+—      ├── engine.spec.ts      # 51 tests
+—      └── standalone.spec.ts  # 1 test
 ├── goal-acceptance-mcp/        # MCP server + Agent Plugin
-│   ├── src/
-│   │   ├── mcp-server.ts       # stdio MCP server, 12 tools
-│   │   ├── store.ts            # FileAcceptanceStore
-│   │   └── index.ts
-│   ├── bin/mcp-server.mjs      # Built stdio entry point
-│   ├── plugin.json             # Agent Plugins manifest
-│   ├── mcp.json                # MCP server config
-│   ├── skills/                 # Portable Agent Skills (8 skills)
-│   └── tests/
-│       └── mcp-server.spec.ts  # 22 tests
+—  ├── src/
+—  —  ├── mcp-server.ts       # stdio MCP server, 13 tools
+—  —  ├── store.ts            # FileAcceptanceStore
+—  —  └── index.ts
+—  ├── bin/mcp-server.mjs      # Built stdio entry point
+—  ├── plugin.json             # Agent Plugins manifest
+—  ├── mcp.json                # MCP server config
+—  ├── skills/                 # Portable Agent Skills (8 skills)
+—  └── tests/
+—      └── mcp-server.spec.ts  # 22 tests
 ├── goal-acceptance-openclaw/   # OpenClaw native plugin
-│   ├── src/
-│   │   └── index.ts            # defineToolPlugin, 12 tools (in-process)
-│   ├── dist/index.js           # Built entry point
-│   ├── openclaw.plugin.json    # OpenClaw plugin manifest
-│   └── skills/                 # Portable Agent Skills (8 skills)
+—  ├── src/
+—  —  └── index.ts            # defineToolPlugin, 13 tools (in-process)
+—  ├── dist/index.js           # Built entry point
+—  ├── openclaw.plugin.json    # OpenClaw plugin manifest
+—  └── skills/                 # Portable Agent Skills (8 skills)
 └── goal-acceptance/            # DeepSeek Harness Cordis plugin
     ├── src/
-    │   ├── index.ts            # apply(): service + tools + prompt + dependency-aware steering
-    │   ├── service.ts          # GoalAcceptanceService (per-agent engine)
-    │   ├── store.ts            # SessionAcceptanceStore (dsh-session adapter)
-    │   ├── tools.ts            # 5 model tools
-    │   ├── prompt.ts           # System prompt section with task progress
-    │   ├── types.ts            # SessionEventMap declarations
-    │   └── invariant.ts        # Runtime invariant
+    —  ├── index.ts            # apply(): service + tools + prompt + dependency-aware steering
+    —  ├── service.ts          # GoalAcceptanceService (per-agent engine)
+    —  ├── store.ts            # SessionAcceptanceStore (dsh-session adapter)
+    —  ├── tools.ts            # 5 model tools
+    —  ├── prompt.ts           # System prompt section with task progress
+    —  ├── types.ts            # SessionEventMap declarations
+    —  └── invariant.ts        # Runtime invariant
     └── tests/
         ├── service.spec.ts     # 5 tests
         ├── tools.spec.ts       # 3 tests

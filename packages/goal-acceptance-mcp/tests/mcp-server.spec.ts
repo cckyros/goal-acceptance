@@ -31,11 +31,12 @@ describe('GoalAcceptanceMcpServer', () => {
   it('lists tools', async () => {
     const { client } = await createClient()
     const tools = await client.listTools()
-    expect(tools.tools).toHaveLength(12)
+    expect(tools.tools).toHaveLength(13)
     const names = tools.tools.map(t => t.name)
     expect(names).toContain('set_acceptance_criteria')
     expect(names).toContain('get_acceptance_criteria')
     expect(names).toContain('validate_criterion')
+    expect(names).toContain('confirm_criterion')
     expect(names).toContain('update_task_status')
     expect(names).toContain('amend_acceptance_criteria')
     expect(names).toContain('can_complete_goal')
@@ -224,7 +225,7 @@ describe('GoalAcceptanceMcpServer', () => {
     expect(parsed.summary).toBeDefined()
     expect(parsed.summary.allRequiredPassed).toBeDefined()
     expect(parsed.summary.passedCount).toBe(1)
-    expect(parsed.summary.selfClaimedCount).toBe(0)
+    expect(parsed.summary.selfClaimedCount).toBe(1) // default role=agent: passed is self-claimed
     expect(parsed.summary.totalCount).toBe(2)
     // Slim summary should NOT have these heavy fields
     expect(parsed.summary.passed).toBeUndefined()
@@ -494,7 +495,7 @@ describe('GoalAcceptanceMcpServer', () => {
 
   it('auto-starts new goal when previous goal is completed', async () => {
     const { client } = await createClient()
-    // Goal 1: set criteria, validate, complete
+    // Goal 1: set criteria, validate, confirm, complete
     const res1 = await client.callTool({
       name: 'set_acceptance_criteria',
       arguments: { criteria: [{ id: 'c1', description: 'first goal', required: true }] },
@@ -503,6 +504,11 @@ describe('GoalAcceptanceMcpServer', () => {
     await client.callTool({
       name: 'validate_criterion',
       arguments: { criterion_id: 'c1', status: 'passed', evidence: 'done', evidence_type: 'command' },
+    })
+    // Default role=agent: needs reviewer confirmation before completion
+    await client.callTool({
+      name: 'confirm_criterion',
+      arguments: { criterion_id: 'c1', evidence: 'reviewer re-verified: done', evidence_type: 'command' },
     })
     // Goal 1 is now completed
     const canComplete = await client.callTool({ name: 'can_complete_goal', arguments: {} })

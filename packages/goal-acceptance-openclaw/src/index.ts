@@ -269,11 +269,11 @@ export default defineToolPlugin({
           Type.Literal('agent'),
           Type.Literal('reviewer'),
           Type.Literal('dual'),
-        ], { description: 'Role locking the criteria. agent: passed marks self-claimed. reviewer/dual: formal passed. Default: dual.' })),
+        ], { description: 'Role locking the criteria. agent (default): passed marks self-claimed, requiring confirm_criterion by an independent reviewer. reviewer/dual: formal passed immediately (use only when the user explicitly waives independent review).' })),
       }),
       execute: async (params, ctx) => {
         let eng = ensureGoal(ctx?.pluginConfig)
-        const role = params.role || 'dual'
+        const role = params.role || 'agent'
         try {
           const list = await eng.setCriteria(params.criteria.map(mapCriterion), role)
           const summary = eng.summarize()
@@ -350,6 +350,30 @@ export default defineToolPlugin({
         return verbose
           ? { criterion: updated, summary }
           : { criterion: updated, summary: slimSummary(summary) }
+      },
+    }),
+
+    tool({
+      name: 'confirm_criterion',
+      description: 'Reviewer confirmation of a self-claimed passed criterion. MUST be called by an independent reviewer agent (e.g. a subagent that did not do the work), NOT by the agent that performed the task. The reviewer must independently re-verify the criterion (re-run tests, re-check files) and provide that fresh evidence here. Requires high-confidence evidence_type (command/file/url); text is rejected. Converts self-claimed to formal pass, unblocking can_complete_goal.',
+      parameters: Type.Object({
+        criterion_id: Type.String({ description: 'Criterion id to confirm. Must currently be passed and self-claimed.' }),
+        evidence: Type.String({ description: 'Independent re-verification evidence gathered by the reviewer (not copied from the original validation).' }),
+        evidence_type: Type.Union([
+          Type.Literal('command'),
+          Type.Literal('file'),
+          Type.Literal('url'),
+        ], { description: 'Type of evidence. Must be high-confidence; text is not accepted.' }),
+      }),
+      execute: async (params, ctx) => {
+        const eng = getEngine(ctx?.pluginConfig)
+        const updated = await eng.confirmCriterion({
+          criterionId: params.criterion_id,
+          evidence: params.evidence,
+          evidenceType: params.evidence_type,
+        })
+        const summary = eng.summarize()
+        return { goalId: currentGoalId, criterion: updated, summary: slimSummary(summary) }
       },
     }),
 

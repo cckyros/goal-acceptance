@@ -8,6 +8,7 @@ import type { GoalAcceptanceStore } from './store.ts'
 import type {
   AcceptanceSummary,
   AmendSpec,
+  ConfirmCriterionSpec,
   CriterionSpec,
   CriterionTaskProgress,
   EvidenceType,
@@ -45,7 +46,7 @@ function initialState(): AcceptanceState {
     locked: false,
     observedCount: 0,
     taskStatuses: new Map(),
-    role: 'dual',
+    role: 'agent',
     taskPlan: new Map(),
     taskPlanOrder: [],
     taskPlanLocked: false,
@@ -208,7 +209,7 @@ export class GoalAcceptanceEngine {
   constructor(private readonly store: GoalAcceptanceStore) {}
 
   /** Set and lock the acceptance criteria. Returns the resolved criteria list. */
-  async setCriteria(specs: readonly CriterionSpec[], role: GoalRole = 'dual'): Promise<GoalCriterion[]> {
+  async setCriteria(specs: readonly CriterionSpec[], role: GoalRole = 'agent'): Promise<GoalCriterion[]> {
     if (!Array.isArray(specs) || specs.length === 0) {
       throw new GoalAcceptanceError('criteria list must be a non-empty array', 'GOAL_ACCEPTANCE_INVALID_CRITERIA')
     }
@@ -297,6 +298,53 @@ export class GoalAcceptanceEngine {
       validatedAt: now,
       evidenceType,
       ...selfClaimed ? { selfClaimed: true } : {},
+    }
+
+    await this.store.append(event)
+    this.applyEvent(event)
+
+    const updated = this.state.criteria.get(spec.criterionId)
+    /* v8 ignore next */
+    if (updated === undefined) throw new Error('sync failed')
+    return updated
+  }
+
+  /**
+   * Reviewer confirmation of a self-claimed passed criterion.
+   * Converts selfClaimed=true to a formal pass. Requires independent
+   * high-confidence evidence (command/file/url); 'text' evidence is rejected.
+   */
+  async confirmCriterion(spec: ConfirmCriterionSpec): Promise<GoalCriterion> {
+    this.sync()
+
+    const existing = this.state.criteria.get(spec.criterionId)
+    if (existing === undefined) {
+      throw new GoalAcceptanceError(`criterion "${spec.criterionId}" not found`, 'GOAL_ACCEPTANCE_CRITERION_NOT_FOUND')
+    }
+    if (existing.status !== 'passed' || existing.selfClaimed !== true) {
+      throw new GoalAcceptanceError(
+        `criterion "${spec.criterionId}" is not a self-claimed pass (status: ${existing.status}, selfClaimed: ${existing.selfClaimed === true}). Only self-claimed passed criteria can be confirmed.`,
+        'GOAL_ACCEPTANCE_NOT_SELF_CLAIMED',
+      )
+    }
+    if (typeof spec.evidence !== 'string' || spec.evidence.trim().length === 0) {
+      throw new GoalAcceptanceError('independent re-verification evidence is required to confirm a criterion', 'GOAL_ACCEPTANCE_EVIDENCE_REQUIRED')
+    }
+    if (spec.evidenceType === 'text') {
+      throw new GoalAcceptanceError(
+        'confirmation requires high-confidence evidence (command, file, or url); text evidence is not accepted',
+        'GOAL_ACCEPTANCE_LOW_CONFIDENCE_EVIDENCE',
+      )
+    }
+
+    const now = Date.now()
+    const event: GoalAcceptanceValidateEvent = {
+      type: 'goal-acceptance/validate',
+      criterionId: spec.criterionId,
+      status: 'passed',
+      evidence: spec.evidence.trim(),
+      validatedAt: now,
+      evidenceType: spec.evidenceType,
     }
 
     await this.store.append(event)
@@ -547,7 +595,7 @@ export class GoalAcceptanceEngine {
         this.state.order.push(criterion.id)
       }
       this.state.locked = true
-      this.state.role = data.role ?? 'dual'
+      this.state.role = data.role ?? 'agent'
     } else if (event.type === 'goal-acceptance/validate') {
       const data = event as GoalAcceptanceValidateEvent
       const existing = this.state.criteria.get(data.criterionId)
