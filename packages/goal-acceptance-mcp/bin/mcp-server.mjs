@@ -1,12 +1,13 @@
-import { existsSync, readFileSync, realpathSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, readdirSync, realpathSync, unlinkSync, writeFileSync } from "node:fs";
 import { mkdir, readFile, writeFile } from "node:fs/promises";
-import { dirname } from "node:path";
+import { join } from "node:path";
 import { pathToFileURL } from "node:url";
+import { randomUUID } from "node:crypto";
 import process from "node:process";
 import { Server } from "@modelcontextprotocol/sdk/server/index.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { CallToolRequestSchema, ListToolsRequestSchema } from "@modelcontextprotocol/sdk/types.js";
-import { GoalAcceptanceEngine, InMemoryAcceptanceStore } from "@cckyros/goal-acceptance-core";
+import { GoalAcceptanceEngine, GoalAcceptanceError, InMemoryAcceptanceStore } from "@cckyros/goal-acceptance-core";
 //#region lib/types/store.js
 /** File-backed event store using a JSON file. */
 var FileAcceptanceStore = class {
@@ -46,11 +47,161 @@ function slimSummary(s) {
 		totalCount: s.totalCount
 	};
 }
-/** Resolve the active acceptance store. */
-function resolveStore() {
-	const dataDir = process.env.PLUGIN_DATA;
-	if (dataDir !== void 0 && dataDir.length > 0) return new FileAcceptanceStore(`${dataDir}/acceptance-events.json`);
+let currentGoalId = null;
+const engineCache = /* @__PURE__ */ new Map();
+const metaCache = /* @__PURE__ */ new Map();
+/** Resolve the PLUGIN_DATA directory, or empty string for in-memory mode. */
+function dataDir() {
+	const d = process.env.PLUGIN_DATA;
+	return d !== void 0 && d.length > 0 ? d : "";
+}
+/** Directory storing per-goal event files and metadata. */
+function goalsDir() {
+	const d = dataDir();
+	return d ? join(d, "goals") : "";
+}
+/** File recording the currently active goal ID (for restart recovery). */
+function currentGoalFile() {
+	const d = dataDir();
+	return d ? join(d, "current-goal.txt") : "";
+}
+/** Create a store for a specific goal. */
+function storeForGoal(goalId) {
+	const dir = goalsDir();
+	if (dir) return new FileAcceptanceStore(join(dir, `${goalId}.json`));
 	return new InMemoryAcceptanceStore();
+}
+/** Get or create the engine for the current goal. Throws if no active goal. */
+function getEngine() {
+	if (currentGoalId === null) throw new GoalAcceptanceError("no active goal. Call start_goal to create one, or set_acceptance_criteria to auto-create one.", "GOAL_ACCEPTANCE_NO_ACTIVE_GOAL");
+	return getOrCreateEngine(currentGoalId);
+}
+/** Get or create an engine for a specific goal ID (bypasses current-goal check). */
+function getOrCreateEngine(goalId) {
+	let engine = engineCache.get(goalId);
+	if (engine === void 0) {
+		engine = new GoalAcceptanceEngine(storeForGoal(goalId));
+		engineCache.set(goalId, engine);
+	}
+	return engine;
+}
+/** Start a new goal. Generates a UUID, persists metadata, sets it as current. */
+function startGoal(title) {
+	const id = randomUUID();
+	const meta = {
+		id,
+		title: title ?? "",
+		createdAt: Date.now()
+	};
+	const dir = goalsDir();
+	if (dir) {
+		mkdirSync(dir, { recursive: true });
+		writeFileSync(join(dir, `${id}.meta.json`), JSON.stringify(meta, null, 2) + "\n");
+		writeFileSync(join(dir, `${id}.json`), "[]");
+	}
+	metaCache.set(id, meta);
+	currentGoalId = id;
+	persistCurrentGoal();
+	engineCache.set(id, new GoalAcceptanceEngine(storeForGoal(id)));
+	return meta;
+}
+/** Persist the current goal ID to disk for restart recovery. */
+function persistCurrentGoal() {
+	const f = currentGoalFile();
+	if (f) writeFileSync(f, currentGoalId ?? "");
+}
+/** Load the current goal from disk on startup. */
+function loadCurrentGoal() {
+	const dir = goalsDir();
+	if (!dir) return;
+	const f = currentGoalFile();
+	if (existsSync(f)) {
+		const id = readFileSync(f, "utf-8").trim();
+		if (id.length > 0 && existsSync(join(dir, `${id}.meta.json`))) {
+			currentGoalId = id;
+			loadGoalMeta(id);
+		}
+	}
+}
+/** Load a goal's metadata from disk into the cache. */
+function loadGoalMeta(id) {
+	const cached = metaCache.get(id);
+	if (cached) return cached;
+	const dir = goalsDir();
+	if (!dir) return void 0;
+	const metaPath = join(dir, `${id}.meta.json`);
+	if (!existsSync(metaPath)) return void 0;
+	const meta = JSON.parse(readFileSync(metaPath, "utf-8"));
+	metaCache.set(id, meta);
+	return meta;
+}
+/** List all goals with status summaries. */
+function listGoals() {
+	const dir = goalsDir();
+	if (!dir) return Array.from(metaCache.values()).map((m) => {
+		const engine = engineCache.get(m.id);
+		const summary = engine ? engine.summarize() : {
+			totalCount: 0,
+			passedCount: 0,
+			allRequiredPassed: true
+		};
+		return {
+			...m,
+			criteriaCount: summary.totalCount,
+			passedCount: summary.passedCount,
+			allRequiredPassed: summary.allRequiredPassed,
+			isActive: m.id === currentGoalId
+		};
+	}).sort((a, b) => b.createdAt - a.createdAt);
+	return readdirSync(dir).filter((f) => f.endsWith(".meta.json")).map((f) => {
+		const meta = JSON.parse(readFileSync(join(dir, f), "utf-8"));
+		metaCache.set(meta.id, meta);
+		const summary = getOrCreateEngine(meta.id).summarize();
+		return {
+			...meta,
+			criteriaCount: summary.totalCount,
+			passedCount: summary.passedCount,
+			allRequiredPassed: summary.allRequiredPassed,
+			isActive: meta.id === currentGoalId
+		};
+	}).sort((a, b) => b.createdAt - a.createdAt);
+}
+/** Switch the active goal to an existing goal ID. */
+function switchGoal(id) {
+	const dir = goalsDir();
+	if (dir) {
+		if (!existsSync(join(dir, `${id}.meta.json`))) throw new GoalAcceptanceError(`goal ${id} not found`, "GOAL_ACCEPTANCE_NOT_FOUND");
+	} else if (!metaCache.has(id)) throw new GoalAcceptanceError(`goal ${id} not found`, "GOAL_ACCEPTANCE_NOT_FOUND");
+	currentGoalId = id;
+	persistCurrentGoal();
+	return loadGoalMeta(id) ?? {
+		id,
+		title: "",
+		createdAt: 0
+	};
+}
+/** Reset (delete) the current goal's data and clear it as active. */
+function resetGoal() {
+	if (currentGoalId === null) throw new GoalAcceptanceError("no active goal to reset", "GOAL_ACCEPTANCE_NO_ACTIVE_GOAL");
+	const id = currentGoalId;
+	const dir = goalsDir();
+	if (dir) {
+		try {
+			unlinkSync(join(dir, `${id}.json`));
+		} catch {}
+		try {
+			unlinkSync(join(dir, `${id}.meta.json`));
+		} catch {}
+	}
+	engineCache.delete(id);
+	metaCache.delete(id);
+	currentGoalId = null;
+	persistCurrentGoal();
+}
+/** Ensure a goal is active; auto-create one if none exists. */
+function ensureGoal() {
+	if (currentGoalId === null) startGoal();
+	return getEngine();
 }
 const CRITERION_ITEM_SCHEMA = {
 	type: "object",
@@ -113,12 +264,19 @@ const TASK_PLAN_ITEM_SCHEMA = {
 		}
 	}
 };
+/** Reset all goal manager state (for testing: each createMcpServer gets fresh state). */
+function resetGoalState() {
+	currentGoalId = null;
+	engineCache.clear();
+	metaCache.clear();
+}
 /** Create a configured MCP server over the goal-acceptance engine. */
 function createMcpServer() {
-	const engine = new GoalAcceptanceEngine(resolveStore());
+	resetGoalState();
+	loadCurrentGoal();
 	const server = new Server({
 		name: "@cckyros/goal-acceptance-mcp",
-		version: "0.1.0-rc.11"
+		version: "0.1.0-rc.12"
 	}, { capabilities: { tools: {} } });
 	server.setRequestHandler(ListToolsRequestSchema, async () => ({ tools: [
 		{
@@ -283,6 +441,49 @@ function createMcpServer() {
 				additionalProperties: false,
 				properties: {}
 			}
+		},
+		{
+			name: "start_goal",
+			description: "Start a new goal with a fresh state. Use this when the current goal is locked and you need to begin a new independent task. Each goal has its own acceptance criteria and task plan. The new goal becomes the active goal.",
+			inputSchema: {
+				type: "object",
+				additionalProperties: false,
+				properties: { title: {
+					type: "string",
+					description: "Optional human-readable title for the goal."
+				} }
+			}
+		},
+		{
+			name: "list_goals",
+			description: "List all goals with their status summaries. Shows goal ID, title, creation time, criteria counts, and which goal is currently active.",
+			inputSchema: {
+				type: "object",
+				additionalProperties: false,
+				properties: {}
+			}
+		},
+		{
+			name: "switch_goal",
+			description: "Switch the active goal to an existing goal by ID. Use list_goals to find goal IDs.",
+			inputSchema: {
+				type: "object",
+				additionalProperties: false,
+				required: ["goal_id"],
+				properties: { goal_id: {
+					type: "string",
+					description: "The goal ID to switch to (from list_goals)."
+				} }
+			}
+		},
+		{
+			name: "reset_goal",
+			description: "Delete the current goal and all its data (criteria, task plan, validations). The goal is permanently removed. Use this to clear a messed-up goal and start fresh.",
+			inputSchema: {
+				type: "object",
+				additionalProperties: false,
+				properties: {}
+			}
 		}
 	] }));
 	server.setRequestHandler(CallToolRequestSchema, async (request) => {
@@ -292,40 +493,53 @@ function createMcpServer() {
 			case "set_acceptance_criteria": {
 				const criteria = input.criteria;
 				const role = input.role ?? "dual";
-				const list = await engine.setCriteria(criteria.map((c) => ({
-					id: c.id,
-					description: c.description,
-					...c.required !== void 0 ? { required: c.required } : {},
-					...c.method !== void 0 ? { method: c.method } : {},
-					...c.task_ids !== void 0 ? { taskIds: c.task_ids } : {},
-					...c.depends_on !== void 0 ? { dependsOn: c.depends_on } : {}
-				})), role);
-				const summary = engine.summarize();
-				return { content: [{
-					type: "text",
-					text: JSON.stringify({
-						criteria: list,
-						summary
-					}, null, 2)
-				}] };
+				const engine = ensureGoal();
+				try {
+					const list = await engine.setCriteria(criteria.map((c) => ({
+						id: c.id,
+						description: c.description,
+						...c.required !== void 0 ? { required: c.required } : {},
+						...c.method !== void 0 ? { method: c.method } : {},
+						...c.task_ids !== void 0 ? { taskIds: c.task_ids } : {},
+						...c.depends_on !== void 0 ? { dependsOn: c.depends_on } : {}
+					})), role);
+					const summary = engine.summarize();
+					return { content: [{
+						type: "text",
+						text: JSON.stringify({
+							goalId: currentGoalId,
+							criteria: list,
+							summary
+						}, null, 2)
+					}] };
+				} catch (e) {
+					if (e instanceof GoalAcceptanceError && e.code === "GOAL_ACCEPTANCE_ALREADY_LOCKED") throw new GoalAcceptanceError(`criteria are already locked for goal ${currentGoalId}. Call start_goal to begin a new goal, or reset_goal to clear the current one.`, "GOAL_ACCEPTANCE_ALREADY_LOCKED");
+					throw e;
+				}
 			}
 			case "get_acceptance_criteria": {
 				const verbose = input.verbose !== false;
+				const engine = getEngine();
 				const summary = engine.summarize();
 				if (!verbose) return { content: [{
 					type: "text",
-					text: JSON.stringify({ summary: slimSummary(summary) })
+					text: JSON.stringify({
+						goalId: currentGoalId,
+						summary: slimSummary(summary)
+					})
 				}] };
 				const criteria = engine.getCriteria();
 				return { content: [{
 					type: "text",
 					text: JSON.stringify({
+						goalId: currentGoalId,
 						criteria,
 						summary
 					}, null, 2)
 				}] };
 			}
 			case "validate_criterion": {
+				const engine = getEngine();
 				const updated = await engine.validateCriterion({
 					criterionId: input.criterion_id,
 					status: input.status,
@@ -337,15 +551,18 @@ function createMcpServer() {
 				return { content: [{
 					type: "text",
 					text: JSON.stringify(verbose ? {
+						goalId: currentGoalId,
 						criterion: updated,
 						summary
 					} : {
+						goalId: currentGoalId,
 						criterion: updated,
 						summary: slimSummary(summary)
 					}, null, 2)
 				}] };
 			}
 			case "update_task_status": {
+				const engine = getEngine();
 				await engine.updateTaskStatus({
 					taskId: input.task_id,
 					status: input.status
@@ -355,10 +572,12 @@ function createMcpServer() {
 				return { content: [{
 					type: "text",
 					text: JSON.stringify(verbose ? {
+						goalId: currentGoalId,
 						taskId: input.task_id,
 						status: input.status,
 						summary
 					} : {
+						goalId: currentGoalId,
 						taskId: input.task_id,
 						status: input.status,
 						summary: slimSummary(summary)
@@ -366,6 +585,7 @@ function createMcpServer() {
 				}] };
 			}
 			case "amend_acceptance_criteria": {
+				const engine = getEngine();
 				const criteria = input.criteria;
 				const added = await engine.amendCriteria({
 					criteria: criteria.map((c) => ({
@@ -382,19 +602,24 @@ function createMcpServer() {
 				return { content: [{
 					type: "text",
 					text: JSON.stringify({
+						goalId: currentGoalId,
 						addedCriteria: added,
 						summary
 					}, null, 2)
 				}] };
 			}
 			case "can_complete_goal": {
-				const result = engine.canComplete();
+				const result = getEngine().canComplete();
 				return { content: [{
 					type: "text",
-					text: JSON.stringify(result, null, 2)
+					text: JSON.stringify({
+						goalId: currentGoalId,
+						...result
+					}, null, 2)
 				}] };
 			}
 			case "set_task_plan": {
+				const engine = getEngine();
 				const tasks = input.tasks;
 				const plan = await engine.setTaskPlan(tasks.map((t) => ({
 					id: t.id,
@@ -406,18 +631,57 @@ function createMcpServer() {
 				return { content: [{
 					type: "text",
 					text: JSON.stringify({
+						goalId: currentGoalId,
 						taskPlan: plan,
 						summary: slimSummary(summary)
 					}, null, 2)
 				}] };
 			}
 			case "get_task_plan": {
-				const plan = engine.getTaskPlan();
+				const plan = getEngine().getTaskPlan();
 				return { content: [{
 					type: "text",
-					text: JSON.stringify({ taskPlan: plan }, null, 2)
+					text: JSON.stringify({
+						goalId: currentGoalId,
+						taskPlan: plan
+					}, null, 2)
 				}] };
 			}
+			case "start_goal": {
+				const title = input.title;
+				const meta = startGoal(title);
+				return { content: [{
+					type: "text",
+					text: JSON.stringify({
+						goal: meta,
+						message: "New goal started and set as active."
+					}, null, 2)
+				}] };
+			}
+			case "list_goals": {
+				const goals = listGoals();
+				return { content: [{
+					type: "text",
+					text: JSON.stringify({ goals }, null, 2)
+				}] };
+			}
+			case "switch_goal": {
+				const id = input.goal_id;
+				const meta = switchGoal(id);
+				return { content: [{
+					type: "text",
+					text: JSON.stringify({
+						goal: meta,
+						message: "Switched active goal."
+					}, null, 2)
+				}] };
+			}
+			case "reset_goal":
+				resetGoal();
+				return { content: [{
+					type: "text",
+					text: JSON.stringify({ message: "Current goal deleted. No active goal. Call set_acceptance_criteria to auto-create a new one, or start_goal." }, null, 2)
+				}] };
 			default: throw new Error(`Unknown tool: ${name}`);
 		}
 	});
@@ -425,8 +689,8 @@ function createMcpServer() {
 }
 /** Start the stdio MCP server. */
 async function main() {
-	const dataDir = process.env.PLUGIN_DATA;
-	if (dataDir !== void 0 && dataDir.length > 0) await mkdir(dirname(`${dataDir}/acceptance-events.json`), { recursive: true });
+	const dir = goalsDir();
+	if (dir) await mkdir(dir, { recursive: true });
 	const server = createMcpServer();
 	const transport = new StdioServerTransport();
 	await server.connect(transport);

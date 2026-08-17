@@ -139,7 +139,7 @@ export interface CriterionTaskProgress {
   readonly pendingTasks: number
   /** Failed tasks. */
   readonly failedTasks: number
-  /** True when all linked tasks are 'completed'. Empty task list â†?false. */
+  /** True when all linked tasks are 'completed'. Empty task list ï¿½?false. */
   readonly readyToValidate: boolean
 }
 
@@ -207,6 +207,7 @@ export type GoalAcceptanceErrorCode =
   | 'GOAL_ACCEPTANCE_INVALID_TASK_PLAN'
   | 'GOAL_ACCEPTANCE_TASK_PLAN_ALREADY_SET'
   | 'GOAL_ACCEPTANCE_TASK_NOT_FOUND'
+  | 'GOAL_ACCEPTANCE_NO_ACTIVE_GOAL'
 
 /** Event payload when initial criteria are locked. */
 export interface GoalAcceptanceSetEvent {

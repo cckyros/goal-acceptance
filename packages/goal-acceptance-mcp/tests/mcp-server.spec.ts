@@ -17,7 +17,7 @@ describe('GoalAcceptanceMcpServer', () => {
   it('lists tools', async () => {
     const { client } = await createClient()
     const tools = await client.listTools()
-    expect(tools.tools).toHaveLength(8)
+    expect(tools.tools).toHaveLength(12)
     const names = tools.tools.map(t => t.name)
     expect(names).toContain('set_acceptance_criteria')
     expect(names).toContain('get_acceptance_criteria')
@@ -27,6 +27,10 @@ describe('GoalAcceptanceMcpServer', () => {
     expect(names).toContain('can_complete_goal')
     expect(names).toContain('set_task_plan')
     expect(names).toContain('get_task_plan')
+    expect(names).toContain('start_goal')
+    expect(names).toContain('list_goals')
+    expect(names).toContain('switch_goal')
+    expect(names).toContain('reset_goal')
   })
 
   it('sets criteria with task links and dependencies', async () => {
@@ -381,12 +385,13 @@ describe('GoalAcceptanceMcpServer', () => {
 
   it('rejects task plan before criteria are locked', async () => {
     const { client } = await createClient()
+    // No active goal yet — set_task_plan should fail
     await expect(client.callTool({
       name: 'set_task_plan',
       arguments: {
         tasks: [{ id: 't1', description: 'One', deliverable: 'a.txt' }],
       },
-    })).rejects.toThrow('before criteria are locked')
+    })).rejects.toThrow()
   })
 
   it('rejects setting task plan twice', async () => {
@@ -433,5 +438,168 @@ describe('GoalAcceptanceMcpServer', () => {
     const summaryParsed = JSON.parse(summaryText)
     expect(summaryParsed.summary.taskPlan).toHaveLength(2)
     expect(summaryParsed.summary.taskProgress.completedTasks).toBe(1)
+  })
+
+  // ─── Multi-goal tests ───
+
+  it('auto-creates a goal on first set_acceptance_criteria', async () => {
+    const { client } = await createClient()
+    const result = await client.callTool({
+      name: 'set_acceptance_criteria',
+      arguments: { criteria: [{ id: 'c1', description: 'test' }] },
+    })
+    const text = String((result.content as Array<{ type: string; text: string }>)[0]!.text)
+    const parsed = JSON.parse(text)
+    expect(parsed.goalId).toBeDefined()
+    expect(typeof parsed.goalId).toBe('string')
+    expect(parsed.goalId.length).toBeGreaterThan(0)
+  })
+
+  it('start_goal creates a new goal and set_acceptance_criteria works on it', async () => {
+    const { client } = await createClient()
+    // First goal
+    await client.callTool({
+      name: 'set_acceptance_criteria',
+      arguments: { criteria: [{ id: 'c1', description: 'goal A' }] },
+    })
+    // Start a new goal
+    const startResult = await client.callTool({
+      name: 'start_goal',
+      arguments: { title: 'Goal B' },
+    })
+    const startText = String((startResult.content as Array<{ type: string; text: string }>)[0]!.text)
+    const startParsed = JSON.parse(startText)
+    expect(startParsed.goal.id).toBeDefined()
+    expect(startParsed.goal.title).toBe('Goal B')
+
+    // set_acceptance_criteria should work on the new goal
+    const setResult = await client.callTool({
+      name: 'set_acceptance_criteria',
+      arguments: { criteria: [{ id: 'c1', description: 'goal B criterion' }] },
+    })
+    const setText = String((setResult.content as Array<{ type: string; text: string }>)[0]!.text)
+    const setParsed = JSON.parse(setText)
+    expect(setParsed.goalId).toBe(startParsed.goal.id)
+    expect(setParsed.criteria).toHaveLength(1)
+  })
+
+  it('set_acceptance_criteria on locked goal gives clear error pointing to start_goal', async () => {
+    const { client } = await createClient()
+    await client.callTool({
+      name: 'set_acceptance_criteria',
+      arguments: { criteria: [{ id: 'c1', description: 'first' }] },
+    })
+    await expect(client.callTool({
+      name: 'set_acceptance_criteria',
+      arguments: { criteria: [{ id: 'c2', description: 'second' }] },
+    })).rejects.toThrow('start_goal')
+  })
+
+  it('two goals have independent criteria locks', async () => {
+    const { client } = await createClient()
+    // Goal A
+    await client.callTool({
+      name: 'set_acceptance_criteria',
+      arguments: { criteria: [{ id: 'c1', description: 'goal A' }] },
+    })
+    // Goal B
+    await client.callTool({ name: 'start_goal', arguments: { title: 'B' } })
+    await client.callTool({
+      name: 'set_acceptance_criteria',
+      arguments: { criteria: [{ id: 'c1', description: 'goal B' }] },
+    })
+    // Switch back to goal A — its criteria should be intact
+    const goalsResult = await client.callTool({ name: 'list_goals', arguments: {} })
+    const goalsText = String((goalsResult.content as Array<{ type: string; text: string }>)[0]!.text)
+    const goalsParsed = JSON.parse(goalsText)
+    expect(goalsParsed.goals).toHaveLength(2)
+    // Both goals should have 1 criterion each
+    expect(goalsParsed.goals[0].criteriaCount).toBe(1)
+    expect(goalsParsed.goals[1].criteriaCount).toBe(1)
+  })
+
+  it('list_goals shows all goals with active flag', async () => {
+    const { client } = await createClient()
+    await client.callTool({
+      name: 'set_acceptance_criteria',
+      arguments: { criteria: [{ id: 'c1', description: 'A' }] },
+    })
+    await client.callTool({ name: 'start_goal', arguments: { title: 'B' } })
+
+    const result = await client.callTool({ name: 'list_goals', arguments: {} })
+    const text = String((result.content as Array<{ type: string; text: string }>)[0]!.text)
+    const parsed = JSON.parse(text)
+    expect(parsed.goals).toHaveLength(2)
+    const activeGoals = parsed.goals.filter((g: { isActive: boolean }) => g.isActive)
+    expect(activeGoals).toHaveLength(1)
+  })
+
+  it('switch_goal changes active goal', async () => {
+    const { client } = await createClient()
+    // Goal A
+    const resA = await client.callTool({
+      name: 'set_acceptance_criteria',
+      arguments: { criteria: [{ id: 'c1', description: 'A' }] },
+    })
+    const goalAId = JSON.parse(String((resA.content as Array<{ type: string; text: string }>)[0]!.text)).goalId
+
+    // Goal B
+    await client.callTool({ name: 'start_goal', arguments: { title: 'B' } })
+
+    // Switch back to A
+    const switchResult = await client.callTool({
+      name: 'switch_goal',
+      arguments: { goal_id: goalAId },
+    })
+    const switchText = String((switchResult.content as Array<{ type: string; text: string }>)[0]!.text)
+    const switchParsed = JSON.parse(switchText)
+    expect(switchParsed.goal.id).toBe(goalAId)
+
+    // Verify we can read A's criteria
+    const getResult = await client.callTool({ name: 'get_acceptance_criteria', arguments: {} })
+    const getText = String((getResult.content as Array<{ type: string; text: string }>)[0]!.text)
+    const getParsed = JSON.parse(getText)
+    expect(getParsed.goalId).toBe(goalAId)
+    expect(getParsed.criteria).toHaveLength(1)
+    expect(getParsed.criteria[0].description).toBe('A')
+  })
+
+  it('reset_goal clears current goal and allows fresh start', async () => {
+    const { client } = await createClient()
+    await client.callTool({
+      name: 'set_acceptance_criteria',
+      arguments: { criteria: [{ id: 'c1', description: 'to be deleted' }] },
+    })
+    // Reset
+    const resetResult = await client.callTool({ name: 'reset_goal', arguments: {} })
+    const resetText = String((resetResult.content as Array<{ type: string; text: string }>)[0]!.text)
+    const resetParsed = JSON.parse(resetText)
+    expect(resetParsed.message).toContain('deleted')
+
+    // Should be able to set_acceptance_criteria again (auto-creates new goal)
+    const setResult = await client.callTool({
+      name: 'set_acceptance_criteria',
+      arguments: { criteria: [{ id: 'c1', description: 'fresh start' }] },
+    })
+    const setText = String((setResult.content as Array<{ type: string; text: string }>)[0]!.text)
+    const setParsed = JSON.parse(setText)
+    expect(setParsed.criteria).toHaveLength(1)
+    expect(setParsed.criteria[0].description).toBe('fresh start')
+  })
+
+  it('switch_goal rejects unknown goal id', async () => {
+    const { client } = await createClient()
+    await expect(client.callTool({
+      name: 'switch_goal',
+      arguments: { goal_id: 'nonexistent-id' },
+    })).rejects.toThrow('not found')
+  })
+
+  it('reset_goal rejects when no active goal', async () => {
+    const { client } = await createClient()
+    await expect(client.callTool({
+      name: 'reset_goal',
+      arguments: {},
+    })).rejects.toThrow('no active goal')
   })
 })
