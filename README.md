@@ -1,5 +1,7 @@
 # goal-acceptance
 
+![goal-acceptance](docs/goal-acceptance-cover.jpg)
+
 English | [中文](README.zh-CN.md)
 
 Acceptance-criteria-driven goal completion for autonomous AI agents.

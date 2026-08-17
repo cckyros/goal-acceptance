@@ -1,5 +1,7 @@
 # goal-acceptance
 
+![goal-acceptance](docs/goal-acceptance-cover.jpg)
+
 [English](README.md) | 中文
 
 面向自主 AI Agent 的验收标准驱动式目标完成机制。
