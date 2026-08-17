@@ -118,7 +118,7 @@ function createMcpServer() {
 	const engine = new GoalAcceptanceEngine(resolveStore());
 	const server = new Server({
 		name: "@cckyros/goal-acceptance-mcp",
-		version: "0.1.0-rc.10"
+		version: "0.1.0-rc.11"
 	}, { capabilities: { tools: {} } });
 	server.setRequestHandler(ListToolsRequestSchema, async () => ({ tools: [
 		{
@@ -431,7 +431,10 @@ async function main() {
 	const transport = new StdioServerTransport();
 	await server.connect(transport);
 	const keepAlive = setInterval(() => {}, 1 << 30);
-	process.stdin.on("close", () => clearInterval(keepAlive));
+	process.stdin.on("close", () => {
+		clearInterval(keepAlive);
+		process.exit(0);
+	});
 }
 function isMainEntry() {
 	try {

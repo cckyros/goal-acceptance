@@ -82,7 +82,7 @@ export function createMcpServer(): Server {
   const server = new Server(
     {
       name: '@cckyros/goal-acceptance-mcp',
-      version: '0.1.0-rc.10',
+      version: '0.1.0-rc.11',
     },
     {
       capabilities: {
@@ -364,7 +364,13 @@ export async function main(): Promise<void> {
   // immediately after connect() resolves when launched via npx or other wrappers
   // that don't hold the stdin pipe write end open.
   const keepAlive = setInterval(() => {}, 1 << 30)
-  process.stdin.on('close', () => clearInterval(keepAlive))
+  process.stdin.on('close', () => {
+    clearInterval(keepAlive)
+    // Exit explicitly when the parent closes stdin (disconnects/reconnects).
+    // Without this, leftover handles in the MCP SDK prevent process exit,
+    // causing orphaned processes on every Devin reconnect.
+    process.exit(0)
+  })
 }
 
 // Auto-start when run directly. Use realpath to handle symlinks/junctions
