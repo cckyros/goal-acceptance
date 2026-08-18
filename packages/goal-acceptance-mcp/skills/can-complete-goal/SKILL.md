@@ -1,15 +1,39 @@
 ---
 name: can-complete-goal
-description: Check whether the goal can be completed based on current acceptance criteria.
+description: Check whether the goal can be completed based on current acceptance criteria. Blocks on self-claimed required criteria.
 ---
 
-Before concluding a goal, call this skill to verify that all **required**
-acceptance criteria are `passed`. The check returns `{ allowed: boolean,
-reason?: string }`:
+Before concluding a goal, call this to verify that all **required**
+acceptance criteria are formally passed. Returns `{ allowed, reason? }`:
 
-- **allowed: true** — all required criteria passed (or no criteria locked).
-- **allowed: false** — one or more required criteria are still pending,
-  in_progress, failed, blocked, or not_run. The `reason` field lists how many
-  are unresolved.
+- **allowed: true** — all required criteria are formally passed
+- **allowed: false** — one or more required criteria are unresolved or
+  self-claimed
 
-Do not declare the goal complete until this check returns `allowed: true`.
+## Blocking Conditions
+
+| Criterion State | Blocks completion? |
+|----------------|-------------------|
+| `passed` + `selfClaimed=false` | No — formal pass |
+| `passed` + `selfClaimed=true` | **Yes** — needs `confirm_criterion` |
+| `failed` | Yes |
+| `blocked` | Yes |
+| `pending` | Yes |
+| `in_progress` | Yes |
+| `not_run` | Yes (required only) |
+
+## Self-Claimed Blocking
+
+When `role=agent` (default), `validate_criterion` with `passed` marks the
+criterion as `selfClaimed=true`. The completion gate treats self-claimed
+required criteria as unresolved — they must be confirmed by an independent
+reviewer via `confirm_criterion` before the goal can complete.
+
+This prevents the agent from declaring "done" based on its own
+self-assessment without independent verification.
+
+## Do Not Declare Complete
+
+Do not tell the user the task is complete until this check returns
+`allowed: true`. If it returns `allowed: false`, read the `reason` field
+and address each blocking criterion.

@@ -1,0 +1,17 @@
+feat: add goal-planning skill + workflow guidance in tool descriptions
+
+- New goal-planning skill: spawn subagent for coverage analysis before
+  locking criteria (goal-backward check, vague-verb check, verification
+  check) inspired by notque/claude-code-toolkit plan-checker
+- New confirm-criterion skill: documents the independent reviewer flow
+- Updated set-acceptance-criteria skill: references goal-planning,
+  documents quality rules and role=agent default
+- Updated validate-criterion skill: forbids memory-based validation,
+  requires actual command/file/url execution
+- Updated can-complete-goal skill: documents selfClaimed blocking
+- Embedded workflow guidance directly in MCP tool descriptions so
+  agents see the process at the tool-call level, not just in skills
+
+Generated with [Devin](https://devin.ai)
+
+Co-Authored-By: Devin <158243242+devin-ai-integration[bot]@users.noreply.github.com>
