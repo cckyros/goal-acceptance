@@ -1,6 +1,6 @@
 /**
  * OpenClaw native plugin entry for goal-acceptance.
- * Registers 12 tools that directly call the core engine (no MCP stdio needed).
+ * Registers 13 tools that directly call the core engine (no MCP stdio needed).
  * Multi-goal: each goal has its own event file under ${dataDir}/goals/.
  */
 import { readFile, writeFile } from 'node:fs/promises'

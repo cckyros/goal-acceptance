@@ -85,9 +85,9 @@ class MyStore implements GoalAcceptanceStore {
 
 ## Status model
 
-- `pending` / `in_progress` �?not yet verified
-- `passed` / `failed` �?terminal; requires evidence
-- `blocked` �?cannot be verified in this environment
-- `not_run` �?explicitly skipped
+- `pending` / `in_progress` - not yet verified
+- `passed` / `failed` - terminal outcomes; requires evidence
+- `blocked` - cannot be verified in this environment
+- `not_run` - explicitly skipped
 
 `canComplete()` returns `allowed: true` only when all `required: true` criteria are `passed`.

@@ -24,7 +24,7 @@ Plugins. One package, multiple runtimes:
 | **Cursor** | MCP stdio server | Model voluntarily calls tools |
 | **Devin** | MCP stdio server | Model voluntarily calls tools |
 | **OpenClaw** | Native plugin (`@cckyros/goal-acceptance-openclaw`) or Agent Plugin bundle | Model voluntarily calls tools |
-| **DeepSeek Harness** | Cordis plugin (`@cckyros/dsh-goal-acceptance`) | **Yes** — `agent.steer()` forces continuation |
+| **DeepSeek Harness** | Cordis plugin (`@cckyros/goal-acceptance`) | **Yes** — `agent.steer()` forces continuation |
 | **Any MCP client** | stdio MCP server | Model voluntarily calls tools |
 | **Any Agent Plugins client** | plugin.json + mcp.json + skills | Model voluntarily calls tools |
 | **Any JS/TS runtime** | Core library (`@cckyros/goal-acceptance-core`) | Programmatic —you control it |
@@ -39,7 +39,7 @@ The MCP server exposes 13 tools covering the full goal-acceptance lifecycle:
 
 - **Criteria management**: set, get, amend
 - **Task plan management**: set task plan, get task plan
-- **Validation**: validate criterion with typed evidence
+- **Validation**: validate criterion with typed evidence; confirm criterion with independent reviewer evidence
 - **Progress tracking**: update task status
 - **Completion gate**: can complete goal
 - **Multi-goal management**: start goal, list goals, switch goal, reset goal
@@ -96,12 +96,23 @@ for the full summary. This minimizes token overhead during normal operation.
 | [`@cckyros/goal-acceptance-core`](packages/goal-acceptance-core) | Framework-agnostic state machine, types, errors, abstract store | None |
 | [`@cckyros/goal-acceptance-mcp`](packages/goal-acceptance-mcp) | MCP stdio server + Agent Plugin bundle (plugin.json, mcp.json, skills) | core, MCP SDK |
 | [`@cckyros/goal-acceptance-openclaw`](packages/goal-acceptance-openclaw) | OpenClaw native plugin (in-process tools, no stdio) | core, typebox; peer: openclaw |
-| [`@cckyros/dsh-goal-acceptance`](packages/goal-acceptance) | DeepSeek Harness Cordis plugin with turn-stopping steering | core, schemastery; peer: dsh-* packages |
+| [`@cckyros/goal-acceptance`](packages/goal-acceptance) | DeepSeek Harness Cordis plugin with turn-stopping steering | core, schemastery; peer: dsh-* packages |
 
 ## Architecture
 
 ```
-                    ┌─────────────────────────────────────────────────—                    —@cckyros/goal-acceptance-core                   —                    —(zero-dep state machine, event-sourced)         —                    └──┬──────────────┬───────────────┬───────────────—                       —             —              —          ┌────────────┴───────—┌───┴──────────—┌──┴──────────────────────—          —@cckyros/goal-     ——@cckyros/    ——@cckyros/dsh-goal-      —          —acceptance-mcp     ——goal-        ——acceptance              —          —(MCP stdio server +——acceptance-  ——(DeepSeek Harness       —          — Agent Plugin      ——openclaw     —— Cordis plugin)         —          — bundle)           ——(OpenClaw    ——turn-stopping           —          —13 tools, stdio    —— native)     ——agent.steer()           —          —skills/ included   ——13 tools,    ——system prompt           —          —                   ——in-process   ——tool registration       —          └────────────────────—└──────────────—└─────────────────────────— ```
+@cckyros/goal-acceptance-core
+  zero-dependency, event-sourced state machine
+        |
+        +-- @cckyros/goal-acceptance-mcp
+        |     MCP stdio server + Agent Plugin bundle (13 tools)
+        |
+        +-- @cckyros/goal-acceptance-openclaw
+        |     OpenClaw native plugin (13 in-process tools)
+        |
+        +-- @cckyros/goal-acceptance
+              DeepSeek Harness Cordis plugin with turn-stopping steering
+```
 
 ## Quick Start
 
@@ -128,19 +139,19 @@ await engine.updateTaskStatus({ taskId: 'task-2', status: 'completed' })
 
 // When all linked tasks are done, the criterion is "ready to validate"
 const summary = engine.summarize()
-console.log(summary.readyToValidate.map(c => c.id)) // —['api-200']
+console.log(summary.readyToValidate.map(c => c.id)) // ['api-200']
 
 // Record validation with evidence
 await engine.validateCriterion({
   criterionId: 'api-200',
   status: 'passed',
-  evidence: 'curl /health —HTTP 200 OK',
+  evidence: 'curl /health -> HTTP 200 OK',
 })
 
 // Check if goal can complete
 const { allowed, reason } = engine.canComplete()
 console.log(allowed, reason)
-// —true, undefined
+// true, undefined
 ```
 
 ### MCP server (Devin, Claude Code, Cursor, etc.)
@@ -242,10 +253,10 @@ is not set, state is in-memory only (lost on restart).
 The `@cckyros/goal-acceptance-openclaw` package is an OpenClaw native plugin that registers all 13 tools directly in-process (no MCP stdio overhead).
 
 ```sh
-openclaw plugins install "npm:@cckyros/goal-acceptance-openclaw@rc"
+openclaw plugins install "npm:@cckyros/goal-acceptance-openclaw@0.1.0"
 ```
 
-> **Note**: The `@rc` tag is required because the package is in pre-release. Once a stable version is published, the tag can be omitted.
+> **Note**: `0.1.0` is the first stable release; the version can be omitted when using the npm `latest` tag.
 
 After install, restart the gateway:
 
@@ -273,9 +284,11 @@ node_modules/@cckyros/goal-acceptance-mcp/
 ├── plugin.json    # Agent Plugin manifest
 ├── mcp.json       # stdio MCP server config
 └── skills/        # Portable Agent Skills
+    ├── goal-planning/SKILL.md
     ├── set-acceptance-criteria/SKILL.md
     ├── get-acceptance-criteria/SKILL.md
     ├── validate-criterion/SKILL.md
+    ├── confirm-criterion/SKILL.md
     ├── update-task-status/SKILL.md
     ├── amend-acceptance-criteria/SKILL.md
     └── can-complete-goal/SKILL.md
@@ -290,9 +303,9 @@ The Cordis plugin is the only variant that can **force** the agent to continue
 working when it tries to stop early. It intercepts `agent/turn-stopping` and
 steers the agent back with dependency-aware priority ordering.
 
-```sh
-npm install @cckyros/dsh-goal-acceptance
-```
+The Cordis package is source-only in this repository and is intended to be
+installed inside a DeepSeek Harness workspace where its peer dependencies are
+already available.
 
 ```yaml
 # cordis.yml
@@ -318,7 +331,7 @@ The plugin:
 
 | Tool | Description |
 |------|-------------|
-| `set_acceptance_criteria` | Lock the criteria list. Each criterion may link to task IDs and declare dependencies. Optional `role` parameter (`agent`/`reviewer`/`dual`, default `dual`) controls self-claim behavior. Must be called before implementation. |
+| `set_acceptance_criteria` | Lock the criteria list. Each criterion may link to task IDs and declare dependencies. Optional `role` parameter (`agent`/`reviewer`/`dual`, default `agent`) controls self-claim behavior. With the default, passed criteria require independent reviewer confirmation. Must be called before implementation. |
 | `get_acceptance_criteria` | Read current criteria, task progress, summary, task plan, ready-to-validate list, and next-actionable ordering. Optional `verbose` parameter (default `true`; pass `false` for slim summary only). |
 | `set_task_plan` | Set and lock the task decomposition plan. Each task must have a unique id, unambiguous description, and concrete deliverable. Dependency cycles are rejected. Requires criteria to be locked first. |
 | `get_task_plan` | Read the current task decomposition plan with live task statuses. |
