@@ -1,7 +1,7 @@
-{
+﻿{
   "name": "@cckyros/goal-acceptance-mcp",
   "description": "MCP server and Agent Plugin packaging for goal-acceptance criteria",
-  "version": "0.1.1",
+  "version": "0.1.2",
   "publishConfig": {
     "access": "public"
   },

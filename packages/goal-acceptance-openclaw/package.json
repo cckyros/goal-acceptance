@@ -1,7 +1,7 @@
-{
+﻿{
   "name": "@cckyros/goal-acceptance-openclaw",
   "description": "OpenClaw native plugin for goal-acceptance criteria management",
-  "version": "0.1.1",
+  "version": "0.1.2",
   "publishConfig": {
     "access": "public"
   },

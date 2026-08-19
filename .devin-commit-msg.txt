@@ -1,12 +1,14 @@
-feat: add DSH plugin manifest for Cordis package
+chore(release): bump to 0.1.2
 
-- add root dsh.plugin.json with name/goal-acceptance and entry @cckyros/goal-acceptance
-- add packages/goal-acceptance/cordis.patch.yml for Cordis bundle injection
-- add dsh.bundle.patch field, dsh-plugin keywords, and cordis.patch.yml to files list
+Validated the Cordis plugin (`packages/goal-acceptance`) in the
+DeepSeek Harness `goal-agent-preset` worktree:
+- synced 0.1.1 source into `packages/goal/goal-acceptance` and
+  `packages/goal/goal-acceptance-core`
+- built with `tsc` and bundled with `tsdown` successfully
+- all 78 tests passed (57 core + 18 Cordis plugin + 3 MCP)
 
-Note: the Cordis package remains workspace-only (peer deps on dsh/cordis are
-resolvable only inside the DeepSeek Harness workspace); standalone npm install
-is not supported until dsh packages are fully published.
+Also adds the DSH plugin manifest from the previous commit
+(`dsh.plugin.json`, `cordis.patch.yml`, package `dsh` field).
 
 Generated with [Devin](https://devin.ai)
 
