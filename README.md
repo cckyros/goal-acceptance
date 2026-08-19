@@ -316,10 +316,10 @@ plugins:
 ```
 
 The plugin:
-- Registers 5 model tools (`set/get/validate_acceptance_criteria`, `update_task_status`, `amend_acceptance_criteria`)
+- Registers the same 13 model tools as the MCP adapter
 - Injects a `policy:goal-acceptance` system prompt section with task progress and next-actionable ordering
 - Intercepts `agent/turn-stopping` and steers the agent back with dependency-aware
-  priority ordering when required criteria are still pending
+  priority ordering for pending work and self-claimed criteria awaiting reviewer confirmation
 
 > **Note**: The Cordis plugin requires DeepSeek Harness packages as peer
 > dependencies (`@deepseek-ai/dsh-agent`, `dsh-llm`, `dsh-session`, `dsh-tools`,
@@ -347,9 +347,12 @@ The plugin:
 
 ## Criterion Status Lifecycle
 
-```
-                    ┌──────────—                    —pending  ——initial state after setCriteria
-                    └────┬─────—                         —              ┌──────────┼──────────—              —         —         —              —         —         —        ┌──────────—┌────────—┌────────—        │in_progress——passed ——failed —        └──────────—└────────—└────────—              —         —         —              —         —    ┌────────—              —         —    │blocked —              —         —    └────────—              —         —    ┌────────—              └──────────┘─────│not_run —                                └────────— ```
+pending -> in_progress -> passed
+             |              |
+             +-> failed     +-> selfClaimed -> confirm_criterion -> formal pass
+             |
+             +-> blocked
+             +-> not_run (non-required criteria only)
 
 | Status | Meaning | Evidence required |
 |--------|---------|-------------------|
@@ -414,9 +417,9 @@ class MyDbStore implements GoalAcceptanceStore {
 | Turn-stopping enforcement | yes (`agent.steer()`, dependency-aware) | no | no | no |
 | Cross-client portable | no (Harness only) | yes (any MCP client) | yes (any Agent Plugins client) | no (OpenClaw only) |
 | Persistent state | `dsh-session` log | `$PLUGIN_DATA/acceptance-events.json` | same as MCP | same as MCP |
-| Dual-role validation | no | yes (`role` parameter) | yes | yes |
-| Typed evidence | no | yes (`evidence_type` parameter) | yes | yes |
-| Task decomposition plan | no | yes (`set_task_plan` / `get_task_plan`) | yes | yes |
+| Dual-role validation | yes (`role` parameter) | yes (`role` parameter) | yes | yes |
+| Typed evidence | yes (`evidence_type` parameter) | yes (`evidence_type` parameter) | yes | yes |
+| Task decomposition plan | yes (`set_task_plan` / `get_task_plan`) | yes (`set_task_plan` / `get_task_plan`) | yes | yes |
 | Slim responses | no | yes (`verbose` parameter) | yes | yes |
 | In-process calls (no stdio) | yes | no | no | yes |
 
