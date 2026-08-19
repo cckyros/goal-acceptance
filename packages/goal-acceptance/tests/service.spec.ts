@@ -86,7 +86,7 @@ describe('GoalAcceptanceService', () => {
     await service.setCriteria(agent, [
       { id: 'crit-1', description: 'Login works', required: true },
       { id: 'crit-2', description: 'Logout works', required: true },
-    ])
+    ], 'reviewer')
 
     // Rejects passed without evidence
     await expect(service.validateCriterion(agent, {

@@ -253,10 +253,10 @@ is not set, state is in-memory only (lost on restart).
 The `@cckyros/goal-acceptance-openclaw` package is an OpenClaw native plugin that registers all 13 tools directly in-process (no MCP stdio overhead).
 
 ```sh
-openclaw plugins install "npm:@cckyros/goal-acceptance-openclaw@0.1.0"
+openclaw plugins install "npm:@cckyros/goal-acceptance-openclaw@0.1.1"
 ```
 
-> **Note**: `0.1.0` is the first stable release; the version can be omitted when using the npm `latest` tag.
+> **Note**: `0.1.1` is the first stable release; the version can be omitted when using the npm `latest` tag.
 
 After install, restart the gateway:
 
@@ -409,7 +409,7 @@ class MyDbStore implements GoalAcceptanceStore {
 
 | Capability | Cordis plugin | MCP server | Agent Plugin | OpenClaw native |
 |------------|:---:|:---:|:---:|:---:|
-| Model tools | `set/get/validate/update_task/amend` | 13 tools (see [MCP Tools](#mcp-tools)) | same as MCP | same as MCP (in-process) |
+| Model tools | 13 tools (see [MCP Tools](#mcp-tools)) | 13 tools (see [MCP Tools](#mcp-tools)) | same as MCP | same as MCP (in-process) |
 | System prompt / Skills | `policy:goal-acceptance` | `skills/` | `skills/` | `skills/` |
 | Turn-stopping enforcement | yes (`agent.steer()`, dependency-aware) | no | no | no |
 | Cross-client portable | no (Harness only) | yes (any MCP client) | yes (any Agent Plugins client) | no (OpenClaw only) |
@@ -430,46 +430,23 @@ instructions.
 ```
 packages/
 ├── goal-acceptance-core/       # Zero-dependency state machine
-—  ├── src/
-—  —  ├── engine.ts           # GoalAcceptanceEngine (criteria + tasks + deps + amend)
-—  —  ├── store.ts            # GoalAcceptanceStore + InMemoryAcceptanceStore
-—  —  ├── types.ts            # GoalCriterion, AcceptanceSummary, events, task types
-—  —  ├── errors.ts           # GoalAcceptanceError
-—  —  └── index.ts            # Public exports
-—  └── tests/
-—      ├── engine.spec.ts      # 51 tests
-—      └── standalone.spec.ts  # 1 test
+│   ├── src/                    # Engine, store, types, errors, exports
+│   └── tests/                  # Core behavior tests
 ├── goal-acceptance-mcp/        # MCP server + Agent Plugin
-—  ├── src/
-—  —  ├── mcp-server.ts       # stdio MCP server, 13 tools
-—  —  ├── store.ts            # FileAcceptanceStore
-—  —  └── index.ts
-—  ├── bin/mcp-server.mjs      # Built stdio entry point
-—  ├── plugin.json             # Agent Plugins manifest
-—  ├── mcp.json                # MCP server config
-—  ├── skills/                 # Portable Agent Skills (8 skills)
-—  └── tests/
-—      └── mcp-server.spec.ts  # 22 tests
+│   ├── src/                    # stdio server, 13 tools, file store
+│   ├── bin/mcp-server.mjs      # Built stdio entry point
+│   ├── plugin.json             # Agent Plugins manifest
+│   ├── mcp.json                # MCP server config
+│   ├── skills/                 # Portable Agent Skills (8 skills)
+│   └── tests/                  # MCP protocol tests
 ├── goal-acceptance-openclaw/   # OpenClaw native plugin
-—  ├── src/
-—  —  └── index.ts            # defineToolPlugin, 13 tools (in-process)
-—  ├── dist/index.js           # Built entry point
-—  ├── openclaw.plugin.json    # OpenClaw plugin manifest
-—  └── skills/                 # Portable Agent Skills (8 skills)
+│   ├── src/                    # defineToolPlugin, 13 in-process tools
+│   ├── dist/index.js           # Built entry point
+│   ├── openclaw.plugin.json    # OpenClaw plugin manifest
+│   └── skills/                 # Portable Agent Skills (8 skills)
 └── goal-acceptance/            # DeepSeek Harness Cordis plugin
-    ├── src/
-    —  ├── index.ts            # apply(): service + tools + prompt + dependency-aware steering
-    —  ├── service.ts          # GoalAcceptanceService (per-agent engine)
-    —  ├── store.ts            # SessionAcceptanceStore (dsh-session adapter)
-    —  ├── tools.ts            # 5 model tools
-    —  ├── prompt.ts           # System prompt section with task progress
-    —  ├── types.ts            # SessionEventMap declarations
-    —  └── invariant.ts        # Runtime invariant
-    └── tests/
-        ├── service.spec.ts     # 5 tests
-        ├── tools.spec.ts       # 3 tests
-        ├── plugin.spec.ts      # 4 tests
-        └── invariant.spec.ts   # 1 test
+    ├── src/                    # apply(), service, store, tools, prompt, types
+    └── tests/                  # Cordis adapter and steering tests
 ```
 
 ## Build

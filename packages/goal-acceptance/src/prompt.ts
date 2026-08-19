@@ -14,10 +14,11 @@ export function renderAcceptanceGuidance(summary?: AcceptanceSummary): string {
     + '- If requirements expand during execution, use `amend_acceptance_criteria` to append new criteria with a reason. Existing criteria are not modified.\n'
     + '- As tasks complete, call `update_task_status` to reflect progress. When all tasks linked to a criterion are completed, that criterion is "ready to validate".\n'
     + '- Validate each criterion with concrete evidence using `validate_criterion` (status: `passed` or `failed` requires evidence).\n'
+    + '- Required criteria passed by the agent are self-claimed; an independent reviewer must re-verify them and call `confirm_criterion` with command, file, or url evidence before completion.\n'
     + '- Respect dependency ordering: validate criteria whose `depends_on` are all passed first.\n'
     + '- If a criterion cannot be verified because this environment lacks a vision model, screenshot comparison, permission, or external service, mark it as `blocked`.\n'
     + '- Continue executing all achievable independent criteria even if one criterion has failed.\n'
-    + '- The Goal can only conclude when all required criteria are passed; otherwise report a structured summary of failures and blockers.'
+    + '- The Goal can only conclude when all required criteria are formally passed; self-claimed passes require independent `confirm_criterion` review. Otherwise report a structured summary of failures and blockers.'
 
   if (summary !== undefined && summary.totalCount > 0) {
     const tp = summary.taskProgress
@@ -41,7 +42,7 @@ export function renderAcceptanceGuidance(summary?: AcceptanceSummary): string {
       const next = summary.nextActionable[0]!
       text += `\n- Next actionable: "${next.id}" (${next.description})`
       if (summary.nextActionable.length > 1) {
-        text += ` â€?followed by: ${summary.nextActionable.slice(1).map(c => `"${c.id}"`).join(', ')}`
+        text += `; followed by: ${summary.nextActionable.slice(1).map(c => `"${c.id}"`).join(', ')}`
       }
     }
   }

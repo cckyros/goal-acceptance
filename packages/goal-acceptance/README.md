@@ -1,10 +1,10 @@
 # @cckyros/goal-acceptance
 
-English | [中文](README.zh.md)
+English
 
 Model-provider-neutral goal acceptance criteria and validation enforcement plugin for the DeepSeek Harness (`goal-acceptance`).
 
-This plugin manages immutable acceptance criteria per Goal session, provides model-facing tools (`set_acceptance_criteria`, `validate_criterion`, `get_acceptance_criteria`), and intercepts `agent/turn-stopping` to steer uncompleted work or report a final structured summary.
+This plugin manages immutable acceptance criteria per Goal session, provides the same 13 model-facing tools as the MCP adapter, and intercepts `agent/turn-stopping` to steer uncompleted work or request independent reviewer confirmation.
 
 It is a thin Cordis wrapper over [`@cckyros/goal-acceptance-core`](../goal-acceptance-core), which is a framework-agnostic npm package that can also be used in OpenClaw, Cursor, Claude Code, or other agent runtimes.
 
@@ -12,7 +12,10 @@ For the portable Agent Plugin and MCP packaging, see [`@cckyros/goal-acceptance-
 
 ## Plugin
 
-`apply(ctx)` provides `ctx.goalAcceptance` and registers model-facing tools and prompts.
+`apply(ctx)` provides `ctx.goalAcceptance`, registers the 13 MCP-compatible tools,
+and adds the `policy:goal-acceptance` prompt section plus dependency-aware
+`agent/turn-stopping` steering. The default `role=agent` marks passed criteria as
+self-claimed until an independent reviewer calls `confirm_criterion`.
 
 ## Model Experience
 

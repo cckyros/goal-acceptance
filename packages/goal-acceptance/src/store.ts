@@ -11,6 +11,7 @@ import type {
   GoalAcceptanceValidateEvent,
   GoalAcceptanceTaskUpdateEvent,
   GoalAcceptanceAmendEvent,
+  GoalAcceptanceTaskPlanEvent,
 } from '@cckyros/goal-acceptance-core'
 
 const ACCEPTANCE_EVENT_TYPES = new Set([
@@ -18,6 +19,7 @@ const ACCEPTANCE_EVENT_TYPES = new Set([
   'goal-acceptance/validate',
   'goal-acceptance/task-update',
   'goal-acceptance/amend',
+  'goal-acceptance/task-plan',
 ])
 
 export class SessionAcceptanceStore implements GoalAcceptanceStore {
@@ -52,6 +54,11 @@ export class SessionAcceptanceStore implements GoalAcceptanceStore {
       case 'goal-acceptance/amend': {
         const { type: _type, ...payload } = event as GoalAcceptanceAmendEvent
         this.session.append('goal-acceptance/amend', payload)
+        break
+      }
+      case 'goal-acceptance/task-plan': {
+        const { type: _type, ...payload } = event as GoalAcceptanceTaskPlanEvent
+        this.session.append('goal-acceptance/task-plan', payload)
         break
       }
     }

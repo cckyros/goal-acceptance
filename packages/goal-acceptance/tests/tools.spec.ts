@@ -44,6 +44,16 @@ async function createHarness() {
 }
 
 describe('Goal Acceptance Tools', () => {
+  it('registers the complete MCP 13-tool protocol', async () => {
+    const { tools } = await createHarness()
+    expect(tools.map(tool => tool.name)).toEqual([
+      'set_acceptance_criteria', 'get_acceptance_criteria', 'validate_criterion',
+      'confirm_criterion', 'update_task_status', 'amend_acceptance_criteria',
+      'can_complete_goal', 'set_task_plan', 'get_task_plan', 'start_goal',
+      'list_goals', 'switch_goal', 'reset_goal',
+    ])
+  })
+
   it('executes set_acceptance_criteria and get_acceptance_criteria', async () => {
     const { ctx, agent } = await createHarness()
     const setTool = ctx.tools.get('set_acceptance_criteria')!
@@ -84,6 +94,36 @@ describe('Goal Acceptance Tools', () => {
     expect(valResult.criterion.status).toBe('passed')
     expect(valResult.criterion.evidence).toBe('GET /api/health returned 200 OK')
     expect(valResult.summary.passedCount).toBe(1)
+  })
+
+  it('confirms a self-claimed criterion with high-confidence evidence', async () => {
+    const { ctx, agent } = await createHarness()
+    await ctx.tools.get('set_acceptance_criteria')!.execute({
+      role: 'agent', criteria: [{ id: 'c1', description: 'API returns 200' }],
+    }, { agent } as never)
+    await ctx.tools.get('validate_criterion')!.execute({
+      criterion_id: 'c1', status: 'passed', evidence: 'test passed', evidence_type: 'command',
+    }, { agent } as never)
+    const result = await ctx.tools.get('confirm_criterion')!.execute({
+      criterion_id: 'c1', evidence: 'independent test passed', evidence_type: 'command',
+    }, { agent } as never) as { criterion: { selfClaimed?: boolean }; allowed: boolean }
+    expect(result.criterion.selfClaimed).toBe(false)
+    expect((await ctx.tools.get('can_complete_goal')!.execute({}, { agent } as never) as { allowed: boolean }).allowed).toBe(true)
+  })
+
+  it('supports task plans and goal lifecycle tools', async () => {
+    const { ctx, agent } = await createHarness()
+    await ctx.tools.get('set_acceptance_criteria')!.execute({ criteria: [{ id: 'c1', description: 'Done' }] }, { agent } as never)
+    const plan = await ctx.tools.get('set_task_plan')!.execute({ tasks: [{ id: 't1', description: 'Implement', deliverable: 'Code' }] }, { agent } as never) as { taskPlan: unknown[] }
+    expect(plan.taskPlan).toHaveLength(1)
+    expect((await ctx.tools.get('get_task_plan')!.execute({}, { agent } as never) as { taskPlan: unknown[] }).taskPlan).toHaveLength(1)
+    const initialGoals = (await ctx.tools.get('list_goals')!.execute({}, { agent } as never) as { goals: Array<{ id: string }> }).goals
+    expect(initialGoals).toHaveLength(1)
+    const started = await ctx.tools.get('start_goal')!.execute({ title: 'Next' }, { agent } as never) as { goal: { title: string } }
+    expect(started.goal.title).toBe('Next')
+    const switched = await ctx.tools.get('switch_goal')!.execute({ goal_id: initialGoals[0]!.id }, { agent } as never) as { goal: { id: string } }
+    expect(switched.goal.id).toBe(initialGoals[0]!.id)
+    await ctx.tools.get('reset_goal')!.execute({}, { agent } as never)
   })
 
   it('rejects execution when agent is missing', async () => {

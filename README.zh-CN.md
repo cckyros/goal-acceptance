@@ -85,7 +85,7 @@ MCP 工具默认返回精简摘要；传入 `verbose=true` 可获取完整摘要
 ### Core library
 
 ```sh
-npm install @cckyros/goal-acceptance-core@0.1.0
+npm install @cckyros/goal-acceptance-core@0.1.1
 ```
 
 ```typescript
@@ -119,7 +119,7 @@ console.log(allowed, reason)
 #### 方式 A：全局安装
 
 ```sh
-npm install -g @cckyros/goal-acceptance-mcp@0.1.0
+npm install -g @cckyros/goal-acceptance-mcp@0.1.1
 ```
 
 查看全局安装路径：
@@ -151,7 +151,7 @@ npm root -g
   "mcpServers": {
     "goal-acceptance": {
       "command": "npx",
-      "args": ["-y", "@cckyros/goal-acceptance-mcp@0.1.0"],
+      "args": ["-y", "@cckyros/goal-acceptance-mcp@0.1.1"],
       "env": {
         "PLUGIN_DATA": "/path/to/persistent/data"
       }
@@ -163,7 +163,7 @@ npm root -g
 #### 方式 C：项目级安装
 
 ```sh
-npm install @cckyros/goal-acceptance-mcp@0.1.0
+npm install @cckyros/goal-acceptance-mcp@0.1.1
 ```
 
 ```json
@@ -198,7 +198,7 @@ Windows 使用 `%APPDATA%\devin\mcp_config.json`，macOS/Linux 使用
 ### OpenClaw 原生插件
 
 ```sh
-openclaw plugins install "npm:@cckyros/goal-acceptance-openclaw@0.1.0"
+openclaw plugins install "npm:@cckyros/goal-acceptance-openclaw@0.1.1"
 ```
 
 安装后重启 gateway：

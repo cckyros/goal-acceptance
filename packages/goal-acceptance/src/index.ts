@@ -81,9 +81,10 @@ export function apply(ctx: Context, config: Config = {}): void {
     if (summary.allRequiredPassed) return
 
     // If there are no pending/in_progress criteria, all remaining items are already
-    // marked failed or blocked â€?no further work can be done automatically, let turn close.
+    // marked failed or blocked; no further work can be done automatically, let turn close.
     const actionable = criteria.filter(c => c.required && (c.status === 'pending' || c.status === 'in_progress'))
-    if (actionable.length === 0) return
+    const selfClaimedRequired = summary.selfClaimedPassed.filter(c => c.required)
+    if (actionable.length === 0 && selfClaimedRequired.length === 0) return
 
     if (!autoSteer) return
 
@@ -96,19 +97,26 @@ export function apply(ctx: Context, config: Config = {}): void {
     const parts: string[] = []
     parts.push(`Goal Acceptance Reminder (attempt ${count + 1}/${maxSteering}):`)
 
+    if (selfClaimedRequired.length > 0) {
+      const ids = selfClaimedRequired.map(c => `"${c.id}"`).join(', ')
+      parts.push(`Required criteria ${ids} are self-claimed. Ask an independent reviewer to re-verify and call \`confirm_criterion\` with fresh command, file, or url evidence.`)
+    } else if (actionable.length > 0) {
+      parts.push('Required criteria remain pending or in progress; continue the work before stopping.')
+    }
+
     // Task progress summary
     const tp = summary.taskProgress
     if (tp.totalTasks > 0) {
       parts.push(`Task progress: ${tp.completedTasks}/${tp.totalTasks} completed.`)
     }
 
-    // Ready to validate â€?prompt the agent to validate these first
+    // Ready to validate; prompt the agent to validate these first
     if (summary.readyToValidate.length > 0) {
       const ready = summary.readyToValidate.map(c => `"${c.id}"`).join(', ')
       parts.push(`Ready to validate (all linked tasks done): ${ready}. Call \`validate_criterion\` with evidence now.`)
     }
 
-    // Next actionable â€?ordered by dependency
+    // Next actionable; ordered by dependency
     if (summary.nextActionable.length > 0) {
       const next = summary.nextActionable[0]!
       parts.push(`Next priority: "${next.id}" (${next.description}).`)
@@ -117,7 +125,7 @@ export function apply(ctx: Context, config: Config = {}): void {
         parts.push(`Then: ${rest}.`)
       }
     } else {
-      // No actionable with met dependencies â€?list what's blocked by deps
+      // No actionable with met dependencies; list what's blocked by deps
       const blocked = actionable.filter(c => !summary.nextActionable.includes(c))
       if (blocked.length > 0) {
         const blockedDesc = blocked.map(c => `"${c.id}" (waiting on: ${c.dependsOn.join(', ')})`).join(', ')
