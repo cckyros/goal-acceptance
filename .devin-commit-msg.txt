@@ -1,8 +1,12 @@
-chore: bump versions for goal-planning skill + workflow guidance release
+feat: add DSH plugin manifest for Cordis package
 
-- core: 0.1.0-rc.7 -> 0.1.0-rc.8
-- mcp: 0.1.0-rc.16 -> 0.1.0-rc.17
-- openclaw: 0.1.0-rc.6 -> 0.1.0-rc.7
+- add root dsh.plugin.json with name/goal-acceptance and entry @cckyros/goal-acceptance
+- add packages/goal-acceptance/cordis.patch.yml for Cordis bundle injection
+- add dsh.bundle.patch field, dsh-plugin keywords, and cordis.patch.yml to files list
+
+Note: the Cordis package remains workspace-only (peer deps on dsh/cordis are
+resolvable only inside the DeepSeek Harness workspace); standalone npm install
+is not supported until dsh packages are fully published.
 
 Generated with [Devin](https://devin.ai)
 
