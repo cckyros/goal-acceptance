@@ -11,3 +11,4 @@ dist/
 coverage/
 .devin/
 test-output/
+.worktrees/
