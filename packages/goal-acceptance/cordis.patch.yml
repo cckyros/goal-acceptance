@@ -1,0 +1,4 @@
+- insert:
+    - id: goal-acceptance
+      name: '@cckyros/goal-acceptance'
+      config: {}

@@ -1,13 +1,13 @@
-# @deepseek-ai/dsh-goal-acceptance-mcp
+# @cckyros/goal-acceptance-mcp
 
 MCP server and [Agent Plugins](https://agent-plugins.org) packaging for
-`dsh-goal-acceptance-core`.
+`@cckyros/goal-acceptance-core`.
 
 This package is three things at once:
 
-1. **ESM library** (`lib/index.js`) — programmatic `createMcpServer()`.
-2. **MCP server** (`bin/mcp-server.mjs`) — stdio server for any MCP-capable client.
-3. **Agent Plugin** (`plugin.json` + `mcp.json` + `skills/`) — loadable by
+1. **ESM library** (`lib/index.js`) - exposes `createMcpServer()` programmatically.
+2. **MCP server** (`bin/mcp-server.mjs`) - stdio server for any MCP-capable client.
+3. **Agent Plugin** (`plugin.json` + `mcp.json` + `skills/`) - loadable by
    OpenClaw, Claude Code, Cursor, and any conformant Agent Plugins client.
 
 ## Usage as an Agent Plugin
@@ -16,7 +16,7 @@ Install the package, then point an Agent-Plugins-capable client at the package
 root:
 
 ```text
-node_modules/@deepseek-ai/dsh-goal-acceptance-mcp/
+node_modules/@cckyros/goal-acceptance-mcp/
 ├── plugin.json
 ├── mcp.json
 └── skills/
@@ -28,7 +28,9 @@ The client will:
 - Discover the `skills/*`.
 - Start the stdio MCP server defined in `mcp.json`.
 - Surface the tools `set_acceptance_criteria`, `get_acceptance_criteria`,
-  `validate_criterion`, and `can_complete_goal`.
+  `set_task_plan`, `get_task_plan`, `validate_criterion`, `confirm_criterion`,
+  `update_task_status`, `amend_acceptance_criteria`, `can_complete_goal`,
+  `start_goal`, `list_goals`, `switch_goal`, and `reset_goal`.
 
 ## Usage as a standalone MCP server
 
@@ -46,12 +48,18 @@ The server writes `acceptance-events.json` under `$PLUGIN_DATA`.
 
 ## Tools
 
-- `set_acceptance_criteria` — lock the criteria list.
-- `get_acceptance_criteria` — read current criteria and summary.
-- `validate_criterion` — record status and evidence.
-- `can_complete_goal` — check whether all required criteria passed.
+- `set_acceptance_criteria` - lock the criteria list. The default `role=agent` requires independent reviewer confirmation.
+- `get_acceptance_criteria` - read current criteria, task progress, task plan, and summary. Optional `verbose` (default `true`).
+- `set_task_plan` - set and lock the task decomposition plan. Each task needs an id, description, and deliverable. Dependency cycles are rejected.
+- `get_task_plan` - read the task decomposition plan with live task statuses.
+- `validate_criterion` - record status and evidence for one criterion. Optional `evidence_type` (`command`/`file`/`url`/`text`). Optional `verbose` (default `false`).
+- `confirm_criterion` - independently confirm a self-claimed pass with fresh `command`/`file`/`url` evidence.
+- `update_task_status` - update a linked task's status. Optional `verbose` (default `false`).
+- `amend_acceptance_criteria` - append new criteria after the initial lock (requires a reason).
+- `can_complete_goal` - check whether all required criteria are formally passed (self-claimed does not count).
+- `start_goal`, `list_goals`, `switch_goal`, `reset_goal` - manage isolated goals.
 
 ## DeepSeek Harness
 
 For DeepSeek Harness use the Cordis plugin
-`@deepseek-ai/dsh-goal-acceptance` instead.
+`@cckyros/goal-acceptance` instead.

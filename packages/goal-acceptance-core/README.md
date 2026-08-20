@@ -1,4 +1,4 @@
-# @deepseek-ai/dsh-goal-acceptance-core
+# @cckyros/goal-acceptance-core
 
 Framework-agnostic core for managing and validating goal acceptance criteria.
 
@@ -7,12 +7,12 @@ stateful `GoalAcceptanceEngine` over an abstract `GoalAcceptanceStore` and can b
 used in any JavaScript/TypeScript runtime (DeepSeek Harness, OpenClaw, Cursor,
 Claude Code, tests, or standalone scripts).
 
-For Agent Plugins and MCP packaging, see `@deepseek-ai/dsh-goal-acceptance-mcp`.
+For Agent Plugins and MCP packaging, see `@cckyros/goal-acceptance-mcp`.
 
 ## Usage
 
 ```ts
-import { GoalAcceptanceEngine, InMemoryAcceptanceStore } from '@deepseek-ai/dsh-goal-acceptance-core'
+import { GoalAcceptanceEngine, InMemoryAcceptanceStore } from '@cckyros/goal-acceptance-core'
 
 const engine = new GoalAcceptanceEngine(new InMemoryAcceptanceStore())
 
@@ -33,12 +33,12 @@ console.log(engine.canComplete())
 
 ## Usage in OpenClaw
 
-`dsh-goal-acceptance-core` has no Cordis/Harness peer dependencies. You can
+`@cckyros/goal-acceptance-core` has no Cordis/Harness peer dependencies. You can
 `npm install` it into an OpenClaw (or any other Node.js agent) project and wire
 it into a skill:
 
 ```ts
-import { GoalAcceptanceEngine, InMemoryAcceptanceStore } from '@deepseek-ai/dsh-goal-acceptance-core'
+import { GoalAcceptanceEngine, InMemoryAcceptanceStore } from '@cckyros/goal-acceptance-core'
 
 // Inside an OpenClaw skill context
 const store = new InMemoryAcceptanceStore() // or a custom store backed by OpenClaw's memory
@@ -67,7 +67,7 @@ conversation state).
 Implement `GoalAcceptanceStore` to persist events in your own backend:
 
 ```ts
-import type { GoalAcceptanceStore, GoalAcceptanceEvent } from '@deepseek-ai/dsh-goal-acceptance-core'
+import type { GoalAcceptanceStore, GoalAcceptanceEvent } from '@cckyros/goal-acceptance-core'
 
 class MyStore implements GoalAcceptanceStore {
   private readonly _events: GoalAcceptanceEvent[] = []
@@ -85,9 +85,9 @@ class MyStore implements GoalAcceptanceStore {
 
 ## Status model
 
-- `pending` / `in_progress` — not yet verified
-- `passed` / `failed` — terminal; requires evidence
-- `blocked` — cannot be verified in this environment
-- `not_run` — explicitly skipped
+- `pending` / `in_progress` - not yet verified
+- `passed` / `failed` - terminal outcomes; requires evidence
+- `blocked` - cannot be verified in this environment
+- `not_run` - explicitly skipped
 
 `canComplete()` returns `allowed: true` only when all `required: true` criteria are `passed`.

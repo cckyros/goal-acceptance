@@ -8,9 +8,10 @@
   "scripts": {
     "build": "tsc -b && tsdown",
     "test": "vitest run",
-    "typecheck": "tsc -b --noEmit"
+    "typecheck": "tsc --noEmit -p tsconfig.typecheck.json"
   },
   "devDependencies": {
+    "@types/node": "^26.2.0",
     "tsdown": "^0.22.2",
     "typescript": "^5.8.0",
     "vitest": "^4.1.0"

@@ -9,3 +9,7 @@ bin/*.mjs
 !.env.example
 dist/
 coverage/
+.devin/
+test-output/
+docs/
+.worktrees/

@@ -1,7 +1,7 @@
-{
-  "name": "@deepseek-ai/dsh-goal-acceptance",
+﻿{
+  "name": "@cckyros/goal-acceptance",
   "description": "Model-provider-neutral goal acceptance criteria and validation enforcement plugin for the DeepSeek Harness",
-  "version": "0.1.0-rc.5",
+  "version": "0.1.2",
   "publishConfig": {
     "access": "public"
   },
@@ -33,33 +33,28 @@
     "lib/index.js",
     "lib/invariant.js",
     "lib/types/**/*.js",
-    "lib/types/**/*.d.ts"
+    "lib/types/**/*.d.ts",
+    "cordis.patch.yml"
   ],
   "license": "MIT",
+  "keywords": ["deepseek-harness", "dsh-plugin", "goal", "acceptance", "criteria", "cordis"],
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    }
+  },
   "peerDependencies": {
-    "@deepseek-ai/dsh-agent": "workspace:^",
-    "@deepseek-ai/dsh-goal": "workspace:^",
-    "@deepseek-ai/dsh-invariants": "workspace:^",
-    "@deepseek-ai/dsh-llm": "workspace:^",
-    "@deepseek-ai/dsh-session": "workspace:^",
-    "@deepseek-ai/dsh-system-prompt": "workspace:^",
-    "@deepseek-ai/dsh-tools": "workspace:^",
-    "@deepseek-ai/cordis": "workspace:^"
+    "@deepseek-ai/dsh-agent": "*",
+    "@deepseek-ai/dsh-goal": "*",
+    "@deepseek-ai/dsh-invariants": "*",
+    "@deepseek-ai/dsh-llm": "*",
+    "@deepseek-ai/dsh-session": "*",
+    "@deepseek-ai/dsh-system-prompt": "*",
+    "@deepseek-ai/dsh-tools": "*",
+    "@deepseek-ai/cordis": "*"
   },
   "dependencies": {
-    "@deepseek-ai/dsh-goal-acceptance-core": "workspace:^",
-    "@deepseek-ai/schemastery": "workspace:^"
-  },
-  "devDependencies": {
-    "@deepseek-ai/dsh-agent": "workspace:^",
-    "@deepseek-ai/dsh-agent-loop": "workspace:^",
-    "@deepseek-ai/dsh-agent-loop-testkit": "workspace:^",
-    "@deepseek-ai/dsh-goal": "workspace:^",
-    "@deepseek-ai/dsh-invariants": "workspace:^",
-    "@deepseek-ai/dsh-llm": "workspace:^",
-    "@deepseek-ai/dsh-session": "workspace:^",
-    "@deepseek-ai/dsh-system-prompt": "workspace:^",
-    "@deepseek-ai/dsh-tools": "workspace:^",
-    "@deepseek-ai/cordis": "workspace:^"
+    "@cckyros/goal-acceptance-core": "^0.1.2",
+    "@deepseek-ai/schemastery": "^3.18.1"
   }
 }

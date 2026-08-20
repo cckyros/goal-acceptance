@@ -70,12 +70,21 @@ describe('Goal Acceptance Plugin', () => {
     expect((steerMsg.content[0] as { text: string }).text).toContain('Required criteria')
   })
 
+  it('steers self-claimed required criteria toward independent reviewer confirmation', async () => {
+    const { ctx, agent } = await createHarness({ autoSteerUncompleted: true })
+    await ctx.goalAcceptance.setCriteria(agent, [{ id: 'c1', description: 'Run build' }], 'agent')
+    await ctx.goalAcceptance.validateCriterion(agent, { criterionId: 'c1', status: 'passed', evidence: 'build exit 0' })
+    await agentEvents(ctx, agent).serial('agent/turn-stopping', { turn: 1, signal: new AbortController().signal })
+    expect(agent.inbox.nextStep).toHaveLength(1)
+    expect((agent.inbox.nextStep[0]!.content[0] as { text: string }).text).toContain('confirm_criterion')
+  })
+
   it('does not steer when all required criteria are passed', async () => {
     const { ctx, agent } = await createHarness({ autoSteerUncompleted: true })
 
     await ctx.goalAcceptance.setCriteria(agent, [
       { id: 'c1', description: 'Run build', required: true },
-    ])
+    ], 'reviewer')
     await ctx.goalAcceptance.validateCriterion(agent, {
       criterionId: 'c1',
       status: 'passed',

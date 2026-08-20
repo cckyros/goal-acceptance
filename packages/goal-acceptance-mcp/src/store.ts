@@ -1,6 +1,6 @@
 import { readFile, writeFile } from 'node:fs/promises'
 import { existsSync, readFileSync } from 'node:fs'
-import type { GoalAcceptanceEvent, GoalAcceptanceStore } from '@deepseek-ai/dsh-goal-acceptance-core'
+import type { GoalAcceptanceEvent, GoalAcceptanceStore } from '@cckyros/goal-acceptance-core'
 
 /** File-backed event store using a JSON file. */
 export class FileAcceptanceStore implements GoalAcceptanceStore {

@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest'
-import { GoalAcceptanceEngine, InMemoryAcceptanceStore } from '@deepseek-ai/dsh-goal-acceptance-core'
+import { GoalAcceptanceEngine, InMemoryAcceptanceStore } from '@cckyros/goal-acceptance-core'
 
 describe('OpenClaw-style standalone usage', () => {
   it('can run the acceptance engine without Cordis or Harness', async () => {
@@ -19,6 +19,17 @@ describe('OpenClaw-style standalone usage', () => {
       criterionId: 'compile',
       status: 'passed',
       evidence: 'tsc --noEmit exited with 0',
+      evidenceType: 'command',
+    })
+
+    // Default role is 'agent': passed is self-claimed, completion is blocked
+    // until an independent reviewer confirms with fresh evidence.
+    expect(acceptance.canComplete().allowed).toBe(false)
+
+    await acceptance.confirmCriterion({
+      criterionId: 'compile',
+      evidence: 'reviewer re-ran tsc --noEmit: exit 0',
+      evidenceType: 'command',
     })
 
     expect(acceptance.canComplete().allowed).toBe(true)
