@@ -1,0 +1,31 @@
+{
+  "name": "@cckyros/goal-acceptance",
+  "owner": {
+    "name": "cckyros"
+  },
+  "metadata": {
+    "description": "Acceptance-criteria-driven goal completion for autonomous agents.",
+    "version": "0.2.0"
+  },
+  "plugins": [
+    {
+      "name": "goal-acceptance",
+      "source": ".",
+      "description": "Acceptance-criteria-driven goal completion for autonomous agents.",
+      "version": "0.2.0",
+      "author": {
+        "name": "cckyros"
+      },
+      "homepage": "https://github.com/cckyros/goal-acceptance",
+      "repository": "https://github.com/cckyros/goal-acceptance",
+      "license": "MIT",
+      "keywords": [
+        "@cckyros/goal-acceptance",
+        "mcp",
+        "agent-plugins",
+        "agent-skills",
+        "scaffold"
+      ]
+    }
+  ]
+}

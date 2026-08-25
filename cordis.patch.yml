@@ -1,0 +1,5 @@
+# dsh plugin activation - see package.json "dsh" key.
+- insert:
+    - id: goal-acceptance
+      name: "@cckyros/goal-acceptance"
+      config: {}
