@@ -11,7 +11,7 @@ import {
   ListToolsRequestSchema,
 } from '@modelcontextprotocol/sdk/types.js'
 import { GoalAcceptanceEngine, GoalAcceptanceError, InMemoryAcceptanceStore } from '@cckyros/goal-acceptance-core'
-import type { GoalRole, EvidenceType, GoalAcceptanceStore } from '@cckyros/goal-acceptance-core'
+import type { GoalRole, EvidenceType, GoalAcceptanceStore, CriterionSpec } from '@cckyros/goal-acceptance-core'
 import { FileAcceptanceStore } from './store.ts'
 
 interface ToolInput {
@@ -66,6 +66,27 @@ const PACKAGE_VERSION: string = (() => {
     return '0.0.0'
   }
 })()
+
+interface CriterionInput {
+  readonly id: string
+  readonly description: string
+  readonly required?: boolean
+  readonly method?: string
+  readonly task_ids?: string[]
+  readonly depends_on?: string[]
+}
+
+/** Translate the tool's snake_case criterion input into engine specs. */
+function toCriterionSpecs(criteria: readonly CriterionInput[]): CriterionSpec[] {
+  return criteria.map(c => ({
+    id: c.id,
+    description: c.description,
+    ...c.required !== undefined ? { required: c.required } : {},
+    ...c.method !== undefined ? { method: c.method } : {},
+    ...c.task_ids !== undefined ? { taskIds: c.task_ids } : {},
+    ...c.depends_on !== undefined ? { dependsOn: c.depends_on } : {},
+  }))
+}
 
 /** Compact one-line summary for default (non-verbose) responses. */
 function slimSummary(s: import('@cckyros/goal-acceptance-core').AcceptanceSummary) {
@@ -347,6 +368,8 @@ export function createMcpServer(): Server {
           '- role: agent (default) marks passed as self-claimed; reviewer/dual marks formal passed',
           '',
           'CRITICAL: Default role=agent. Passed criteria are self-claimed, requiring confirm_criterion before completion. Do NOT declare a task complete until can_complete_goal returns allowed=true.',
+          '',
+          'ALREADY-LOCKED BEHAVIOUR: Criteria are immutable once locked, so calling this again rotates to a NEW goal instead of failing. The response reports previousGoalId, and previousGoalIncomplete=true when the goal you just left still had unfinished required criteria. To add criteria to the CURRENT goal use amend_acceptance_criteria; to return to a rotated-away goal use list_goals then switch_goal.',
         ].join('\n'),
         inputSchema: {
           type: 'object',
@@ -594,47 +617,42 @@ export function createMcpServer(): Server {
     try {
     switch (name) {
       case 'set_acceptance_criteria': {
-        const criteria = input.criteria as Array<{ id: string; description: string; required?: boolean; method?: string; task_ids?: string[]; depends_on?: string[] }>
+        const specs = toCriterionSpecs(input.criteria as CriterionInput[])
         const role = (input.role as GoalRole | undefined) ?? 'agent'
         // Auto-create a goal if none is active (backward compat: first call just works)
         let engine = ensureGoal()
         try {
-          const list = await engine.setCriteria(criteria.map(c => ({
-            id: c.id,
-            description: c.description,
-            ...c.required !== undefined ? { required: c.required } : {},
-            ...c.method !== undefined ? { method: c.method } : {},
-            ...c.task_ids !== undefined ? { taskIds: c.task_ids } : {},
-            ...c.depends_on !== undefined ? { dependsOn: c.depends_on } : {},
-          })), role)
+          const list = await engine.setCriteria(specs, role)
           const summary = engine.summarize()
           return {
             content: [{ type: 'text', text: JSON.stringify({ goalId: currentGoalId, criteria: list, summary }, null, 2) }],
           }
         } catch (e) {
           if (e instanceof GoalAcceptanceError && e.code === 'GOAL_ACCEPTANCE_ALREADY_LOCKED') {
-            // Check if the current goal is already completed — if so, auto-start a new goal
-            const completedGoalId = currentGoalId
-            if (engine.canComplete().allowed) {
-              startGoal()
-              engine = getEngine()
-              const list = await engine.setCriteria(criteria.map(c => ({
-                id: c.id,
-                description: c.description,
-                ...c.required !== undefined ? { required: c.required } : {},
-                ...c.method !== undefined ? { method: c.method } : {},
-                ...c.task_ids !== undefined ? { taskIds: c.task_ids } : {},
-                ...c.depends_on !== undefined ? { dependsOn: c.depends_on } : {},
-              })), role)
-              const summary = engine.summarize()
-              return {
-                content: [{ type: 'text', text: JSON.stringify({ goalId: currentGoalId, previousGoalId: completedGoalId, autoStarted: true, criteria: list, summary }, null, 2) }],
-              }
+            // Locked criteria are immutable by design, so rotate to a fresh goal
+            // instead of failing: an error here dead-ends the caller on a goal it
+            // can no longer edit. The previous goal keeps its own events and stays
+            // reachable through list_goals / switch_goal. When it was left
+            // unfinished we say so in the response so the abandonment is visible
+            // rather than silent.
+            const previousGoalId = currentGoalId
+            const completion = engine.canComplete()
+            const previousGoalSummary = slimSummary(engine.summarize())
+            startGoal()
+            engine = getEngine()
+            const list = await engine.setCriteria(specs, role)
+            const summary = engine.summarize()
+            return {
+              content: [{ type: 'text', text: JSON.stringify({
+                goalId: currentGoalId,
+                previousGoalId,
+                autoStarted: true,
+                previousGoalIncomplete: !completion.allowed,
+                ...completion.allowed ? {} : { previousGoalReason: completion.reason, previousGoalSummary },
+                criteria: list,
+                summary,
+              }, null, 2) }],
             }
-            throw new GoalAcceptanceError(
-              `criteria are already locked for goal ${currentGoalId}. Call start_goal to begin a new goal, or reset_goal to clear the current one.`,
-              'GOAL_ACCEPTANCE_ALREADY_LOCKED',
-            )
           }
           throw e
         }
@@ -715,16 +733,8 @@ export function createMcpServer(): Server {
       }
       case 'amend_acceptance_criteria': {
         const engine = getEngine()
-        const criteria = input.criteria as Array<{ id: string; description: string; required?: boolean; method?: string; task_ids?: string[]; depends_on?: string[] }>
         const added = await engine.amendCriteria({
-          criteria: criteria.map(c => ({
-            id: c.id,
-            description: c.description,
-            ...c.required !== undefined ? { required: c.required } : {},
-            ...c.method !== undefined ? { method: c.method } : {},
-            ...c.task_ids !== undefined ? { taskIds: c.task_ids } : {},
-            ...c.depends_on !== undefined ? { dependsOn: c.depends_on } : {},
-          })),
+          criteria: toCriterionSpecs(input.criteria as CriterionInput[]),
           reason: input.reason as string,
         })
         const summary = engine.summarize()

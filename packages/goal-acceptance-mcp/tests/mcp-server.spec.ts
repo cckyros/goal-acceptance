@@ -484,13 +484,49 @@ describe('GoalAcceptanceMcpServer', () => {
     expect(setParsed.criteria).toHaveLength(1)
   })
 
-  it('set_acceptance_criteria on locked goal gives clear error pointing to start_goal', async () => {
+  it('rotates to a new goal when the locked goal is still incomplete', async () => {
     const { client } = await createClient()
+    const res1 = await client.callTool({
+      name: 'set_acceptance_criteria',
+      arguments: { criteria: [{ id: 'c1', description: 'first', required: true }] },
+    })
+    const goal1Id = JSON.parse(String((res1.content as Array<{ type: string; text: string }>)[0]!.text)).goalId
+
+    // Goal 1 is locked and still pending — this must not dead-end the caller.
+    const res2 = await client.callTool({
+      name: 'set_acceptance_criteria',
+      arguments: { criteria: [{ id: 'c2', description: 'second', required: true }] },
+    })
+    expect(res2.isError).toBeFalsy()
+    const parsed = JSON.parse(String((res2.content as Array<{ type: string; text: string }>)[0]!.text))
+    expect(parsed.goalId).not.toBe(goal1Id)
+    expect(parsed.autoStarted).toBe(true)
+    expect(parsed.previousGoalId).toBe(goal1Id)
+    expect(parsed.previousGoalIncomplete).toBe(true)
+    expect(parsed.previousGoalReason).toBeTruthy()
+    expect(parsed.previousGoalSummary.allRequiredPassed).toBe(false)
+    expect(parsed.criteria).toHaveLength(1)
+    expect(parsed.criteria[0].id).toBe('c2')
+  })
+
+  it('keeps the abandoned goal and its criteria retrievable after rotation', async () => {
+    const { client } = await createClient()
+    const res1 = await client.callTool({
+      name: 'set_acceptance_criteria',
+      arguments: { criteria: [{ id: 'c1', description: 'first', required: true }] },
+    })
+    const goal1Id = JSON.parse(String((res1.content as Array<{ type: string; text: string }>)[0]!.text)).goalId
     await client.callTool({
       name: 'set_acceptance_criteria',
-      arguments: { criteria: [{ id: 'c1', description: 'first' }] },
+      arguments: { criteria: [{ id: 'c2', description: 'second', required: true }] },
     })
-    await expectErrorResponse(client, 'set_acceptance_criteria', { criteria: [{ id: 'c2', description: 'second' }] }, 'start_goal')
+
+    const goals = await client.callTool({ name: 'list_goals', arguments: {} })
+    const goalsParsed = JSON.parse(String((goals.content as Array<{ type: string; text: string }>)[0]!.text))
+    expect(goalsParsed.goals).toHaveLength(2)
+    const abandoned = goalsParsed.goals.find((g: { id: string }) => g.id === goal1Id)
+    expect(abandoned.criteriaCount).toBe(1)
+    expect(abandoned.isActive).toBe(false)
   })
 
   it('auto-starts new goal when previous goal is completed', async () => {

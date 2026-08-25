@@ -74,6 +74,43 @@ describe('Goal Acceptance Tools', () => {
     expect(getResult.summary.totalCount).toBe(2)
   })
 
+  it('rotates to a new goal when set_acceptance_criteria hits an incomplete locked goal', async () => {
+    const { ctx, agent } = await createHarness()
+    const setTool = ctx.tools.get('set_acceptance_criteria')!
+
+    const first = await setTool.execute({
+      criteria: [{ id: 'c1', description: 'first', required: true }],
+    }, { agent } as never) as { goalId: string }
+
+    // Goal 1 is locked and still pending — this must not dead-end the caller.
+    const second = await setTool.execute({
+      criteria: [{ id: 'c2', description: 'second', required: true }],
+    }, { agent } as never) as {
+      goalId: string
+      previousGoalId: string
+      autoStarted: boolean
+      previousGoalIncomplete: boolean
+      previousGoalReason: string
+      criteria: Array<{ id: string }>
+    }
+
+    expect(second.goalId).not.toBe(first.goalId)
+    expect(second.autoStarted).toBe(true)
+    expect(second.previousGoalId).toBe(first.goalId)
+    expect(second.previousGoalIncomplete).toBe(true)
+    expect(second.previousGoalReason).toBeTruthy()
+    expect(second.criteria.map(c => c.id)).toEqual(['c2'])
+
+    // The abandoned goal stays reachable with its criteria intact.
+    const goals = await ctx.tools.get('list_goals')!.execute({}, { agent } as never) as {
+      goals: Array<{ id: string; criteriaCount: number; isActive: boolean }>
+    }
+    expect(goals.goals).toHaveLength(2)
+    const abandoned = goals.goals.find(g => g.id === first.goalId)!
+    expect(abandoned.criteriaCount).toBe(1)
+    expect(abandoned.isActive).toBe(false)
+  })
+
   it('validates a criterion using validate_criterion tool', async () => {
     const { ctx, agent } = await createHarness()
     const setTool = ctx.tools.get('set_acceptance_criteria')!

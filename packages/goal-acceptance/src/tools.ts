@@ -5,7 +5,8 @@
 
 import type { Context } from '@deepseek-ai/cordis'
 import { defineTool, type GenericCallView, type ToolDefinition } from '@deepseek-ai/dsh-tools'
-import type { EvidenceType, GoalCriterionStatus, GoalRole, TaskStatus } from './types.ts'
+import { GoalAcceptanceError } from './types.ts'
+import type { AcceptanceSummary, EvidenceType, GoalCriterionStatus, GoalRole, TaskStatus } from './types.ts'
 
 const STATUSES: GoalCriterionStatus[] = [
   'pending',
@@ -66,6 +67,15 @@ const OUTPUT_OBJECT_SCHEMA = {
   additionalProperties: true,
 } as const
 
+function slimSummary(s: AcceptanceSummary) {
+  return {
+    allRequiredPassed: s.allRequiredPassed,
+    passedCount: s.passedCount,
+    selfClaimedCount: s.selfClaimedCount,
+    totalCount: s.totalCount,
+  }
+}
+
 /** Create the tool definitions for goal acceptance criteria. */
 export function createAcceptanceTools(ctx: Context): ToolDefinition[] {
   const getTool = defineTool({
@@ -93,7 +103,7 @@ export function createAcceptanceTools(ctx: Context): ToolDefinition[] {
 
   const setTool = defineTool({
     name: 'set_acceptance_criteria',
-    description: 'Set and lock the initial acceptance criteria for the current Goal. Must be called after user confirmation and before implementation. Each criterion may link to task IDs and declare dependencies on other criteria.',
+    description: 'Set and lock the initial acceptance criteria for the current goal. Must be called before implementation. Optional role field controls self-claim behavior: agent marks passed as self-claimed (needs reviewer confirmation), reviewer/dual marks formal passed. Criteria are immutable once locked, so calling this again rotates to a NEW goal instead of failing; the response reports previousGoalId and previousGoalIncomplete=true when the goal you just left still had unfinished required criteria. To add criteria to the CURRENT goal use amend_acceptance_criteria; to return to a rotated-away goal use list_goals then switch_goal.',
     parameters: {
       criteria: {
         type: 'array',
@@ -101,30 +111,59 @@ export function createAcceptanceTools(ctx: Context): ToolDefinition[] {
         description: 'Array of criteria definitions with id, description, required flag, verification method, optional task IDs, and optional dependencies.',
         items: CRITERION_ITEM_SCHEMA,
       },
-      role: { ...ROLE_SCHEMA, description: 'Role locking criteria; defaults to agent.' },
+      role: { ...ROLE_SCHEMA, description: 'Role locking criteria; defaults to agent. agent: passed marks self-claimed, requiring confirm_criterion by an independent reviewer. reviewer/dual: formal passed immediately (use only when the user explicitly waives independent review).' },
     },
     output: {
       schema: OUTPUT_OBJECT_SCHEMA,
       render: (_args: unknown, value: unknown) => [{ type: 'text' as const, text: JSON.stringify(value, null, 2) }],
     },
-    execute(args, exec) {
+    async execute(args, exec) {
       const agent = exec.agent
       if (agent === undefined) throw new Error('acceptance tools require a calling agent')
       const service = ctx.get('goalAcceptance')
       if (service === undefined) throw new Error('goalAcceptance service is not mounted')
       const rawCriteria = args.criteria as Array<{ id: string; description: string; required?: boolean; method?: string; task_ids?: string[]; depends_on?: string[] }>
-      return service.setCriteria(agent, rawCriteria.map(c => ({
+      const mapped = rawCriteria.map(c => ({
         id: c.id,
         description: c.description,
         ...c.required !== undefined ? { required: c.required } : {},
         ...c.method !== undefined ? { method: c.method } : {},
         ...c.task_ids !== undefined ? { taskIds: c.task_ids } : {},
         ...c.depends_on !== undefined ? { dependsOn: c.depends_on } : {},
-      })), (args.role as GoalRole | undefined) ?? 'agent').then(criteria => ({
-        criteria,
-        goalId: service.getActiveGoalId(agent),
-        summary: service.summarize(agent),
-      })) as never
+      }))
+      const role = (args.role as GoalRole | undefined) ?? 'agent'
+      try {
+        const criteria = await service.setCriteria(agent, mapped, role)
+        return {
+          criteria,
+          goalId: service.getActiveGoalId(agent),
+          summary: service.summarize(agent),
+        } as never
+      } catch (e) {
+        if (e instanceof GoalAcceptanceError && e.code === 'GOAL_ACCEPTANCE_ALREADY_LOCKED') {
+          // Locked criteria are immutable by design, so rotate to a fresh goal
+          // instead of failing: an error here dead-ends the caller on a goal it
+          // can no longer edit. The previous goal keeps its own events and stays
+          // reachable through list_goals / switch_goal. When it was left
+          // unfinished we say so in the response so the abandonment is visible
+          // rather than silent.
+          const previousGoalId = service.getActiveGoalId(agent)
+          const completion = service.canComplete(agent)
+          const previousGoalSummary = slimSummary(service.summarize(agent))
+          await service.startGoal(agent)
+          const criteria = await service.setCriteria(agent, mapped, role)
+          return {
+            goalId: service.getActiveGoalId(agent),
+            previousGoalId,
+            autoStarted: true,
+            previousGoalIncomplete: !completion.allowed,
+            ...completion.allowed ? {} : { previousGoalReason: completion.reason, previousGoalSummary },
+            criteria,
+            summary: service.summarize(agent),
+          } as never
+        }
+        throw e
+      }
     },
     presentCall: args => present('Set acceptance criteria', 'other', args.criteria),
   })

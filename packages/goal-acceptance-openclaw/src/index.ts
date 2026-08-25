@@ -262,7 +262,7 @@ export default defineToolPlugin({
   tools: (tool) => [
     tool({
       name: 'set_acceptance_criteria',
-      description: 'Set and lock the initial acceptance criteria for the current goal. Must be called before implementation. Optional role field controls self-claim behavior: agent marks passed as self-claimed (needs reviewer confirmation), reviewer/dual marks formal passed.',
+      description: 'Set and lock the initial acceptance criteria for the current goal. Must be called before implementation. Optional role field controls self-claim behavior: agent marks passed as self-claimed (needs reviewer confirmation), reviewer/dual marks formal passed. Criteria are immutable once locked, so calling this again rotates to a NEW goal instead of failing; the response reports previousGoalId and previousGoalIncomplete=true when the goal you just left still had unfinished required criteria. To add criteria to the CURRENT goal use amend_acceptance_criteria; to return to a rotated-away goal use list_goals then switch_goal.',
       parameters: Type.Object({
         criteria: Type.Array(CriterionItem, { description: 'Array of criteria definitions.' }),
         role: Type.Optional(Type.Union([
@@ -280,19 +280,28 @@ export default defineToolPlugin({
           return { goalId: currentGoalId, criteria: list, summary }
         } catch (e) {
           if (e instanceof GoalAcceptanceError && e.code === 'GOAL_ACCEPTANCE_ALREADY_LOCKED') {
-            // Check if the current goal is already completed — if so, auto-start a new goal
-            const completedGoalId = currentGoalId
-            if (eng.canComplete().allowed) {
-              startGoal(ctx?.pluginConfig)
-              eng = getEngine(ctx?.pluginConfig)
-              const list = await eng.setCriteria(params.criteria.map(mapCriterion), role)
-              const summary = eng.summarize()
-              return { goalId: currentGoalId, previousGoalId: completedGoalId, autoStarted: true, criteria: list, summary }
+            // Locked criteria are immutable by design, so rotate to a fresh goal
+            // instead of failing: an error here dead-ends the caller on a goal it
+            // can no longer edit. The previous goal keeps its own events and stays
+            // reachable through list_goals / switch_goal. When it was left
+            // unfinished we say so in the response so the abandonment is visible
+            // rather than silent.
+            const previousGoalId = currentGoalId
+            const completion = eng.canComplete()
+            const previousGoalSummary = slimSummary(eng.summarize())
+            startGoal(ctx?.pluginConfig)
+            eng = getEngine(ctx?.pluginConfig)
+            const list = await eng.setCriteria(params.criteria.map(mapCriterion), role)
+            const summary = eng.summarize()
+            return {
+              goalId: currentGoalId,
+              previousGoalId,
+              autoStarted: true,
+              previousGoalIncomplete: !completion.allowed,
+              ...completion.allowed ? {} : { previousGoalReason: completion.reason, previousGoalSummary },
+              criteria: list,
+              summary,
             }
-            throw new GoalAcceptanceError(
-              `criteria are already locked for goal ${currentGoalId}. Call start_goal to begin a new goal, or reset_goal to clear the current one.`,
-              'GOAL_ACCEPTANCE_ALREADY_LOCKED',
-            )
           }
           throw e
         }
