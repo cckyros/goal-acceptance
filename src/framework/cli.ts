@@ -88,7 +88,7 @@ function splitTargets(raw: string | undefined): string[] {
     .filter(Boolean);
 }
 
-function resolveScope(manifest: PluginManifest, flags: Map<string, string>): Scope {
+function resolveScope(flags: Map<string, string>): Scope {
   const g = flags.get("global");
   if (g !== undefined) return "global";
   const s = flags.get("scope");
@@ -99,7 +99,6 @@ function resolveScope(manifest: PluginManifest, flags: Map<string, string>): Sco
 async function chooseTargetsInteractive(
   manifest: PluginManifest,
   adapters: TargetAdapter[],
-  dir: string,
   ctx: InstallContext,
 ): Promise<string[]> {
   const detected = await detectAll(adapters, ctx);
@@ -209,7 +208,7 @@ export async function runInstall(
 ): Promise<number> {
   const { manifest, adapters } = deps;
   const dir = flags.get("dir") ? join(flags.get("dir")!) : process.cwd();
-  const scope = resolveScope(manifest, flags);
+  const scope = resolveScope(flags);
   const dryRun = flags.has("dry-run");
   const nonInteractive = flags.has("non-interactive") || !process.stdin.isTTY;
   const update = flags.has("update");
@@ -232,7 +231,7 @@ export async function runInstall(
         .map((a) => a.id);
       if (!targets.length) targets = [adapters[0]?.id].filter(Boolean) as string[];
     } else {
-      targets = await chooseTargetsInteractive(manifest, adapters, dir, ctx);
+      targets = await chooseTargetsInteractive(manifest, adapters, ctx);
     }
   }
   const selected = adapters.filter((a) => targets.includes(a.id));
@@ -282,7 +281,7 @@ export async function runUninstall(
 ): Promise<number> {
   const { manifest, adapters } = deps;
   const dir = flags.get("dir") ? join(flags.get("dir")!) : process.cwd();
-  const scope = resolveScope(manifest, flags);
+  const scope = resolveScope(flags);
   const dryRun = flags.has("dry-run");
   const purgeConfig = flags.has("purge-config");
   const nonInteractive = flags.has("non-interactive") || !process.stdin.isTTY;
@@ -293,7 +292,7 @@ export async function runUninstall(
   if (!targets.length) {
     targets = nonInteractive
       ? adapters.map((a) => a.id)
-      : await chooseTargetsInteractive(manifest, adapters, dir, ctx);
+      : await chooseTargetsInteractive(manifest, adapters, ctx);
   }
   const selected = adapters.filter((a) => targets.includes(a.id));
   const unknown = targets.filter((t) => !adapters.some((a) => a.id === t));
@@ -368,7 +367,6 @@ async function runConfig(
   }
   if (sub === "get" || sub === undefined) {
     const key = positionals[1];
-    const source = cfg.sources[key ?? ""];
     if (key) {
       const v = cfg.values[key];
       if (v === undefined) {

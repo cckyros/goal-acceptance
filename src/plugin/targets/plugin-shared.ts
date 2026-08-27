@@ -70,14 +70,6 @@ export interface CmdResult {
   stderr: string;
 }
 
-/** First line of stderr/stdout, truncated — the failure surface of a CLI
- *  registration is its error message, not the full transcript. */
-function trimErr(s: string): string {
-  const t = s.trim();
-  const line = t.split(/\r?\n/)[0] ?? "";
-  return line.length > 300 ? `${line.slice(0, 300)}…` : line;
-}
-
 /** Quote an argument for the Windows cmd.exe command line: wrap in double
  *  quotes with embedded quotes doubled. Backslashes stay literal (cmd does
  *  not process them; JSON-style \\ escaping would corrupt Windows paths). */

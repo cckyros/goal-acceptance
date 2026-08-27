@@ -303,7 +303,6 @@ export const vscodeAdapter: TargetAdapter = {
   manualHint: "code.visualstudio.com — install the `code` CLI (Command Palette → Shell Command: Install 'code' command in PATH)",
 
   install: async (ctx) => {
-    const m = ctx.manifest;
     const mat = pluginMaterialize(ctx);
     if ("missing" in mat) {
       return { status: "error", detail: `missing package files: ${mat.missing.join(", ")}` };

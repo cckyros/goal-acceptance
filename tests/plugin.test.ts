@@ -18,7 +18,6 @@ function read(p: string): string {
 const pkg = JSON.parse(read("package.json"));
 const pluginJson = JSON.parse(read("plugin.json"));
 const mcpJson = JSON.parse(read("mcp.json"));
-const dotMcpJson = JSON.parse(read(".mcp.json"));
 const marketplace = JSON.parse(read("marketplace.json"));
 const cordisPatch = read("cordis.patch.yml");
 

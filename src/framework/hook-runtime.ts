@@ -8,7 +8,7 @@
 //  - all logging → stderr; NEVER log to stdout
 //  - always exit 0 (non-zero would block the tool / kill context injection);
 //    failure paths emit `{}` (no-op, tool proceeds normally)
-import type { HookDef, PluginManifest } from "./manifest.ts";
+import type { PluginManifest } from "./manifest.ts";
 import { resolveConfig } from "./config.ts";
 
 /** Write the hook JSON payload in a single write, then exit only after the
