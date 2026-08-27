@@ -1,0 +1,19 @@
+{
+  "$schema": "https://agent-plugins.org/schemas/1.0.0/plugin.schema.json",
+  "name": "goal-acceptance",
+  "version": "0.2.0",
+  "description": "Acceptance-criteria-driven goal completion for autonomous agents.",
+  "author": {
+    "name": "cckyros"
+  },
+  "homepage": "https://github.com/cckyros/goal-acceptance",
+  "repository": "https://github.com/cckyros/goal-acceptance",
+  "license": "MIT",
+  "keywords": [
+    "@cckyros/goal-acceptance",
+    "mcp",
+    "agent-plugins",
+    "agent-skills",
+    "scaffold"
+  ]
+}

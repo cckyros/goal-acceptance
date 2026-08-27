@@ -1,0 +1,31 @@
+name: publish
+on:
+  push:
+    tags: ["v*"]
+permissions:
+  contents: read
+  packages: write # GITHUB_TOKEN 发布 GitHub Packages 所需
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      # version 必须显式指定:本仓库 package.json 无 packageManager 字段,
+      # pnpm/action-setup 缺 version 输入时会直接报错退出。
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 11.22.0
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22 # pnpm 11.22 uses node:sqlite (requires >= 22.13)
+          registry-url: https://npm.pkg.github.com
+      - run: pnpm install --frozen-lockfile
+      - run: pnpm run verify # build → typecheck → node --test (135/135)
+      - name: Validate tag vs version
+        run: |
+          TAG=${GITHUB_REF#refs/tags/}          # v0.2.0
+          VER="v$(node -p "require('./package.json').version")"  # package.json 0.2.0 → v0.2.0
+          [ "$TAG" = "$VER" ] || { echo "tag $TAG != version $VER"; exit 1; }
+      - run: pnpm publish --no-git-checks
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.GITHUB_TOKEN }}

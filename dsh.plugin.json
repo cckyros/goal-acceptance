@@ -1,10 +1,10 @@
 {
   "name": "goal-acceptance",
   "description": "Acceptance-criteria-driven goal completion and validation enforcement plugin for DeepSeek Harness.",
-  "version": "0.1.5",
+  "version": "0.2.0",
   "entry": {
     "name": "@cckyros/goal-acceptance",
-    "inject": []
+    "inject": ["agents", "tools", "systemPrompt"]
   },
   "client": {
     "platform": "node"

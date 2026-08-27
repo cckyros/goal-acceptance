@@ -1,9 +1,15 @@
-packages:
-  - "packages/goal-acceptance-core"
-  - "packages/goal-acceptance-mcp"
-  - "packages/goal-acceptance-openclaw"
+# autoInstallPeers must stay off: @deepseek-ai/* peer closures include
+# host-platform packages (dsh-scope, dsh-typert-protocol, dsh-code-runtime,
+# dsh-user-approval) that are NOT in the npm registry — dsh injects them at
+# runtime. Explicit devDependencies cover the local test surface.
+autoInstallPeers: false
 allowBuilds:
-  '@google/genai': set this to true or false
-  openclaw: set this to true or false
-  protobufjs: set this to true or false
-  tree-sitter-bash: set this to true or false
+  # Explicitly approved: esbuild runs its install script (platform binary).
+  esbuild: true
+  # Explicitly denied: these deps' postinstall scripts never ran during the
+  # 135/135 test surface; pnpm 11's verify-deps gate fails installs when a
+  # build-script dep is unlisted, so list them as denied to keep CI green.
+  '@google/genai': false
+  openclaw: false
+  protobufjs: false
+  tree-sitter-bash: false
