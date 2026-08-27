@@ -35,21 +35,27 @@ export const codexAdapter: TargetAdapter = {
     const agentsFile = join(codexDir, "AGENTS.md");
     const details: string[] = [];
 
-    // 1) [mcp_servers.<name>] section, version-pinned so updates reinstall
+    // 1) [mcp_servers.<name>] section, version-pinned so updates reinstall.
+    // TOML bare keys cannot contain '@' or '/', so the last segment must be quoted.
+    const tomlServerKey = JSON.stringify(m.name);           // "@cckyros/goal-acceptance"
+    const tomlSectionName = `mcp_servers.${tomlServerKey}`; // mcp_servers."@cckyros/goal-acceptance"
     const args = ["-y", `${m.name}@${m.version}`, "mcp"].map((a) => JSON.stringify(a)).join(", ");
     const block =
-      `[mcp_servers.${m.name}]\n` +
+      `[${tomlSectionName}]\n` +
       `command = ${JSON.stringify("npx")}\n` +
       `args = [${args}]\n` +
       `tool_timeout_sec = 180\n`;
-    if (ctx.dryRun) ctx.log(`[dry-run] upsert [mcp_servers.${m.name}] section in ${configToml}`);
+    if (ctx.dryRun) ctx.log(`[dry-run] upsert [${tomlSectionName}] section in ${configToml}`);
+    // Migrate away from the old unquoted (TOML-invalid) section name.
+    const legacySectionName = `mcp_servers.${m.name}`;
+    if (!ctx.dryRun) removeTomlSection(configToml, legacySectionName);
     const r1 = ctx.dryRun
       ? { changed: true }
-      : upsertTomlSection(configToml, `mcp_servers.${m.name}`, block);
+      : upsertTomlSection(configToml, tomlSectionName, block);
     details.push(
       r1.changed
-        ? `[mcp_servers.${m.name}] section upserted in ${configToml} (npx -y ${m.name}@${m.version} mcp)${ctx.dryRun ? " [dry-run]" : r1.backup ? ` (backup: ${r1.backup})` : ""}`
-        : `config.toml already has [mcp_servers.${m.name}] — idempotent, no change`,
+        ? `[${tomlSectionName}] section upserted in ${configToml} (npx -y ${m.name}@${m.version} mcp)${ctx.dryRun ? " [dry-run]" : r1.backup ? ` (backup: ${r1.backup})` : ""}`
+        : `config.toml already has [${tomlSectionName}] — idempotent, no change`,
     );
 
     // 2) AGENTS.md managed block (from the agents-fragment template)
@@ -108,16 +114,21 @@ export const codexAdapter: TargetAdapter = {
     const agentsFile = join(codexDir, "AGENTS.md");
     const notes: string[] = [];
 
+    const tomlServerKey = JSON.stringify(m.name);
+    const tomlSectionName = `mcp_servers.${tomlServerKey}`;
+    const legacySectionName = `mcp_servers.${m.name}`;
     if (ctx.dryRun) {
       notes.push(
-        `[dry-run] would remove [mcp_servers.${m.name}] from ${configToml} and the AGENTS.md block from ${agentsFile}`,
+        `[dry-run] would remove [${tomlSectionName}] from ${configToml} and the AGENTS.md block from ${agentsFile}`,
       );
     } else {
-      const r1 = removeTomlSection(configToml, `mcp_servers.${m.name}`);
+      // Remove both the new quoted and the old unquoted/invalid section names.
+      removeTomlSection(configToml, legacySectionName);
+      const r1 = removeTomlSection(configToml, tomlSectionName);
       notes.push(
         r1.changed
-          ? `removed [mcp_servers.${m.name}] section from ${configToml}${r1.backup ? `, backup ${r1.backup}` : ""}`
-          : `no [mcp_servers.${m.name}] section in ${configToml}`,
+          ? `removed [${tomlSectionName}] section from ${configToml}${r1.backup ? `, backup ${r1.backup}` : ""}`
+          : `no [${tomlSectionName}] section in ${configToml}`,
       );
       const r2 = removeManagedBlock(agentsFile, m.markers.agentsStart, m.markers.agentsEnd);
       notes.push(

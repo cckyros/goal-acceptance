@@ -18,7 +18,6 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version: 22 # pnpm 11.22 uses node:sqlite (requires >= 22.13)
-          registry-url: https://npm.pkg.github.com
       - run: pnpm install --frozen-lockfile
       - run: pnpm run verify # build → typecheck → node --test (135/135)
       - name: Validate tag vs version
@@ -26,6 +25,19 @@ jobs:
           TAG=${GITHUB_REF#refs/tags/}          # v0.2.0
           VER="v$(node -p "require('./package.json').version")"  # package.json 0.2.0 → v0.2.0
           [ "$TAG" = "$VER" ] || { echo "tag $TAG != version $VER"; exit 1; }
-      - run: pnpm publish --no-git-checks
+      # pnpm v11.5.3+ no longer expands ${...} placeholders in project .npmrc,
+      # so we set the scoped registry + auth explicitly via pnpm config for each publish.
+      - name: Publish to GitHub Packages
+        run: |
+          pnpm config set --location project @cckyros:registry https://npm.pkg.github.com
+          pnpm config set //npm.pkg.github.com/:_authToken "$GITHUB_TOKEN"
+          pnpm publish --no-git-checks
         env:
-          NODE_AUTH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      - name: Publish to npm
+        run: |
+          pnpm config set --location project @cckyros:registry https://registry.npmjs.org
+          pnpm config set //registry.npmjs.org/:_authToken "$NPM_TOKEN"
+          pnpm publish --no-git-checks
+        env:
+          NPM_TOKEN: ${{ secrets.NPM_TOKEN }}

@@ -62,13 +62,13 @@ test("codex: config.toml section + AGENTS.md block upsert idempotently and remov
 
   const first = run(["install", "--non-interactive", "--target", "codex"], dir);
   assert.equal(first.status, 0, first.stdout + first.stderr);
-  assert.equal(count(read(toml)!, `[mcp_servers.${manifest.name}]`), 1);
+  assert.equal(count(read(toml)!, `[mcp_servers.${JSON.stringify(manifest.name)}]`), 1);
   assert.equal(count(read(toml)!, `${manifest.name}@${manifest.version}`), 1, "version-pinned npx args");
   assert.equal(count(read(agents)!, manifest.markers.agentsStart), 1);
 
   const second = run(["install", "--non-interactive", "--target", "codex"], dir);
   assert.equal(second.status, 0, second.stdout + second.stderr);
-  assert.equal(count(read(toml)!, `[mcp_servers.${manifest.name}]`), 1, "re-install must not duplicate the section");
+  assert.equal(count(read(toml)!, `[mcp_servers.${JSON.stringify(manifest.name)}]`), 1, "re-install must not duplicate the section");
   assert.equal(count(read(agents)!, manifest.markers.agentsStart), 1, "re-install must not duplicate the block");
 
   const un = run(["uninstall", "--non-interactive", "--target", "codex"], dir);
