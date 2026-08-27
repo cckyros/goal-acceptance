@@ -10,7 +10,7 @@
     "url": "git+https://github.com/cckyros/goal-acceptance.git"
   },
   "publishConfig": {
-    "registry": "https://registry.npmjs.org",
+    "registry": "https://npm.pkg.github.com",
     "access": "public"
   },
   "bin": {
