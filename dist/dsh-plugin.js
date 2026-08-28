@@ -725,6 +725,11 @@ var GoalManager = class {
     this.metaCache.set(id, meta);
     return meta;
   }
+  /** Return the active goal's metadata, or undefined when none is active. */
+  getCurrentGoalMeta() {
+    if (this.currentGoalId === null) return void 0;
+    return this.loadGoalMeta(this.currentGoalId);
+  }
   /** List all goals with status summaries. */
   listGoals() {
     const dir = this.goalsDir;
@@ -1584,7 +1589,7 @@ ${stderr.trim()}` : "",
 // src/plugin/manifest.ts
 var manifest = {
   name: "@cckyros/goal-acceptance",
-  version: "0.2.3",
+  version: "0.2.4",
   // 0.1.x monorepo → 0.2.0 single-package scaffold
   brand: "goal-acceptance",
   description: "Acceptance-criteria-driven goal completion for autonomous agents.",

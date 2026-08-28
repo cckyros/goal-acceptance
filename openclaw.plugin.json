@@ -2,7 +2,7 @@
   "id": "goal-acceptance",
   "name": "goal-acceptance",
   "description": "Acceptance-criteria-driven goal completion for autonomous agents.",
-  "version": "0.2.3",
+  "version": "0.2.4",
   "configSchema": {
     "type": "object",
     "properties": {},

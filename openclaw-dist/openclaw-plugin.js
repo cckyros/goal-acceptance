@@ -6,796 +6,8 @@ var __export = (target, all) => {
 
 // src/plugin/openclaw-plugin.ts
 import { execSync } from "node:child_process";
-
-// src/plugin/engine/errors.ts
-var GoalAcceptanceError = class extends Error {
-  code;
-  hint;
-  constructor(message, code, hint) {
-    const fullMessage = hint ? `goal-acceptance: ${message} (Hint: ${hint})` : `goal-acceptance: ${message}`;
-    super(fullMessage);
-    this.code = code;
-    this.hint = hint;
-    this.name = "GoalAcceptanceError";
-  }
-};
-
-// src/plugin/engine/store.ts
-var InMemoryAcceptanceStore = class {
-  _events = [];
-  get events() {
-    return this._events;
-  }
-  append(event) {
-    this._events.push(event);
-  }
-};
-
-// src/plugin/engine/engine.ts
-function initialState() {
-  return {
-    criteria: /* @__PURE__ */ new Map(),
-    order: [],
-    locked: false,
-    observedCount: 0,
-    taskStatuses: /* @__PURE__ */ new Map(),
-    role: "agent",
-    taskPlan: /* @__PURE__ */ new Map(),
-    taskPlanOrder: [],
-    taskPlanLocked: false
-  };
-}
-function toCriterion(spec, now, defaults) {
-  return {
-    id: spec.id.trim(),
-    description: spec.description.trim(),
-    required: spec.required !== false,
-    method: typeof spec.method === "string" && spec.method.trim().length > 0 ? spec.method.trim() : "manual",
-    status: "pending",
-    updatedAt: now,
-    taskIds: Array.isArray(spec.taskIds) ? spec.taskIds.map((t) => t.trim()).filter((t) => t.length > 0) : [],
-    dependsOn: Array.isArray(spec.dependsOn) ? spec.dependsOn.map((d) => d.trim()).filter((d) => d.length > 0) : [],
-    ...defaults.addedAfterLock === true ? { addedAfterLock: true, addedAt: defaults.addedAt ?? now } : {}
-  };
-}
-function validateSpecs(specs, existingIds) {
-  const seenIds = /* @__PURE__ */ new Set();
-  for (const spec of specs) {
-    if (typeof spec.id !== "string" || spec.id.trim().length === 0) {
-      throw new GoalAcceptanceError("each criterion must have a non-empty id", "GOAL_ACCEPTANCE_INVALID_CRITERIA");
-    }
-    const id = spec.id.trim();
-    if (seenIds.has(id)) {
-      throw new GoalAcceptanceError(`duplicate criterion id "${id}"`, "GOAL_ACCEPTANCE_INVALID_CRITERIA");
-    }
-    if (existingIds.has(id)) {
-      throw new GoalAcceptanceError(`criterion id "${id}" already exists`, "GOAL_ACCEPTANCE_DUPLICATE_AMEND_ID");
-    }
-    seenIds.add(id);
-    if (typeof spec.description !== "string" || spec.description.trim().length === 0) {
-      throw new GoalAcceptanceError(`criterion "${id}" must have a non-empty description`, "GOAL_ACCEPTANCE_INVALID_CRITERIA");
-    }
-  }
-}
-function validateTaskPlan(specs) {
-  if (!Array.isArray(specs) || specs.length === 0) {
-    throw new GoalAcceptanceError("task plan must be a non-empty array", "GOAL_ACCEPTANCE_INVALID_TASK_PLAN");
-  }
-  const ids = /* @__PURE__ */ new Set();
-  const descriptions = /* @__PURE__ */ new Set();
-  for (const spec of specs) {
-    if (typeof spec.id !== "string" || spec.id.trim().length === 0) {
-      throw new GoalAcceptanceError("each task must have a non-empty id", "GOAL_ACCEPTANCE_INVALID_TASK_PLAN");
-    }
-    const id = spec.id.trim();
-    if (ids.has(id)) {
-      throw new GoalAcceptanceError(`duplicate task id "${id}"`, "GOAL_ACCEPTANCE_INVALID_TASK_PLAN");
-    }
-    ids.add(id);
-    if (typeof spec.description !== "string" || spec.description.trim().length === 0) {
-      throw new GoalAcceptanceError(`task "${id}" must have a non-empty description`, "GOAL_ACCEPTANCE_INVALID_TASK_PLAN");
-    }
-    const description = spec.description.trim();
-    if (descriptions.has(description)) {
-      throw new GoalAcceptanceError(`task "${id}" has an ambiguous description (duplicate of another task)`, "GOAL_ACCEPTANCE_INVALID_TASK_PLAN");
-    }
-    descriptions.add(description);
-    if (typeof spec.deliverable !== "string" || spec.deliverable.trim().length === 0) {
-      throw new GoalAcceptanceError(`task "${id}" must declare a deliverable`, "GOAL_ACCEPTANCE_INVALID_TASK_PLAN");
-    }
-  }
-  for (const spec of specs) {
-    const id = spec.id.trim();
-    for (const dep of spec.dependsOn ?? []) {
-      const depId = dep.trim();
-      if (depId.length === 0) {
-        throw new GoalAcceptanceError(`task "${id}" has an empty dependency id`, "GOAL_ACCEPTANCE_INVALID_TASK_PLAN");
-      }
-      if (depId === id) {
-        throw new GoalAcceptanceError(`task "${id}" cannot depend on itself`, "GOAL_ACCEPTANCE_INVALID_TASK_PLAN");
-      }
-      if (!ids.has(depId)) {
-        throw new GoalAcceptanceError(`task "${id}" depends on unknown task "${depId}"`, "GOAL_ACCEPTANCE_INVALID_TASK_PLAN");
-      }
-    }
-  }
-  const deps = /* @__PURE__ */ new Map();
-  for (const spec of specs) {
-    deps.set(spec.id.trim(), (spec.dependsOn ?? []).map((d) => d.trim()));
-  }
-  const visiting = /* @__PURE__ */ new Set();
-  const visited = /* @__PURE__ */ new Set();
-  const visit = (id) => {
-    if (visiting.has(id)) {
-      return [id];
-    }
-    if (visited.has(id)) {
-      return [];
-    }
-    visiting.add(id);
-    for (const dep of deps.get(id) ?? []) {
-      const cycle = visit(dep);
-      if (cycle.length > 0) {
-        return [id, ...cycle];
-      }
-    }
-    visiting.delete(id);
-    visited.add(id);
-    return [];
-  };
-  for (const id of ids) {
-    const cycle = visit(id);
-    if (cycle.length > 0) {
-      throw new GoalAcceptanceError(`dependency cycle detected: ${cycle.join(" -> ")}`, "GOAL_ACCEPTANCE_INVALID_TASK_PLAN");
-    }
-  }
-}
-function dependenciesMet(criterion, criteria) {
-  if (criterion.dependsOn.length === 0) return true;
-  return criterion.dependsOn.every((depId) => {
-    const dep = criteria.get(depId);
-    return dep !== void 0 && dep.status === "passed";
-  });
-}
-function computeTaskProgress(criterion, taskStatuses) {
-  let completed = 0;
-  let inProgress = 0;
-  let pending = 0;
-  let failed = 0;
-  for (const taskId of criterion.taskIds) {
-    const status = taskStatuses.get(taskId) ?? "pending";
-    switch (status) {
-      case "completed":
-        completed += 1;
-        break;
-      case "in_progress":
-        inProgress += 1;
-        break;
-      case "pending":
-        pending += 1;
-        break;
-      case "failed":
-        failed += 1;
-        break;
-    }
-  }
-  const total = criterion.taskIds.length;
-  return {
-    criterionId: criterion.id,
-    totalTasks: total,
-    completedTasks: completed,
-    inProgressTasks: inProgress,
-    pendingTasks: pending,
-    failedTasks: failed,
-    readyToValidate: total > 0 && completed === total
-  };
-}
-var GoalAcceptanceEngine = class {
-  state = initialState();
-  store;
-  constructor(store) {
-    this.store = store;
-  }
-  /** Set and lock the acceptance criteria. Returns the resolved criteria list. */
-  async setCriteria(specs, role = "agent") {
-    if (!Array.isArray(specs) || specs.length === 0) {
-      throw new GoalAcceptanceError("criteria list must be a non-empty array", "GOAL_ACCEPTANCE_INVALID_CRITERIA");
-    }
-    this.sync();
-    if (this.state.locked) {
-      throw new GoalAcceptanceError("acceptance criteria are already locked", "GOAL_ACCEPTANCE_ALREADY_LOCKED");
-    }
-    validateSpecs(specs, /* @__PURE__ */ new Set());
-    const now = Date.now();
-    const criteria = specs.map((spec) => toCriterion(spec, now, {}));
-    const event = {
-      type: "goal-acceptance/set",
-      criteria,
-      lockedAt: now,
-      role
-    };
-    await this.store.append(event);
-    this.applyEvent(event);
-    return this.getCriteria();
-  }
-  /** Append new criteria after the initial lock. Existing criteria are not modified. */
-  async amendCriteria(spec) {
-    this.sync();
-    if (!this.state.locked) {
-      throw new GoalAcceptanceError("cannot amend before criteria are locked", "GOAL_ACCEPTANCE_NOT_LOCKED");
-    }
-    if (typeof spec.reason !== "string" || spec.reason.trim().length === 0) {
-      throw new GoalAcceptanceError("amend reason is required", "GOAL_ACCEPTANCE_AMEND_REASON_REQUIRED");
-    }
-    if (!Array.isArray(spec.criteria) || spec.criteria.length === 0) {
-      throw new GoalAcceptanceError("amend criteria list must be a non-empty array", "GOAL_ACCEPTANCE_INVALID_CRITERIA");
-    }
-    const existingIds = new Set(this.state.order);
-    validateSpecs(spec.criteria, existingIds);
-    const now = Date.now();
-    const addedCriteria = spec.criteria.map((s) => toCriterion(s, now, { addedAfterLock: true, addedAt: now }));
-    const event = {
-      type: "goal-acceptance/amend",
-      addedCriteria,
-      reason: spec.reason.trim(),
-      amendedAt: now
-    };
-    await this.store.append(event);
-    this.applyEvent(event);
-    return addedCriteria;
-  }
-  /** Record verification status and evidence for one criterion. */
-  async validateCriterion(spec) {
-    this.sync();
-    const existing = this.state.criteria.get(spec.criterionId);
-    if (existing === void 0) {
-      const available = Array.from(this.state.criteria.keys());
-      const hint = available.length > 0 ? `Available criterion IDs: [${available.map((id) => `"${id}"`).join(", ")}]. Call get_acceptance_criteria to inspect full list.` : "No criteria have been set for this goal yet. Call set_acceptance_criteria or quick_start_goal first.";
-      throw new GoalAcceptanceError(`criterion "${spec.criterionId}" not found`, "GOAL_ACCEPTANCE_CRITERION_NOT_FOUND", hint);
-    }
-    const requiresEvidence = spec.status === "passed" || spec.status === "failed";
-    if (requiresEvidence && (typeof spec.evidence !== "string" || spec.evidence.trim().length === 0)) {
-      throw new GoalAcceptanceError(
-        `evidence is required when setting criterion to "${spec.status}"`,
-        "GOAL_ACCEPTANCE_EVIDENCE_REQUIRED",
-        "Provide command output, test run logs, or file verification content via evidence parameter, or use run_and_validate tool."
-      );
-    }
-    const evidenceType = spec.evidenceType ?? "text";
-    const selfClaimed = spec.status === "passed" && this.state.role === "agent";
-    const now = Date.now();
-    const event = {
-      type: "goal-acceptance/validate",
-      criterionId: spec.criterionId,
-      status: spec.status,
-      evidence: spec.evidence !== void 0 && spec.evidence.trim().length > 0 ? spec.evidence.trim() : void 0,
-      validatedAt: now,
-      evidenceType,
-      ...selfClaimed ? { selfClaimed: true } : {}
-    };
-    await this.store.append(event);
-    this.applyEvent(event);
-    const updated = this.state.criteria.get(spec.criterionId);
-    if (updated === void 0) throw new Error("sync failed");
-    return updated;
-  }
-  /**
-   * Reviewer confirmation of a self-claimed passed criterion.
-   * Converts selfClaimed=true to a formal pass. Requires independent
-   * high-confidence evidence (command/file/url); 'text' evidence is rejected.
-   */
-  async confirmCriterion(spec) {
-    this.sync();
-    const existing = this.state.criteria.get(spec.criterionId);
-    if (existing === void 0) {
-      throw new GoalAcceptanceError(`criterion "${spec.criterionId}" not found`, "GOAL_ACCEPTANCE_CRITERION_NOT_FOUND");
-    }
-    if (existing.status !== "passed" || existing.selfClaimed !== true) {
-      throw new GoalAcceptanceError(
-        `criterion "${spec.criterionId}" is not a self-claimed pass (status: ${existing.status}, selfClaimed: ${existing.selfClaimed === true}). Only self-claimed passed criteria can be confirmed.`,
-        "GOAL_ACCEPTANCE_NOT_SELF_CLAIMED"
-      );
-    }
-    if (typeof spec.evidence !== "string" || spec.evidence.trim().length === 0) {
-      throw new GoalAcceptanceError("independent re-verification evidence is required to confirm a criterion", "GOAL_ACCEPTANCE_EVIDENCE_REQUIRED");
-    }
-    if (spec.evidenceType === "text") {
-      throw new GoalAcceptanceError(
-        "confirmation requires high-confidence evidence (command, file, or url); text evidence is not accepted",
-        "GOAL_ACCEPTANCE_LOW_CONFIDENCE_EVIDENCE"
-      );
-    }
-    const now = Date.now();
-    const event = {
-      type: "goal-acceptance/validate",
-      criterionId: spec.criterionId,
-      status: "passed",
-      evidence: spec.evidence.trim(),
-      validatedAt: now,
-      evidenceType: spec.evidenceType
-    };
-    await this.store.append(event);
-    this.applyEvent(event);
-    const updated = this.state.criteria.get(spec.criterionId);
-    if (updated === void 0) throw new Error("sync failed");
-    return updated;
-  }
-  /** Update the status of a linked task. The host calls this when its task system changes. */
-  async updateTaskStatus(spec) {
-    this.sync();
-    const now = Date.now();
-    const event = {
-      type: "goal-acceptance/task-update",
-      taskId: spec.taskId,
-      taskStatus: spec.status,
-      updatedAt: now
-    };
-    await this.store.append(event);
-    this.applyEvent(event);
-  }
-  /** Set and lock the task decomposition plan. Requires criteria to be locked first. */
-  async setTaskPlan(specs) {
-    this.sync();
-    if (!this.state.locked) {
-      throw new GoalAcceptanceError("cannot set a task plan before criteria are locked", "GOAL_ACCEPTANCE_NOT_LOCKED");
-    }
-    if (this.state.taskPlanLocked) {
-      throw new GoalAcceptanceError("task plan is already set", "GOAL_ACCEPTANCE_TASK_PLAN_ALREADY_SET");
-    }
-    validateTaskPlan(specs);
-    const now = Date.now();
-    const tasks = specs.map((spec) => ({
-      id: spec.id.trim(),
-      description: spec.description.trim(),
-      deliverable: spec.deliverable.trim(),
-      dependsOn: (spec.dependsOn ?? []).map((d) => d.trim()).filter((d) => d.length > 0),
-      status: "pending",
-      updatedAt: now
-    }));
-    const event = {
-      type: "goal-acceptance/task-plan",
-      tasks,
-      plannedAt: now
-    };
-    await this.store.append(event);
-    this.applyEvent(event);
-    return this.getTaskPlan();
-  }
-  /** Get the task decomposition plan in declaration order. Empty array if no plan set. */
-  getTaskPlan() {
-    this.sync();
-    return this.state.taskPlanOrder.map((id) => ({
-      ...this.state.taskPlan.get(id),
-      status: this.state.taskStatuses.get(id) ?? this.state.taskPlan.get(id).status
-    }));
-  }
-  /** Get all criteria in declaration order. */
-  getCriteria() {
-    this.sync();
-    return this.state.order.map((id) => this.state.criteria.get(id));
-  }
-  /** Get a single criterion by id. */
-  getCriterion(id) {
-    this.sync();
-    return this.state.criteria.get(id);
-  }
-  /** Compute aggregate summary of criteria validation with task progress and actionable ordering. */
-  summarize() {
-    const list = this.getCriteria();
-    const passed = [];
-    const formalPassed = [];
-    const selfClaimedPassed = [];
-    const failures = [];
-    const blockers = [];
-    const pending = [];
-    const notRun = [];
-    let allRequiredPassed = true;
-    for (const c of list) {
-      switch (c.status) {
-        case "passed":
-          passed.push(c);
-          if (c.selfClaimed === true) {
-            selfClaimedPassed.push(c);
-            if (c.required) allRequiredPassed = false;
-          } else {
-            formalPassed.push(c);
-          }
-          break;
-        case "failed":
-          failures.push(c);
-          if (c.required) allRequiredPassed = false;
-          break;
-        case "blocked":
-          blockers.push(c);
-          if (c.required) allRequiredPassed = false;
-          break;
-        case "in_progress":
-        case "pending":
-          pending.push(c);
-          if (c.required) allRequiredPassed = false;
-          break;
-        case "not_run":
-          notRun.push(c);
-          if (c.required) allRequiredPassed = false;
-          break;
-      }
-    }
-    const criterionTaskProgress = [];
-    let totalTasks = 0;
-    let completedTasks = 0;
-    let inProgressTasks = 0;
-    let pendingTasks = 0;
-    let failedTasks = 0;
-    const planTasks = this.state.taskPlanOrder.map((id) => this.state.taskPlan.get(id));
-    if (planTasks.length > 0) {
-      for (const task of planTasks) {
-        const status = this.state.taskStatuses.get(task.id) ?? "pending";
-        switch (status) {
-          case "completed":
-            completedTasks += 1;
-            break;
-          case "in_progress":
-            inProgressTasks += 1;
-            break;
-          case "pending":
-            pendingTasks += 1;
-            break;
-          case "failed":
-            failedTasks += 1;
-            break;
-        }
-      }
-      totalTasks = planTasks.length;
-    } else {
-      for (const c of list) {
-        if (c.taskIds.length > 0) {
-          const progress = computeTaskProgress(c, this.state.taskStatuses);
-          criterionTaskProgress.push(progress);
-          totalTasks += progress.totalTasks;
-          completedTasks += progress.completedTasks;
-          inProgressTasks += progress.inProgressTasks;
-          pendingTasks += progress.pendingTasks;
-          failedTasks += progress.failedTasks;
-        }
-      }
-    }
-    const readyToValidate = list.filter((c) => c.taskIds.length > 0 && (c.status === "pending" || c.status === "in_progress")).filter((c) => computeTaskProgress(c, this.state.taskStatuses).readyToValidate).filter((c) => dependenciesMet(c, this.state.criteria)).sort((a, b) => topologicalCompare(a, b, this.state.criteria));
-    const nextActionable = list.filter((c) => c.required && (c.status === "pending" || c.status === "in_progress")).filter((c) => dependenciesMet(c, this.state.criteria)).sort((a, b) => topologicalCompare(a, b, this.state.criteria));
-    return {
-      allRequiredPassed: list.length > 0 ? allRequiredPassed : true,
-      totalCount: list.length,
-      passedCount: passed.length,
-      failedCount: failures.length,
-      blockedCount: blockers.length,
-      pendingCount: pending.length,
-      notRunCount: notRun.length,
-      selfClaimedCount: selfClaimedPassed.length,
-      passed,
-      formalPassed,
-      selfClaimedPassed,
-      failures,
-      blockers,
-      pending,
-      notRun,
-      taskProgress: {
-        totalTasks,
-        completedTasks,
-        inProgressTasks,
-        pendingTasks,
-        failedTasks
-      },
-      criterionTaskProgress,
-      readyToValidate,
-      nextActionable,
-      taskPlan: planTasks.map((task) => ({
-        ...task,
-        status: this.state.taskStatuses.get(task.id) ?? task.status
-      }))
-    };
-  }
-  /** Check whether this Goal is allowed to conclude with 'complete'. */
-  canComplete() {
-    this.sync();
-    if (!this.state.locked || this.state.criteria.size === 0) {
-      return { allowed: true };
-    }
-    const summary = this.summarize();
-    if (summary.allRequiredPassed) {
-      return { allowed: true };
-    }
-    const selfClaimedRequired = summary.selfClaimedPassed.filter((c) => c.required).length;
-    const unresolvedCount = summary.failedCount + summary.blockedCount + summary.pendingCount + summary.notRunCount;
-    if (selfClaimedRequired > 0 && unresolvedCount === 0) {
-      return {
-        allowed: false,
-        reason: `Cannot complete goal: ${selfClaimedRequired} required criterion are self-claimed by agent, awaiting reviewer confirmation`
-      };
-    }
-    return {
-      allowed: false,
-      reason: `Cannot complete goal: ${unresolvedCount} required acceptance criteria are not passed`
-    };
-  }
-  sync() {
-    const events = this.store.events.slice(this.state.observedCount);
-    for (const event of events) {
-      this.applyEvent(event);
-      this.state.observedCount += 1;
-    }
-  }
-  applyEvent(event) {
-    if (event.type === "goal-acceptance/set") {
-      const data = event;
-      this.state.criteria.clear();
-      this.state.order = [];
-      for (const criterion of data.criteria) {
-        this.state.criteria.set(criterion.id, criterion);
-        this.state.order.push(criterion.id);
-      }
-      this.state.locked = true;
-      this.state.role = data.role ?? "agent";
-    } else if (event.type === "goal-acceptance/validate") {
-      const data = event;
-      const existing = this.state.criteria.get(data.criterionId);
-      if (existing !== void 0) {
-        const evidenceType = data.evidenceType ?? "text";
-        this.state.criteria.set(data.criterionId, {
-          ...existing,
-          status: data.status,
-          ...data.evidence !== void 0 ? { evidence: data.evidence } : {},
-          updatedAt: data.validatedAt,
-          evidenceType,
-          lowConfidence: evidenceType === "text",
-          ...data.selfClaimed === true ? { selfClaimed: true } : {},
-          ...data.selfClaimed !== true ? { selfClaimed: false } : {}
-        });
-      }
-    } else if (event.type === "goal-acceptance/task-update") {
-      const data = event;
-      this.state.taskStatuses.set(data.taskId, data.taskStatus);
-    } else if (event.type === "goal-acceptance/amend") {
-      const data = event;
-      for (const criterion of data.addedCriteria) {
-        if (!this.state.criteria.has(criterion.id)) {
-          this.state.criteria.set(criterion.id, criterion);
-          this.state.order.push(criterion.id);
-        }
-      }
-    } else if (event.type === "goal-acceptance/task-plan") {
-      const data = event;
-      this.state.taskPlan.clear();
-      this.state.taskPlanOrder = [];
-      for (const task of data.tasks) {
-        this.state.taskPlan.set(task.id, task);
-        this.state.taskPlanOrder.push(task.id);
-      }
-      this.state.taskPlanLocked = true;
-      for (const task of data.tasks) {
-        if (!this.state.taskStatuses.has(task.id)) {
-          this.state.taskStatuses.set(task.id, "pending");
-        }
-      }
-    }
-  }
-};
-function topologicalCompare(a, b, criteria) {
-  if (dependsOnTransitive(b, a.id, criteria, /* @__PURE__ */ new Set())) return -1;
-  if (dependsOnTransitive(a, b.id, criteria, /* @__PURE__ */ new Set())) return 1;
-  return 0;
-}
-function dependsOnTransitive(criterion, targetId, criteria, visited) {
-  if (criterion.dependsOn.includes(targetId)) return true;
-  for (const depId of criterion.dependsOn) {
-    if (visited.has(depId)) continue;
-    visited.add(depId);
-    const dep = criteria.get(depId);
-    if (dep !== void 0 && dependsOnTransitive(dep, targetId, criteria, visited)) return true;
-  }
-  return false;
-}
-
-// src/plugin/goal-manager.ts
-import { randomUUID } from "node:crypto";
-import { existsSync, mkdirSync, readdirSync, readFileSync, unlinkSync, writeFileSync } from "node:fs";
-import { join } from "node:path";
-var FileAcceptanceStore = class {
-  path;
-  constructor(path) {
-    this.path = path;
-  }
-  async #read() {
-    if (!existsSync(this.path)) return [];
-    const raw = await readFileSync(this.path, "utf-8");
-    if (raw.trim().length === 0) return [];
-    return JSON.parse(raw);
-  }
-  async #write(events) {
-    await writeFileSync(this.path, JSON.stringify(events, null, 2) + "\n");
-  }
-  get events() {
-    if (!existsSync(this.path)) return [];
-    const raw = readFileSync(this.path, "utf-8");
-    if (raw.trim().length === 0) return [];
-    return JSON.parse(raw);
-  }
-  async append(event) {
-    const events = await this.#read();
-    events.push(event);
-    await this.#write(events);
-  }
-};
-var GoalManager = class {
-  dataDir;
-  goalsDir;
-  currentGoalId = null;
-  engineCache = /* @__PURE__ */ new Map();
-  metaCache = /* @__PURE__ */ new Map();
-  constructor(dataDir) {
-    this.dataDir = dataDir;
-    this.goalsDir = dataDir ? join(dataDir, "goals") : "";
-    if (dataDir) {
-      mkdirSync(this.goalsDir, { recursive: true });
-      this.loadCurrentGoal();
-    }
-  }
-  getCurrentGoalId() {
-    return this.currentGoalId;
-  }
-  /** Create a store for a specific goal (file-backed when persisted). */
-  storeForGoal(goalId) {
-    const dir = this.goalsDir;
-    if (dir) {
-      return new FileAcceptanceStore(join(dir, `${goalId}.json`));
-    }
-    return new InMemoryAcceptanceStore();
-  }
-  /** Get or create the engine for a specific goal ID. */
-  getOrCreateEngine(goalId) {
-    let engine = this.engineCache.get(goalId);
-    if (engine === void 0) {
-      engine = new GoalAcceptanceEngine(this.storeForGoal(goalId));
-      this.engineCache.set(goalId, engine);
-    }
-    return engine;
-  }
-  /** Get the engine for the active goal. Throws if no active goal. */
-  getEngine() {
-    if (this.currentGoalId === null) {
-      throw new GoalAcceptanceError(
-        "no active goal. Call start_goal to create one, or set_acceptance_criteria to auto-create one.",
-        "GOAL_ACCEPTANCE_NO_ACTIVE_GOAL"
-      );
-    }
-    return this.getOrCreateEngine(this.currentGoalId);
-  }
-  /** Ensure a goal is active; auto-create one if none exists. */
-  ensureGoal() {
-    if (this.currentGoalId === null) {
-      this.startGoal();
-    }
-    return this.getEngine();
-  }
-  /** Start a new goal. Generates a UUID, persists metadata, sets it as current. */
-  startGoal(title) {
-    const id = randomUUID();
-    const meta = { id, title: title ?? "", createdAt: Date.now() };
-    const dir = this.goalsDir;
-    if (dir) {
-      mkdirSync(dir, { recursive: true });
-      writeFileSync(join(dir, `${id}.meta.json`), JSON.stringify(meta, null, 2) + "\n");
-      writeFileSync(join(dir, `${id}.json`), "[]");
-    }
-    this.metaCache.set(id, meta);
-    this.currentGoalId = id;
-    this.persistCurrentGoal();
-    this.engineCache.set(id, new GoalAcceptanceEngine(this.storeForGoal(id)));
-    return meta;
-  }
-  /** Persist the current goal ID to disk for restart recovery. */
-  persistCurrentGoal() {
-    const d = this.dataDir;
-    if (d) {
-      writeFileSync(join(d, "current-goal.txt"), this.currentGoalId ?? "");
-    }
-  }
-  /** Load the current goal from disk on startup. */
-  loadCurrentGoal() {
-    const dir = this.goalsDir;
-    if (!dir) return;
-    const f = join(this.dataDir, "current-goal.txt");
-    if (existsSync(f)) {
-      const id = readFileSync(f, "utf-8").trim();
-      if (id.length > 0 && existsSync(join(dir, `${id}.meta.json`))) {
-        this.currentGoalId = id;
-        this.loadGoalMeta(id);
-      }
-    }
-  }
-  /** Load a goal's metadata from disk into the cache. */
-  loadGoalMeta(id) {
-    const cached = this.metaCache.get(id);
-    if (cached) return cached;
-    const dir = this.goalsDir;
-    if (!dir) return void 0;
-    const metaPath = join(dir, `${id}.meta.json`);
-    if (!existsSync(metaPath)) return void 0;
-    const meta = JSON.parse(readFileSync(metaPath, "utf-8"));
-    this.metaCache.set(id, meta);
-    return meta;
-  }
-  /** List all goals with status summaries. */
-  listGoals() {
-    const dir = this.goalsDir;
-    if (!dir) {
-      return Array.from(this.metaCache.values()).map((m) => {
-        const engine = this.engineCache.get(m.id);
-        const summary = engine ? engine.summarize() : { totalCount: 0, passedCount: 0, allRequiredPassed: true };
-        return {
-          ...m,
-          criteriaCount: summary.totalCount,
-          passedCount: summary.passedCount,
-          allRequiredPassed: summary.allRequiredPassed,
-          isActive: m.id === this.currentGoalId
-        };
-      }).sort((a, b) => b.createdAt - a.createdAt);
-    }
-    const files = readdirSync(dir).filter((f) => f.endsWith(".meta.json"));
-    return files.map((f) => {
-      const meta = JSON.parse(readFileSync(join(dir, f), "utf-8"));
-      this.metaCache.set(meta.id, meta);
-      const engine = this.getOrCreateEngine(meta.id);
-      const summary = engine.summarize();
-      return {
-        ...meta,
-        criteriaCount: summary.totalCount,
-        passedCount: summary.passedCount,
-        allRequiredPassed: summary.allRequiredPassed,
-        isActive: meta.id === this.currentGoalId
-      };
-    }).sort((a, b) => b.createdAt - a.createdAt);
-  }
-  /** Switch the active goal to an existing goal ID. */
-  switchGoal(id) {
-    const dir = this.goalsDir;
-    if (dir) {
-      if (!existsSync(join(dir, `${id}.meta.json`))) {
-        throw new GoalAcceptanceError(`goal ${id} not found`, "GOAL_ACCEPTANCE_NOT_FOUND");
-      }
-    } else {
-      if (!this.metaCache.has(id)) {
-        throw new GoalAcceptanceError(`goal ${id} not found`, "GOAL_ACCEPTANCE_NOT_FOUND");
-      }
-    }
-    this.currentGoalId = id;
-    this.persistCurrentGoal();
-    return this.loadGoalMeta(id) ?? { id, title: "", createdAt: 0 };
-  }
-  /** Reset (delete) the current goal's data and clear it as active. */
-  resetGoal() {
-    if (this.currentGoalId === null) {
-      throw new GoalAcceptanceError("no active goal to reset", "GOAL_ACCEPTANCE_NO_ACTIVE_GOAL");
-    }
-    const id = this.currentGoalId;
-    const dir = this.goalsDir;
-    if (dir) {
-      try {
-        unlinkSync(join(dir, `${id}.json`));
-      } catch {
-      }
-      try {
-        unlinkSync(join(dir, `${id}.meta.json`));
-      } catch {
-      }
-    }
-    this.engineCache.delete(id);
-    this.metaCache.delete(id);
-    this.currentGoalId = null;
-    this.persistCurrentGoal();
-  }
-};
-
-// src/plugin/openclaw-plugin.ts
 import { defineToolPlugin } from "openclaw/plugin-sdk/tool-plugin";
+import { jsonResult, textResult } from "openclaw/plugin-sdk/tool-results";
 
 // node_modules/.pnpm/typebox@1.3.17/node_modules/typebox/build/system/memory/memory.mjs
 var memory_exports = {};
@@ -5206,6 +4418,867 @@ __export(typebox_exports, {
   With: () => With2
 });
 
+// src/plugin/engine/errors.ts
+var GoalAcceptanceError = class extends Error {
+  code;
+  hint;
+  constructor(message, code, hint) {
+    const fullMessage = hint ? `goal-acceptance: ${message} (Hint: ${hint})` : `goal-acceptance: ${message}`;
+    super(fullMessage);
+    this.code = code;
+    this.hint = hint;
+    this.name = "GoalAcceptanceError";
+  }
+};
+
+// src/plugin/engine/store.ts
+var InMemoryAcceptanceStore = class {
+  _events = [];
+  get events() {
+    return this._events;
+  }
+  append(event) {
+    this._events.push(event);
+  }
+};
+
+// src/plugin/engine/engine.ts
+function initialState() {
+  return {
+    criteria: /* @__PURE__ */ new Map(),
+    order: [],
+    locked: false,
+    observedCount: 0,
+    taskStatuses: /* @__PURE__ */ new Map(),
+    role: "agent",
+    taskPlan: /* @__PURE__ */ new Map(),
+    taskPlanOrder: [],
+    taskPlanLocked: false
+  };
+}
+function toCriterion(spec, now, defaults) {
+  return {
+    id: spec.id.trim(),
+    description: spec.description.trim(),
+    required: spec.required !== false,
+    method: typeof spec.method === "string" && spec.method.trim().length > 0 ? spec.method.trim() : "manual",
+    status: "pending",
+    updatedAt: now,
+    taskIds: Array.isArray(spec.taskIds) ? spec.taskIds.map((t) => t.trim()).filter((t) => t.length > 0) : [],
+    dependsOn: Array.isArray(spec.dependsOn) ? spec.dependsOn.map((d) => d.trim()).filter((d) => d.length > 0) : [],
+    ...defaults.addedAfterLock === true ? { addedAfterLock: true, addedAt: defaults.addedAt ?? now } : {}
+  };
+}
+function validateSpecs(specs, existingIds) {
+  const seenIds = /* @__PURE__ */ new Set();
+  for (const spec of specs) {
+    if (typeof spec.id !== "string" || spec.id.trim().length === 0) {
+      throw new GoalAcceptanceError("each criterion must have a non-empty id", "GOAL_ACCEPTANCE_INVALID_CRITERIA");
+    }
+    const id = spec.id.trim();
+    if (seenIds.has(id)) {
+      throw new GoalAcceptanceError(`duplicate criterion id "${id}"`, "GOAL_ACCEPTANCE_INVALID_CRITERIA");
+    }
+    if (existingIds.has(id)) {
+      throw new GoalAcceptanceError(`criterion id "${id}" already exists`, "GOAL_ACCEPTANCE_DUPLICATE_AMEND_ID");
+    }
+    seenIds.add(id);
+    if (typeof spec.description !== "string" || spec.description.trim().length === 0) {
+      throw new GoalAcceptanceError(`criterion "${id}" must have a non-empty description`, "GOAL_ACCEPTANCE_INVALID_CRITERIA");
+    }
+  }
+}
+function validateTaskPlan(specs) {
+  if (!Array.isArray(specs) || specs.length === 0) {
+    throw new GoalAcceptanceError("task plan must be a non-empty array", "GOAL_ACCEPTANCE_INVALID_TASK_PLAN");
+  }
+  const ids = /* @__PURE__ */ new Set();
+  const descriptions = /* @__PURE__ */ new Set();
+  for (const spec of specs) {
+    if (typeof spec.id !== "string" || spec.id.trim().length === 0) {
+      throw new GoalAcceptanceError("each task must have a non-empty id", "GOAL_ACCEPTANCE_INVALID_TASK_PLAN");
+    }
+    const id = spec.id.trim();
+    if (ids.has(id)) {
+      throw new GoalAcceptanceError(`duplicate task id "${id}"`, "GOAL_ACCEPTANCE_INVALID_TASK_PLAN");
+    }
+    ids.add(id);
+    if (typeof spec.description !== "string" || spec.description.trim().length === 0) {
+      throw new GoalAcceptanceError(`task "${id}" must have a non-empty description`, "GOAL_ACCEPTANCE_INVALID_TASK_PLAN");
+    }
+    const description = spec.description.trim();
+    if (descriptions.has(description)) {
+      throw new GoalAcceptanceError(`task "${id}" has an ambiguous description (duplicate of another task)`, "GOAL_ACCEPTANCE_INVALID_TASK_PLAN");
+    }
+    descriptions.add(description);
+    if (typeof spec.deliverable !== "string" || spec.deliverable.trim().length === 0) {
+      throw new GoalAcceptanceError(`task "${id}" must declare a deliverable`, "GOAL_ACCEPTANCE_INVALID_TASK_PLAN");
+    }
+  }
+  for (const spec of specs) {
+    const id = spec.id.trim();
+    for (const dep of spec.dependsOn ?? []) {
+      const depId = dep.trim();
+      if (depId.length === 0) {
+        throw new GoalAcceptanceError(`task "${id}" has an empty dependency id`, "GOAL_ACCEPTANCE_INVALID_TASK_PLAN");
+      }
+      if (depId === id) {
+        throw new GoalAcceptanceError(`task "${id}" cannot depend on itself`, "GOAL_ACCEPTANCE_INVALID_TASK_PLAN");
+      }
+      if (!ids.has(depId)) {
+        throw new GoalAcceptanceError(`task "${id}" depends on unknown task "${depId}"`, "GOAL_ACCEPTANCE_INVALID_TASK_PLAN");
+      }
+    }
+  }
+  const deps = /* @__PURE__ */ new Map();
+  for (const spec of specs) {
+    deps.set(spec.id.trim(), (spec.dependsOn ?? []).map((d) => d.trim()));
+  }
+  const visiting = /* @__PURE__ */ new Set();
+  const visited = /* @__PURE__ */ new Set();
+  const visit = (id) => {
+    if (visiting.has(id)) {
+      return [id];
+    }
+    if (visited.has(id)) {
+      return [];
+    }
+    visiting.add(id);
+    for (const dep of deps.get(id) ?? []) {
+      const cycle = visit(dep);
+      if (cycle.length > 0) {
+        return [id, ...cycle];
+      }
+    }
+    visiting.delete(id);
+    visited.add(id);
+    return [];
+  };
+  for (const id of ids) {
+    const cycle = visit(id);
+    if (cycle.length > 0) {
+      throw new GoalAcceptanceError(`dependency cycle detected: ${cycle.join(" -> ")}`, "GOAL_ACCEPTANCE_INVALID_TASK_PLAN");
+    }
+  }
+}
+function dependenciesMet(criterion, criteria) {
+  if (criterion.dependsOn.length === 0) return true;
+  return criterion.dependsOn.every((depId) => {
+    const dep = criteria.get(depId);
+    return dep !== void 0 && dep.status === "passed";
+  });
+}
+function computeTaskProgress(criterion, taskStatuses) {
+  let completed = 0;
+  let inProgress = 0;
+  let pending = 0;
+  let failed = 0;
+  for (const taskId of criterion.taskIds) {
+    const status = taskStatuses.get(taskId) ?? "pending";
+    switch (status) {
+      case "completed":
+        completed += 1;
+        break;
+      case "in_progress":
+        inProgress += 1;
+        break;
+      case "pending":
+        pending += 1;
+        break;
+      case "failed":
+        failed += 1;
+        break;
+    }
+  }
+  const total = criterion.taskIds.length;
+  return {
+    criterionId: criterion.id,
+    totalTasks: total,
+    completedTasks: completed,
+    inProgressTasks: inProgress,
+    pendingTasks: pending,
+    failedTasks: failed,
+    readyToValidate: total > 0 && completed === total
+  };
+}
+var GoalAcceptanceEngine = class {
+  state = initialState();
+  store;
+  constructor(store) {
+    this.store = store;
+  }
+  /** Set and lock the acceptance criteria. Returns the resolved criteria list. */
+  async setCriteria(specs, role = "agent") {
+    if (!Array.isArray(specs) || specs.length === 0) {
+      throw new GoalAcceptanceError("criteria list must be a non-empty array", "GOAL_ACCEPTANCE_INVALID_CRITERIA");
+    }
+    this.sync();
+    if (this.state.locked) {
+      throw new GoalAcceptanceError("acceptance criteria are already locked", "GOAL_ACCEPTANCE_ALREADY_LOCKED");
+    }
+    validateSpecs(specs, /* @__PURE__ */ new Set());
+    const now = Date.now();
+    const criteria = specs.map((spec) => toCriterion(spec, now, {}));
+    const event = {
+      type: "goal-acceptance/set",
+      criteria,
+      lockedAt: now,
+      role
+    };
+    await this.store.append(event);
+    this.applyEvent(event);
+    return this.getCriteria();
+  }
+  /** Append new criteria after the initial lock. Existing criteria are not modified. */
+  async amendCriteria(spec) {
+    this.sync();
+    if (!this.state.locked) {
+      throw new GoalAcceptanceError("cannot amend before criteria are locked", "GOAL_ACCEPTANCE_NOT_LOCKED");
+    }
+    if (typeof spec.reason !== "string" || spec.reason.trim().length === 0) {
+      throw new GoalAcceptanceError("amend reason is required", "GOAL_ACCEPTANCE_AMEND_REASON_REQUIRED");
+    }
+    if (!Array.isArray(spec.criteria) || spec.criteria.length === 0) {
+      throw new GoalAcceptanceError("amend criteria list must be a non-empty array", "GOAL_ACCEPTANCE_INVALID_CRITERIA");
+    }
+    const existingIds = new Set(this.state.order);
+    validateSpecs(spec.criteria, existingIds);
+    const now = Date.now();
+    const addedCriteria = spec.criteria.map((s) => toCriterion(s, now, { addedAfterLock: true, addedAt: now }));
+    const event = {
+      type: "goal-acceptance/amend",
+      addedCriteria,
+      reason: spec.reason.trim(),
+      amendedAt: now
+    };
+    await this.store.append(event);
+    this.applyEvent(event);
+    return addedCriteria;
+  }
+  /** Record verification status and evidence for one criterion. */
+  async validateCriterion(spec) {
+    this.sync();
+    const existing = this.state.criteria.get(spec.criterionId);
+    if (existing === void 0) {
+      const available = Array.from(this.state.criteria.keys());
+      const hint = available.length > 0 ? `Available criterion IDs: [${available.map((id) => `"${id}"`).join(", ")}]. Call get_acceptance_criteria to inspect full list.` : "No criteria have been set for this goal yet. Call set_acceptance_criteria or quick_start_goal first.";
+      throw new GoalAcceptanceError(`criterion "${spec.criterionId}" not found`, "GOAL_ACCEPTANCE_CRITERION_NOT_FOUND", hint);
+    }
+    const requiresEvidence = spec.status === "passed" || spec.status === "failed";
+    if (requiresEvidence && (typeof spec.evidence !== "string" || spec.evidence.trim().length === 0)) {
+      throw new GoalAcceptanceError(
+        `evidence is required when setting criterion to "${spec.status}"`,
+        "GOAL_ACCEPTANCE_EVIDENCE_REQUIRED",
+        "Provide command output, test run logs, or file verification content via evidence parameter, or use run_and_validate tool."
+      );
+    }
+    const evidenceType = spec.evidenceType ?? "text";
+    const selfClaimed = spec.status === "passed" && this.state.role === "agent";
+    const now = Date.now();
+    const event = {
+      type: "goal-acceptance/validate",
+      criterionId: spec.criterionId,
+      status: spec.status,
+      evidence: spec.evidence !== void 0 && spec.evidence.trim().length > 0 ? spec.evidence.trim() : void 0,
+      validatedAt: now,
+      evidenceType,
+      ...selfClaimed ? { selfClaimed: true } : {}
+    };
+    await this.store.append(event);
+    this.applyEvent(event);
+    const updated = this.state.criteria.get(spec.criterionId);
+    if (updated === void 0) throw new Error("sync failed");
+    return updated;
+  }
+  /**
+   * Reviewer confirmation of a self-claimed passed criterion.
+   * Converts selfClaimed=true to a formal pass. Requires independent
+   * high-confidence evidence (command/file/url); 'text' evidence is rejected.
+   */
+  async confirmCriterion(spec) {
+    this.sync();
+    const existing = this.state.criteria.get(spec.criterionId);
+    if (existing === void 0) {
+      throw new GoalAcceptanceError(`criterion "${spec.criterionId}" not found`, "GOAL_ACCEPTANCE_CRITERION_NOT_FOUND");
+    }
+    if (existing.status !== "passed" || existing.selfClaimed !== true) {
+      throw new GoalAcceptanceError(
+        `criterion "${spec.criterionId}" is not a self-claimed pass (status: ${existing.status}, selfClaimed: ${existing.selfClaimed === true}). Only self-claimed passed criteria can be confirmed.`,
+        "GOAL_ACCEPTANCE_NOT_SELF_CLAIMED"
+      );
+    }
+    if (typeof spec.evidence !== "string" || spec.evidence.trim().length === 0) {
+      throw new GoalAcceptanceError("independent re-verification evidence is required to confirm a criterion", "GOAL_ACCEPTANCE_EVIDENCE_REQUIRED");
+    }
+    if (spec.evidenceType === "text") {
+      throw new GoalAcceptanceError(
+        "confirmation requires high-confidence evidence (command, file, or url); text evidence is not accepted",
+        "GOAL_ACCEPTANCE_LOW_CONFIDENCE_EVIDENCE"
+      );
+    }
+    const now = Date.now();
+    const event = {
+      type: "goal-acceptance/validate",
+      criterionId: spec.criterionId,
+      status: "passed",
+      evidence: spec.evidence.trim(),
+      validatedAt: now,
+      evidenceType: spec.evidenceType
+    };
+    await this.store.append(event);
+    this.applyEvent(event);
+    const updated = this.state.criteria.get(spec.criterionId);
+    if (updated === void 0) throw new Error("sync failed");
+    return updated;
+  }
+  /** Update the status of a linked task. The host calls this when its task system changes. */
+  async updateTaskStatus(spec) {
+    this.sync();
+    const now = Date.now();
+    const event = {
+      type: "goal-acceptance/task-update",
+      taskId: spec.taskId,
+      taskStatus: spec.status,
+      updatedAt: now
+    };
+    await this.store.append(event);
+    this.applyEvent(event);
+  }
+  /** Set and lock the task decomposition plan. Requires criteria to be locked first. */
+  async setTaskPlan(specs) {
+    this.sync();
+    if (!this.state.locked) {
+      throw new GoalAcceptanceError("cannot set a task plan before criteria are locked", "GOAL_ACCEPTANCE_NOT_LOCKED");
+    }
+    if (this.state.taskPlanLocked) {
+      throw new GoalAcceptanceError("task plan is already set", "GOAL_ACCEPTANCE_TASK_PLAN_ALREADY_SET");
+    }
+    validateTaskPlan(specs);
+    const now = Date.now();
+    const tasks = specs.map((spec) => ({
+      id: spec.id.trim(),
+      description: spec.description.trim(),
+      deliverable: spec.deliverable.trim(),
+      dependsOn: (spec.dependsOn ?? []).map((d) => d.trim()).filter((d) => d.length > 0),
+      status: "pending",
+      updatedAt: now
+    }));
+    const event = {
+      type: "goal-acceptance/task-plan",
+      tasks,
+      plannedAt: now
+    };
+    await this.store.append(event);
+    this.applyEvent(event);
+    return this.getTaskPlan();
+  }
+  /** Get the task decomposition plan in declaration order. Empty array if no plan set. */
+  getTaskPlan() {
+    this.sync();
+    return this.state.taskPlanOrder.map((id) => ({
+      ...this.state.taskPlan.get(id),
+      status: this.state.taskStatuses.get(id) ?? this.state.taskPlan.get(id).status
+    }));
+  }
+  /** Get all criteria in declaration order. */
+  getCriteria() {
+    this.sync();
+    return this.state.order.map((id) => this.state.criteria.get(id));
+  }
+  /** Get a single criterion by id. */
+  getCriterion(id) {
+    this.sync();
+    return this.state.criteria.get(id);
+  }
+  /** Compute aggregate summary of criteria validation with task progress and actionable ordering. */
+  summarize() {
+    const list = this.getCriteria();
+    const passed = [];
+    const formalPassed = [];
+    const selfClaimedPassed = [];
+    const failures = [];
+    const blockers = [];
+    const pending = [];
+    const notRun = [];
+    let allRequiredPassed = true;
+    for (const c of list) {
+      switch (c.status) {
+        case "passed":
+          passed.push(c);
+          if (c.selfClaimed === true) {
+            selfClaimedPassed.push(c);
+            if (c.required) allRequiredPassed = false;
+          } else {
+            formalPassed.push(c);
+          }
+          break;
+        case "failed":
+          failures.push(c);
+          if (c.required) allRequiredPassed = false;
+          break;
+        case "blocked":
+          blockers.push(c);
+          if (c.required) allRequiredPassed = false;
+          break;
+        case "in_progress":
+        case "pending":
+          pending.push(c);
+          if (c.required) allRequiredPassed = false;
+          break;
+        case "not_run":
+          notRun.push(c);
+          if (c.required) allRequiredPassed = false;
+          break;
+      }
+    }
+    const criterionTaskProgress = [];
+    let totalTasks = 0;
+    let completedTasks = 0;
+    let inProgressTasks = 0;
+    let pendingTasks = 0;
+    let failedTasks = 0;
+    const planTasks = this.state.taskPlanOrder.map((id) => this.state.taskPlan.get(id));
+    if (planTasks.length > 0) {
+      for (const task of planTasks) {
+        const status = this.state.taskStatuses.get(task.id) ?? "pending";
+        switch (status) {
+          case "completed":
+            completedTasks += 1;
+            break;
+          case "in_progress":
+            inProgressTasks += 1;
+            break;
+          case "pending":
+            pendingTasks += 1;
+            break;
+          case "failed":
+            failedTasks += 1;
+            break;
+        }
+      }
+      totalTasks = planTasks.length;
+    } else {
+      for (const c of list) {
+        if (c.taskIds.length > 0) {
+          const progress = computeTaskProgress(c, this.state.taskStatuses);
+          criterionTaskProgress.push(progress);
+          totalTasks += progress.totalTasks;
+          completedTasks += progress.completedTasks;
+          inProgressTasks += progress.inProgressTasks;
+          pendingTasks += progress.pendingTasks;
+          failedTasks += progress.failedTasks;
+        }
+      }
+    }
+    const readyToValidate = list.filter((c) => c.taskIds.length > 0 && (c.status === "pending" || c.status === "in_progress")).filter((c) => computeTaskProgress(c, this.state.taskStatuses).readyToValidate).filter((c) => dependenciesMet(c, this.state.criteria)).sort((a, b) => topologicalCompare(a, b, this.state.criteria));
+    const nextActionable = list.filter((c) => c.required && (c.status === "pending" || c.status === "in_progress")).filter((c) => dependenciesMet(c, this.state.criteria)).sort((a, b) => topologicalCompare(a, b, this.state.criteria));
+    return {
+      allRequiredPassed: list.length > 0 ? allRequiredPassed : true,
+      totalCount: list.length,
+      passedCount: passed.length,
+      failedCount: failures.length,
+      blockedCount: blockers.length,
+      pendingCount: pending.length,
+      notRunCount: notRun.length,
+      selfClaimedCount: selfClaimedPassed.length,
+      passed,
+      formalPassed,
+      selfClaimedPassed,
+      failures,
+      blockers,
+      pending,
+      notRun,
+      taskProgress: {
+        totalTasks,
+        completedTasks,
+        inProgressTasks,
+        pendingTasks,
+        failedTasks
+      },
+      criterionTaskProgress,
+      readyToValidate,
+      nextActionable,
+      taskPlan: planTasks.map((task) => ({
+        ...task,
+        status: this.state.taskStatuses.get(task.id) ?? task.status
+      }))
+    };
+  }
+  /** Check whether this Goal is allowed to conclude with 'complete'. */
+  canComplete() {
+    this.sync();
+    if (!this.state.locked || this.state.criteria.size === 0) {
+      return { allowed: true };
+    }
+    const summary = this.summarize();
+    if (summary.allRequiredPassed) {
+      return { allowed: true };
+    }
+    const selfClaimedRequired = summary.selfClaimedPassed.filter((c) => c.required).length;
+    const unresolvedCount = summary.failedCount + summary.blockedCount + summary.pendingCount + summary.notRunCount;
+    if (selfClaimedRequired > 0 && unresolvedCount === 0) {
+      return {
+        allowed: false,
+        reason: `Cannot complete goal: ${selfClaimedRequired} required criterion are self-claimed by agent, awaiting reviewer confirmation`
+      };
+    }
+    return {
+      allowed: false,
+      reason: `Cannot complete goal: ${unresolvedCount} required acceptance criteria are not passed`
+    };
+  }
+  sync() {
+    const events = this.store.events.slice(this.state.observedCount);
+    for (const event of events) {
+      this.applyEvent(event);
+      this.state.observedCount += 1;
+    }
+  }
+  applyEvent(event) {
+    if (event.type === "goal-acceptance/set") {
+      const data = event;
+      this.state.criteria.clear();
+      this.state.order = [];
+      for (const criterion of data.criteria) {
+        this.state.criteria.set(criterion.id, criterion);
+        this.state.order.push(criterion.id);
+      }
+      this.state.locked = true;
+      this.state.role = data.role ?? "agent";
+    } else if (event.type === "goal-acceptance/validate") {
+      const data = event;
+      const existing = this.state.criteria.get(data.criterionId);
+      if (existing !== void 0) {
+        const evidenceType = data.evidenceType ?? "text";
+        this.state.criteria.set(data.criterionId, {
+          ...existing,
+          status: data.status,
+          ...data.evidence !== void 0 ? { evidence: data.evidence } : {},
+          updatedAt: data.validatedAt,
+          evidenceType,
+          lowConfidence: evidenceType === "text",
+          ...data.selfClaimed === true ? { selfClaimed: true } : {},
+          ...data.selfClaimed !== true ? { selfClaimed: false } : {}
+        });
+      }
+    } else if (event.type === "goal-acceptance/task-update") {
+      const data = event;
+      this.state.taskStatuses.set(data.taskId, data.taskStatus);
+    } else if (event.type === "goal-acceptance/amend") {
+      const data = event;
+      for (const criterion of data.addedCriteria) {
+        if (!this.state.criteria.has(criterion.id)) {
+          this.state.criteria.set(criterion.id, criterion);
+          this.state.order.push(criterion.id);
+        }
+      }
+    } else if (event.type === "goal-acceptance/task-plan") {
+      const data = event;
+      this.state.taskPlan.clear();
+      this.state.taskPlanOrder = [];
+      for (const task of data.tasks) {
+        this.state.taskPlan.set(task.id, task);
+        this.state.taskPlanOrder.push(task.id);
+      }
+      this.state.taskPlanLocked = true;
+      for (const task of data.tasks) {
+        if (!this.state.taskStatuses.has(task.id)) {
+          this.state.taskStatuses.set(task.id, "pending");
+        }
+      }
+    }
+  }
+};
+function topologicalCompare(a, b, criteria) {
+  if (dependsOnTransitive(b, a.id, criteria, /* @__PURE__ */ new Set())) return -1;
+  if (dependsOnTransitive(a, b.id, criteria, /* @__PURE__ */ new Set())) return 1;
+  return 0;
+}
+function dependsOnTransitive(criterion, targetId, criteria, visited) {
+  if (criterion.dependsOn.includes(targetId)) return true;
+  for (const depId of criterion.dependsOn) {
+    if (visited.has(depId)) continue;
+    visited.add(depId);
+    const dep = criteria.get(depId);
+    if (dep !== void 0 && dependsOnTransitive(dep, targetId, criteria, visited)) return true;
+  }
+  return false;
+}
+
+// src/plugin/goal-manager.ts
+import { randomUUID } from "node:crypto";
+import { existsSync, mkdirSync, readdirSync, readFileSync, unlinkSync, writeFileSync } from "node:fs";
+import { join } from "node:path";
+var FileAcceptanceStore = class {
+  path;
+  constructor(path) {
+    this.path = path;
+  }
+  async #read() {
+    if (!existsSync(this.path)) return [];
+    const raw = await readFileSync(this.path, "utf-8");
+    if (raw.trim().length === 0) return [];
+    return JSON.parse(raw);
+  }
+  async #write(events) {
+    await writeFileSync(this.path, JSON.stringify(events, null, 2) + "\n");
+  }
+  get events() {
+    if (!existsSync(this.path)) return [];
+    const raw = readFileSync(this.path, "utf-8");
+    if (raw.trim().length === 0) return [];
+    return JSON.parse(raw);
+  }
+  async append(event) {
+    const events = await this.#read();
+    events.push(event);
+    await this.#write(events);
+  }
+};
+var GoalManager = class {
+  dataDir;
+  goalsDir;
+  currentGoalId = null;
+  engineCache = /* @__PURE__ */ new Map();
+  metaCache = /* @__PURE__ */ new Map();
+  constructor(dataDir) {
+    this.dataDir = dataDir;
+    this.goalsDir = dataDir ? join(dataDir, "goals") : "";
+    if (dataDir) {
+      mkdirSync(this.goalsDir, { recursive: true });
+      this.loadCurrentGoal();
+    }
+  }
+  getCurrentGoalId() {
+    return this.currentGoalId;
+  }
+  /** Create a store for a specific goal (file-backed when persisted). */
+  storeForGoal(goalId) {
+    const dir = this.goalsDir;
+    if (dir) {
+      return new FileAcceptanceStore(join(dir, `${goalId}.json`));
+    }
+    return new InMemoryAcceptanceStore();
+  }
+  /** Get or create the engine for a specific goal ID. */
+  getOrCreateEngine(goalId) {
+    let engine = this.engineCache.get(goalId);
+    if (engine === void 0) {
+      engine = new GoalAcceptanceEngine(this.storeForGoal(goalId));
+      this.engineCache.set(goalId, engine);
+    }
+    return engine;
+  }
+  /** Get the engine for the active goal. Throws if no active goal. */
+  getEngine() {
+    if (this.currentGoalId === null) {
+      throw new GoalAcceptanceError(
+        "no active goal. Call start_goal to create one, or set_acceptance_criteria to auto-create one.",
+        "GOAL_ACCEPTANCE_NO_ACTIVE_GOAL"
+      );
+    }
+    return this.getOrCreateEngine(this.currentGoalId);
+  }
+  /** Ensure a goal is active; auto-create one if none exists. */
+  ensureGoal() {
+    if (this.currentGoalId === null) {
+      this.startGoal();
+    }
+    return this.getEngine();
+  }
+  /** Start a new goal. Generates a UUID, persists metadata, sets it as current. */
+  startGoal(title) {
+    const id = randomUUID();
+    const meta = { id, title: title ?? "", createdAt: Date.now() };
+    const dir = this.goalsDir;
+    if (dir) {
+      mkdirSync(dir, { recursive: true });
+      writeFileSync(join(dir, `${id}.meta.json`), JSON.stringify(meta, null, 2) + "\n");
+      writeFileSync(join(dir, `${id}.json`), "[]");
+    }
+    this.metaCache.set(id, meta);
+    this.currentGoalId = id;
+    this.persistCurrentGoal();
+    this.engineCache.set(id, new GoalAcceptanceEngine(this.storeForGoal(id)));
+    return meta;
+  }
+  /** Persist the current goal ID to disk for restart recovery. */
+  persistCurrentGoal() {
+    const d = this.dataDir;
+    if (d) {
+      writeFileSync(join(d, "current-goal.txt"), this.currentGoalId ?? "");
+    }
+  }
+  /** Load the current goal from disk on startup. */
+  loadCurrentGoal() {
+    const dir = this.goalsDir;
+    if (!dir) return;
+    const f = join(this.dataDir, "current-goal.txt");
+    if (existsSync(f)) {
+      const id = readFileSync(f, "utf-8").trim();
+      if (id.length > 0 && existsSync(join(dir, `${id}.meta.json`))) {
+        this.currentGoalId = id;
+        this.loadGoalMeta(id);
+      }
+    }
+  }
+  /** Load a goal's metadata from disk into the cache. */
+  loadGoalMeta(id) {
+    const cached = this.metaCache.get(id);
+    if (cached) return cached;
+    const dir = this.goalsDir;
+    if (!dir) return void 0;
+    const metaPath = join(dir, `${id}.meta.json`);
+    if (!existsSync(metaPath)) return void 0;
+    const meta = JSON.parse(readFileSync(metaPath, "utf-8"));
+    this.metaCache.set(id, meta);
+    return meta;
+  }
+  /** Return the active goal's metadata, or undefined when none is active. */
+  getCurrentGoalMeta() {
+    if (this.currentGoalId === null) return void 0;
+    return this.loadGoalMeta(this.currentGoalId);
+  }
+  /** List all goals with status summaries. */
+  listGoals() {
+    const dir = this.goalsDir;
+    if (!dir) {
+      return Array.from(this.metaCache.values()).map((m) => {
+        const engine = this.engineCache.get(m.id);
+        const summary = engine ? engine.summarize() : { totalCount: 0, passedCount: 0, allRequiredPassed: true };
+        return {
+          ...m,
+          criteriaCount: summary.totalCount,
+          passedCount: summary.passedCount,
+          allRequiredPassed: summary.allRequiredPassed,
+          isActive: m.id === this.currentGoalId
+        };
+      }).sort((a, b) => b.createdAt - a.createdAt);
+    }
+    const files = readdirSync(dir).filter((f) => f.endsWith(".meta.json"));
+    return files.map((f) => {
+      const meta = JSON.parse(readFileSync(join(dir, f), "utf-8"));
+      this.metaCache.set(meta.id, meta);
+      const engine = this.getOrCreateEngine(meta.id);
+      const summary = engine.summarize();
+      return {
+        ...meta,
+        criteriaCount: summary.totalCount,
+        passedCount: summary.passedCount,
+        allRequiredPassed: summary.allRequiredPassed,
+        isActive: meta.id === this.currentGoalId
+      };
+    }).sort((a, b) => b.createdAt - a.createdAt);
+  }
+  /** Switch the active goal to an existing goal ID. */
+  switchGoal(id) {
+    const dir = this.goalsDir;
+    if (dir) {
+      if (!existsSync(join(dir, `${id}.meta.json`))) {
+        throw new GoalAcceptanceError(`goal ${id} not found`, "GOAL_ACCEPTANCE_NOT_FOUND");
+      }
+    } else {
+      if (!this.metaCache.has(id)) {
+        throw new GoalAcceptanceError(`goal ${id} not found`, "GOAL_ACCEPTANCE_NOT_FOUND");
+      }
+    }
+    this.currentGoalId = id;
+    this.persistCurrentGoal();
+    return this.loadGoalMeta(id) ?? { id, title: "", createdAt: 0 };
+  }
+  /** Reset (delete) the current goal's data and clear it as active. */
+  resetGoal() {
+    if (this.currentGoalId === null) {
+      throw new GoalAcceptanceError("no active goal to reset", "GOAL_ACCEPTANCE_NO_ACTIVE_GOAL");
+    }
+    const id = this.currentGoalId;
+    const dir = this.goalsDir;
+    if (dir) {
+      try {
+        unlinkSync(join(dir, `${id}.json`));
+      } catch {
+      }
+      try {
+        unlinkSync(join(dir, `${id}.meta.json`));
+      } catch {
+      }
+    }
+    this.engineCache.delete(id);
+    this.metaCache.delete(id);
+    this.currentGoalId = null;
+    this.persistCurrentGoal();
+  }
+};
+
+// src/plugin/openclaw-session-sync.ts
+function hasSession(ctx) {
+  const { sessionKey, agentId } = ctx.toolContext;
+  if (!sessionKey || !agentId) return void 0;
+  return { sessionKey, agentId };
+}
+function buildGoal(manager2, now) {
+  const id = manager2.getCurrentGoalId();
+  if (id === null) return void 0;
+  const meta = manager2.getCurrentGoalMeta() ?? { id, title: "", createdAt: now };
+  const summary = manager2.getEngine().summarize();
+  const status = summary.totalCount > 0 && summary.allRequiredPassed ? "complete" : "active";
+  return {
+    schemaVersion: 1,
+    id: meta.id,
+    objective: meta.title,
+    status,
+    createdAt: meta.createdAt,
+    updatedAt: now,
+    tokenStart: 0,
+    tokenStartFresh: true,
+    tokensUsed: 0,
+    continuationTurns: 0
+  };
+}
+function preserveStatus(existingStatus, newStatus, existingId, newId) {
+  if (existingId === newId && existingStatus === "blocked" && newStatus !== "complete") return "blocked";
+  return newStatus;
+}
+async function syncSessionGoal(ctx) {
+  const scope = hasSession(ctx);
+  if (!scope) return;
+  const { api, manager: manager2 } = ctx;
+  const now = Date.now();
+  const goal = buildGoal(manager2, now);
+  if (!goal) {
+    await clearSessionGoal(ctx);
+    return;
+  }
+  try {
+    const sessionStore = api.runtime?.agent?.session;
+    if (!sessionStore) return;
+    const existing = sessionStore.getSessionEntry(scope);
+    const existingGoal = existing?.goal;
+    goal.status = preserveStatus(existingGoal?.status, goal.status, existingGoal?.id, goal.id);
+    await sessionStore.patchSessionEntry({
+      ...scope,
+      update: () => ({ goal })
+    });
+  } catch (e) {
+    api.logger?.warn?.(`goal-acceptance session sync failed: ${e instanceof Error ? e.message : String(e)}`);
+  }
+}
+async function clearSessionGoal(ctx) {
+  const scope = hasSession(ctx);
+  if (!scope) return;
+  const { api } = ctx;
+  try {
+    const sessionStore = api.runtime?.agent?.session;
+    if (!sessionStore) return;
+    await sessionStore.patchSessionEntry({
+      ...scope,
+      update: () => ({ goal: void 0 })
+    });
+  } catch (e) {
+    api.logger?.warn?.(`goal-acceptance session clear failed: ${e instanceof Error ? e.message : String(e)}`);
+  }
+}
+
 // src/plugin/openclaw-plugin.ts
 var manager = null;
 function getManager(cfg) {
@@ -5233,6 +5306,12 @@ var TaskPlanItem = typebox_exports.Object({
   deliverable: typebox_exports.String({ description: "Concrete artifact that proves this task is done." }),
   depends_on: typebox_exports.Optional(typebox_exports.Array(typebox_exports.String(), { description: "Task ids this task depends on within the same plan." }))
 });
+function wrapResult(result) {
+  if (typeof result === "string") {
+    return textResult(result, result);
+  }
+  return jsonResult(result);
+}
 function slimSummary(s) {
   return {
     allRequiredPassed: s.allRequiredPassed,
@@ -5259,15 +5338,41 @@ function mapTask(t) {
     ...t.depends_on !== void 0 ? { dependsOn: t.depends_on } : {}
   };
 }
+function makeTool(name, label, description, parameters, options, handler) {
+  return () => ({
+    name,
+    label,
+    description,
+    parameters,
+    factory: ({ api, config, toolContext }) => ({
+      name,
+      label,
+      description,
+      parameters,
+      execute: async (_toolCallId, params, _signal, _onUpdate) => {
+        const result = await handler(params, config);
+        if (toolContext.sessionKey && toolContext.agentId) {
+          if (options.clears) {
+            await clearSessionGoal({ api, toolContext });
+          } else if (options.mutates) {
+            await syncSessionGoal({ api, toolContext, manager: getManager(config) });
+          }
+        }
+        return wrapResult(result);
+      }
+    })
+  });
+}
 var openclaw_plugin_default = defineToolPlugin({
   id: "goal-acceptance",
   name: "Goal Acceptance",
   description: "Acceptance-criteria-driven goal completion for autonomous agents.",
   tools: (tool) => [
-    tool({
-      name: "set_acceptance_criteria",
-      description: "Set and lock the initial acceptance criteria for the current goal. Must be called before implementation. Optional role field controls self-claim behavior: agent marks passed as self-claimed (needs reviewer confirmation), reviewer/dual marks formal passed. Criteria are immutable once locked, so calling this again rotates to a NEW goal instead of failing; the response reports previousGoalId and previousGoalIncomplete=true when the goal you just left still had unfinished required criteria. To add criteria to the CURRENT goal use amend_acceptance_criteria; to return to a rotated-away goal use list_goals then switch_goal.",
-      parameters: typebox_exports.Object({
+    tool(makeTool(
+      "set_acceptance_criteria",
+      "Set Acceptance Criteria",
+      "Set and lock the initial acceptance criteria for the current goal. Must be called before implementation. Optional role field controls self-claim behavior: agent marks passed as self-claimed (needs reviewer confirmation), reviewer/dual marks formal passed. Criteria are immutable once locked, so calling this again rotates to a NEW goal instead of failing; the response reports previousGoalId and previousGoalIncomplete=true when the goal you just left still had unfinished required criteria. To add criteria to the CURRENT goal use amend_acceptance_criteria; to return to a rotated-away goal use list_goals then switch_goal.",
+      typebox_exports.Object({
         criteria: typebox_exports.Array(CriterionItem, { description: "Array of criteria definitions." }),
         role: typebox_exports.Optional(typebox_exports.Union([
           typebox_exports.Literal("agent"),
@@ -5275,7 +5380,8 @@ var openclaw_plugin_default = defineToolPlugin({
           typebox_exports.Literal("dual")
         ], { description: "Role locking the criteria. agent (default): passed marks self-claimed, requiring confirm_criterion by an independent reviewer. reviewer/dual: formal passed immediately (use only when the user explicitly waives independent review)." }))
       }),
-      execute: async (params, config) => {
+      { mutates: true },
+      async (params, config) => {
         let mgr = getManager(config);
         const role = params.role || "agent";
         try {
@@ -5302,14 +5408,16 @@ var openclaw_plugin_default = defineToolPlugin({
           throw e;
         }
       }
-    }),
-    tool({
-      name: "get_acceptance_criteria",
-      description: "Read the current acceptance criteria, task progress, and summary. Default returns full criteria list + summary. Pass verbose=false for a one-line summary only.",
-      parameters: typebox_exports.Object({
+    )()),
+    tool(makeTool(
+      "get_acceptance_criteria",
+      "Get Acceptance Criteria",
+      "Read the current acceptance criteria, task progress, and summary. Default returns full criteria list + summary. Pass verbose=false for a one-line summary only.",
+      typebox_exports.Object({
         verbose: typebox_exports.Optional(typebox_exports.Boolean({ description: "Default true: returns criteria + full summary. false: returns only slim summary." }))
       }),
-      execute: async (params, config) => {
+      { mutates: false },
+      async (params, config) => {
         const eng = getManager(config).getEngine();
         const verbose = params.verbose !== false;
         const summary = eng.summarize();
@@ -5317,11 +5425,12 @@ var openclaw_plugin_default = defineToolPlugin({
         const criteria = eng.getCriteria();
         return { criteria, summary };
       }
-    }),
-    tool({
-      name: "validate_criterion",
-      description: "Record verification status and evidence for one criterion. Statuses passed and failed require evidence. Optional evidence_type: command/file/url/text (default text, flagged low-confidence). When role=agent, passed is marked self-claimed. Default response is slim; pass verbose=true for full summary.",
-      parameters: typebox_exports.Object({
+    )()),
+    tool(makeTool(
+      "validate_criterion",
+      "Validate Criterion",
+      "Record verification status and evidence for one criterion. Statuses passed and failed require evidence. Optional evidence_type: command/file/url/text (default text, flagged low-confidence). When role=agent, passed is marked self-claimed. Default response is slim; pass verbose=true for full summary.",
+      typebox_exports.Object({
         criterion_id: typebox_exports.String({ description: "Exact criterion id." }),
         status: typebox_exports.Union([
           typebox_exports.Literal("pending"),
@@ -5340,7 +5449,8 @@ var openclaw_plugin_default = defineToolPlugin({
         ], { description: "Type of evidence. text = low confidence. Default: text." })),
         verbose: typebox_exports.Optional(typebox_exports.Boolean({ description: "Default false: returns criterion + slim summary. true: returns criterion + full summary." }))
       }),
-      execute: async (params, config) => {
+      { mutates: true },
+      async (params, config) => {
         const eng = getManager(config).getEngine();
         const updated = await eng.validateCriterion({
           criterionId: params.criterion_id,
@@ -5352,11 +5462,12 @@ var openclaw_plugin_default = defineToolPlugin({
         const summary = eng.summarize();
         return verbose ? { criterion: updated, summary } : { criterion: updated, summary: slimSummary(summary) };
       }
-    }),
-    tool({
-      name: "confirm_criterion",
-      description: "Reviewer confirmation of a self-claimed passed criterion. MUST be called by an independent reviewer agent (e.g. a subagent that did not do the work), NOT by the agent that performed the task. The reviewer must independently re-verify the criterion (re-run tests, re-check files) and provide that fresh evidence here. Requires high-confidence evidence_type (command/file/url); text is rejected. Converts self-claimed to formal pass, unblocking can_complete_goal.",
-      parameters: typebox_exports.Object({
+    )()),
+    tool(makeTool(
+      "confirm_criterion",
+      "Confirm Criterion",
+      "Reviewer confirmation of a self-claimed passed criterion. MUST be called by an independent reviewer agent (e.g. a subagent that did not do the work), NOT by the agent that performed the task. The reviewer must independently re-verify the criterion (re-run tests, re-check files) and provide that fresh evidence here. Requires high-confidence evidence_type (command/file/url); text is rejected. Converts self-claimed to formal pass, unblocking can_complete_goal.",
+      typebox_exports.Object({
         criterion_id: typebox_exports.String({ description: "Criterion id to confirm. Must currently be passed and self-claimed." }),
         evidence: typebox_exports.String({ description: "Independent re-verification evidence gathered by the reviewer (not copied from the original validation)." }),
         evidence_type: typebox_exports.Union([
@@ -5365,7 +5476,8 @@ var openclaw_plugin_default = defineToolPlugin({
           typebox_exports.Literal("url")
         ], { description: "Type of evidence. Must be high-confidence; text is not accepted." })
       }),
-      execute: async (params, config) => {
+      { mutates: true },
+      async (params, config) => {
         const mgr = getManager(config);
         const updated = await mgr.getEngine().confirmCriterion({
           criterionId: params.criterion_id,
@@ -5375,11 +5487,12 @@ var openclaw_plugin_default = defineToolPlugin({
         const summary = mgr.getEngine().summarize();
         return { goalId: mgr.getCurrentGoalId(), criterion: updated, summary: slimSummary(summary) };
       }
-    }),
-    tool({
-      name: "update_task_status",
-      description: "Update the status of a task linked to one or more acceptance criteria. When all tasks linked to a criterion are completed, that criterion becomes ready to validate. Default response is slim; pass verbose=true for full summary.",
-      parameters: typebox_exports.Object({
+    )()),
+    tool(makeTool(
+      "update_task_status",
+      "Update Task Status",
+      "Update the status of a task linked to one or more acceptance criteria. When all tasks linked to a criterion are completed, that criterion becomes ready to validate. Default response is slim; pass verbose=true for full summary.",
+      typebox_exports.Object({
         task_id: typebox_exports.String({ description: "The task ID to update." }),
         status: typebox_exports.Union([
           typebox_exports.Literal("pending"),
@@ -5389,7 +5502,8 @@ var openclaw_plugin_default = defineToolPlugin({
         ], { description: "New task status." }),
         verbose: typebox_exports.Optional(typebox_exports.Boolean({ description: "Default false: slim summary. true: full summary." }))
       }),
-      execute: async (params, config) => {
+      { mutates: true },
+      async (params, config) => {
         const mgr = getManager(config);
         await mgr.getEngine().updateTaskStatus({
           taskId: params.task_id,
@@ -5399,15 +5513,17 @@ var openclaw_plugin_default = defineToolPlugin({
         const summary = mgr.getEngine().summarize();
         return verbose ? { taskId: params.task_id, status: params.status, summary } : { taskId: params.task_id, status: params.status, summary: slimSummary(summary) };
       }
-    }),
-    tool({
-      name: "amend_acceptance_criteria",
-      description: "Append new acceptance criteria after the initial lock. Existing criteria are not modified. Use when requirements expand during execution.",
-      parameters: typebox_exports.Object({
+    )()),
+    tool(makeTool(
+      "amend_acceptance_criteria",
+      "Amend Acceptance Criteria",
+      "Append new acceptance criteria after the initial lock. Existing criteria are not modified. Use when requirements expand during execution.",
+      typebox_exports.Object({
         criteria: typebox_exports.Array(CriterionItem, { description: "New criteria to append." }),
         reason: typebox_exports.String({ description: "Human-readable reason for the amendment." })
       }),
-      execute: async (params, config) => {
+      { mutates: true },
+      async (params, config) => {
         const mgr = getManager(config);
         const added = await mgr.getEngine().amendCriteria({
           criteria: params.criteria.map(mapCriterion),
@@ -5416,79 +5532,93 @@ var openclaw_plugin_default = defineToolPlugin({
         const summary = mgr.getEngine().summarize();
         return { addedCriteria: added, summary };
       }
-    }),
-    tool({
-      name: "can_complete_goal",
-      description: "Check whether the goal can be completed based on current acceptance criteria.",
-      parameters: typebox_exports.Object({}),
-      execute: async (_params, config) => {
+    )()),
+    tool(makeTool(
+      "can_complete_goal",
+      "Can Complete Goal",
+      "Check whether the goal can be completed based on current acceptance criteria.",
+      typebox_exports.Object({}),
+      { mutates: false },
+      async (_params, config) => {
         return getManager(config).getEngine().canComplete();
       }
-    }),
-    tool({
-      name: "set_task_plan",
-      description: "Set and lock the task decomposition plan for the current goal. Each task must have a unique id, an unambiguous description, and a concrete deliverable. Task dependencies must reference other tasks in the same plan; dependency cycles are rejected. Requires acceptance criteria to be locked first.",
-      parameters: typebox_exports.Object({
+    )()),
+    tool(makeTool(
+      "set_task_plan",
+      "Set Task Plan",
+      "Set and lock the task decomposition plan for the current goal. Each task must have a unique id, an unambiguous description, and a concrete deliverable. Task dependencies must reference other tasks in the same plan; dependency cycles are rejected. Requires acceptance criteria to be locked first.",
+      typebox_exports.Object({
         tasks: typebox_exports.Array(TaskPlanItem, { description: "Ordered list of atomic tasks." })
       }),
-      execute: async (params, config) => {
+      { mutates: true },
+      async (params, config) => {
         const mgr = getManager(config);
         const plan = await mgr.getEngine().setTaskPlan(params.tasks.map(mapTask));
         const summary = mgr.getEngine().summarize();
         return { taskPlan: plan, summary: slimSummary(summary) };
       }
-    }),
-    tool({
-      name: "get_task_plan",
-      description: "Read the current task decomposition plan with live task statuses.",
-      parameters: typebox_exports.Object({}),
-      execute: async (_params, config) => {
+    )()),
+    tool(makeTool(
+      "get_task_plan",
+      "Get Task Plan",
+      "Read the current task decomposition plan with live task statuses.",
+      typebox_exports.Object({}),
+      { mutates: false },
+      async (_params, config) => {
         const mgr = getManager(config);
         const plan = mgr.getEngine().getTaskPlan();
         return { goalId: mgr.getCurrentGoalId(), taskPlan: plan };
       }
-    }),
-    tool({
-      name: "start_goal",
-      description: "Start a new goal with a fresh state. Use this when the current goal is locked and you need to begin a new independent task. Each goal has its own acceptance criteria and task plan. The new goal becomes the active goal.",
-      parameters: typebox_exports.Object({
+    )()),
+    tool(makeTool(
+      "start_goal",
+      "Start Goal",
+      "Start a new goal with a fresh state. Use this when the current goal is locked and you need to begin a new independent task. Each goal has its own acceptance criteria and task plan. The new goal becomes the active goal.",
+      typebox_exports.Object({
         title: typebox_exports.Optional(typebox_exports.String({ description: "Optional human-readable title for the goal." }))
       }),
-      execute: async (params, config) => {
+      { mutates: true },
+      async (params, config) => {
         const meta = getManager(config).startGoal(params.title);
         return { goal: meta, message: "New goal started and set as active." };
       }
-    }),
-    tool({
-      name: "list_goals",
-      description: "List all goals with their status summaries. Shows goal ID, title, creation time, criteria counts, and which goal is currently active.",
-      parameters: typebox_exports.Object({}),
-      execute: async (_params, config) => {
+    )()),
+    tool(makeTool(
+      "list_goals",
+      "List Goals",
+      "List all goals with their status summaries. Shows goal ID, title, creation time, criteria counts, and which goal is currently active.",
+      typebox_exports.Object({}),
+      { mutates: false },
+      async (_params, config) => {
         return { goals: getManager(config).listGoals() };
       }
-    }),
-    tool({
-      name: "switch_goal",
-      description: "Switch the active goal to an existing goal by ID. Use list_goals to find goal IDs.",
-      parameters: typebox_exports.Object({
+    )()),
+    tool(makeTool(
+      "switch_goal",
+      "Switch Goal",
+      "Switch the active goal to an existing goal by ID. Use list_goals to find goal IDs.",
+      typebox_exports.Object({
         goal_id: typebox_exports.String({ description: "The goal ID to switch to (from list_goals)." })
       }),
-      execute: async (params, config) => {
+      { mutates: true },
+      async (params, config) => {
         const meta = getManager(config).switchGoal(params.goal_id);
         return { goal: meta, message: "Switched active goal." };
       }
-    }),
-    tool({
-      name: "run_and_validate",
-      description: "Execute a shell command, capture its real stdout/stderr/exitCode, and validate the criterion in one call. Guarantees high-confidence command evidence.",
-      parameters: typebox_exports.Object({
+    )()),
+    tool(makeTool(
+      "run_and_validate",
+      "Run And Validate",
+      "Execute a shell command, capture its real stdout/stderr/exitCode, and validate the criterion in one call. Guarantees high-confidence command evidence.",
+      typebox_exports.Object({
         criterion_id: typebox_exports.String({ description: "Criterion ID to validate." }),
         command: typebox_exports.String({ description: "Shell command to execute." }),
         cwd: typebox_exports.Optional(typebox_exports.String({ description: "Optional working directory." })),
         timeout_ms: typebox_exports.Optional(typebox_exports.Number({ description: "Optional timeout in milliseconds." })),
         verbose: typebox_exports.Optional(typebox_exports.Boolean({ description: "Default false: slim summary. true: full summary." }))
       }),
-      execute: async (params, config) => {
+      { mutates: true },
+      async (params, config) => {
         const mgr = getManager(config);
         const eng = mgr.getEngine();
         let stdout = "";
@@ -5532,17 +5662,19 @@ ${stderr.trim()}` : "",
           summary: verbose ? summary : slimSummary(summary)
         };
       }
-    }),
-    tool({
-      name: "quick_start_goal",
-      description: "Fast-path tool: Start/rotate a goal, lock criteria, and optionally set task plan all in ONE call.",
-      parameters: typebox_exports.Object({
+    )()),
+    tool(makeTool(
+      "quick_start_goal",
+      "Quick Start Goal",
+      "Fast-path tool: Start/rotate a goal, lock criteria, and optionally set task plan all in ONE call.",
+      typebox_exports.Object({
         title: typebox_exports.Optional(typebox_exports.String({ description: "Optional short goal title." })),
         role: typebox_exports.Optional(typebox_exports.Union([typebox_exports.Literal("agent"), typebox_exports.Literal("reviewer"), typebox_exports.Literal("dual")], { description: "Role locking criteria." })),
         criteria: typebox_exports.Array(CriterionItem, { description: "Initial criteria to lock." }),
         tasks: typebox_exports.Optional(typebox_exports.Array(TaskPlanItem, { description: "Optional task plan." }))
       }),
-      execute: async (params, config) => {
+      { mutates: true },
+      async (params, config) => {
         const mgr = getManager(config);
         const role = params.role || "agent";
         if (params.title !== void 0) mgr.startGoal(params.title);
@@ -5582,16 +5714,18 @@ ${stderr.trim()}` : "",
           message: "Goal initialized and locked successfully."
         };
       }
-    }),
-    tool({
-      name: "reset_goal",
-      description: "Delete the current goal and all its data (criteria, task plan, validations). The goal is permanently removed. Use this to clear a messed-up goal and start fresh.",
-      parameters: typebox_exports.Object({}),
-      execute: async (_params, config) => {
+    )()),
+    tool(makeTool(
+      "reset_goal",
+      "Reset Goal",
+      "Delete the current goal and all its data (criteria, task plan, validations). The goal is permanently removed. Use this to clear a messed-up goal and start fresh.",
+      typebox_exports.Object({}),
+      { clears: true },
+      async (_params, config) => {
         getManager(config).resetGoal();
         return { message: "Current goal deleted. No active goal. Call set_acceptance_criteria to auto-create a new one, or start_goal." };
       }
-    })
+    )())
   ]
 });
 export {

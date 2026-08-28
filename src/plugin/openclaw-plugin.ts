@@ -9,10 +9,13 @@
  * pluginConfig (same stick-after-first-use semantics as the original).
  */
 import { execSync } from 'node:child_process'
+import type { OpenClawPluginApi, OpenClawPluginToolContext } from 'openclaw/plugin-sdk/core'
+import { defineToolPlugin } from 'openclaw/plugin-sdk/tool-plugin'
+import { jsonResult, textResult, type AgentToolResult } from 'openclaw/plugin-sdk/tool-results'
+import { Type } from 'typebox'
 import { GoalAcceptanceError, type GoalCriterion, type GoalTask } from './engine/index.ts'
 import { GoalManager } from './goal-manager.ts'
-import { defineToolPlugin } from 'openclaw/plugin-sdk/tool-plugin'
-import { Type } from 'typebox'
+import { clearSessionGoal, syncSessionGoal } from './openclaw-session-sync.ts'
 
 /** One manager per process, created on first tool call. */
 let manager: GoalManager | null = null
@@ -49,6 +52,13 @@ const TaskPlanItem = Type.Object({
 
 // --- Helpers (unchanged from the original package) ---
 
+function wrapResult(result: unknown): AgentToolResult<unknown> {
+  if (typeof result === 'string') {
+    return textResult(result, result)
+  }
+  return jsonResult(result)
+}
+
 function slimSummary(s: { allRequiredPassed: boolean; passedCount: number; selfClaimedCount: number; totalCount: number }) {
   return {
     allRequiredPassed: s.allRequiredPassed,
@@ -78,6 +88,52 @@ function mapTask(t: { id: string; description: string; deliverable: string; depe
   }
 }
 
+// --- Tool factory wrapper ---
+//
+// `defineToolPlugin`'s `factory` form gives us the active OpenClaw session
+// context (sessionKey + agentId). We use that to mirror the plugin's active
+// acceptance goal into the canonical `SessionEntry.goal` slot, so OpenClaw's
+// built-in `get_goal` and `update_goal` tools see a live goal snapshot.
+
+type ToolFactoryContext = {
+  api: OpenClawPluginApi
+  config: { dataDir?: string }
+  toolContext: OpenClawPluginToolContext
+}
+
+function makeTool(
+  name: string,
+  label: string,
+  description: string,
+  parameters: any,
+  options: { mutates?: boolean; clears?: boolean },
+  handler: (params: any, config: { dataDir?: string }) => Promise<unknown>,
+) {
+  return () => ({
+    name,
+    label,
+    description,
+    parameters,
+    factory: ({ api, config, toolContext }: ToolFactoryContext) => ({
+      name,
+      label,
+      description,
+      parameters,
+      execute: async (_toolCallId: string, params: unknown, _signal?: AbortSignal, _onUpdate?: any) => {
+        const result = await handler(params as any, config)
+        if (toolContext.sessionKey && toolContext.agentId) {
+          if (options.clears) {
+            await clearSessionGoal({ api, toolContext })
+          } else if (options.mutates) {
+            await syncSessionGoal({ api, toolContext, manager: getManager(config) })
+          }
+        }
+        return wrapResult(result)
+      },
+    }),
+  })
+}
+
 // --- Plugin ---
 // id stays 'goal-acceptance' (the brand) so OpenClaw upgrades replace the
 // original plugin instead of installing a duplicate.
@@ -88,10 +144,11 @@ export default defineToolPlugin({
   description: 'Acceptance-criteria-driven goal completion for autonomous agents.',
 
   tools: (tool) => [
-    tool({
-      name: 'set_acceptance_criteria',
-      description: 'Set and lock the initial acceptance criteria for the current goal. Must be called before implementation. Optional role field controls self-claim behavior: agent marks passed as self-claimed (needs reviewer confirmation), reviewer/dual marks formal passed. Criteria are immutable once locked, so calling this again rotates to a NEW goal instead of failing; the response reports previousGoalId and previousGoalIncomplete=true when the goal you just left still had unfinished required criteria. To add criteria to the CURRENT goal use amend_acceptance_criteria; to return to a rotated-away goal use list_goals then switch_goal.',
-      parameters: Type.Object({
+    tool(makeTool(
+      'set_acceptance_criteria',
+      'Set Acceptance Criteria',
+      'Set and lock the initial acceptance criteria for the current goal. Must be called before implementation. Optional role field controls self-claim behavior: agent marks passed as self-claimed (needs reviewer confirmation), reviewer/dual marks formal passed. Criteria are immutable once locked, so calling this again rotates to a NEW goal instead of failing; the response reports previousGoalId and previousGoalIncomplete=true when the goal you just left still had unfinished required criteria. To add criteria to the CURRENT goal use amend_acceptance_criteria; to return to a rotated-away goal use list_goals then switch_goal.',
+      Type.Object({
         criteria: Type.Array(CriterionItem, { description: 'Array of criteria definitions.' }),
         role: Type.Optional(Type.Union([
           Type.Literal('agent'),
@@ -99,7 +156,8 @@ export default defineToolPlugin({
           Type.Literal('dual'),
         ], { description: 'Role locking the criteria. agent (default): passed marks self-claimed, requiring confirm_criterion by an independent reviewer. reviewer/dual: formal passed immediately (use only when the user explicitly waives independent review).' })),
       }),
-      execute: async (params, config) => {
+      { mutates: true },
+      async (params, config) => {
         let mgr = getManager(config)
         const role = params.role || 'agent'
         try {
@@ -131,15 +189,17 @@ export default defineToolPlugin({
           throw e
         }
       },
-    }),
+    )()),
 
-    tool({
-      name: 'get_acceptance_criteria',
-      description: 'Read the current acceptance criteria, task progress, and summary. Default returns full criteria list + summary. Pass verbose=false for a one-line summary only.',
-      parameters: Type.Object({
+    tool(makeTool(
+      'get_acceptance_criteria',
+      'Get Acceptance Criteria',
+      'Read the current acceptance criteria, task progress, and summary. Default returns full criteria list + summary. Pass verbose=false for a one-line summary only.',
+      Type.Object({
         verbose: Type.Optional(Type.Boolean({ description: 'Default true: returns criteria + full summary. false: returns only slim summary.' })),
       }),
-      execute: async (params, config) => {
+      { mutates: false },
+      async (params, config) => {
         const eng = getManager(config).getEngine()
         const verbose = params.verbose !== false
         const summary = eng.summarize()
@@ -147,12 +207,13 @@ export default defineToolPlugin({
         const criteria = eng.getCriteria()
         return { criteria, summary }
       },
-    }),
+    )()),
 
-    tool({
-      name: 'validate_criterion',
-      description: 'Record verification status and evidence for one criterion. Statuses passed and failed require evidence. Optional evidence_type: command/file/url/text (default text, flagged low-confidence). When role=agent, passed is marked self-claimed. Default response is slim; pass verbose=true for full summary.',
-      parameters: Type.Object({
+    tool(makeTool(
+      'validate_criterion',
+      'Validate Criterion',
+      'Record verification status and evidence for one criterion. Statuses passed and failed require evidence. Optional evidence_type: command/file/url/text (default text, flagged low-confidence). When role=agent, passed is marked self-claimed. Default response is slim; pass verbose=true for full summary.',
+      Type.Object({
         criterion_id: Type.String({ description: 'Exact criterion id.' }),
         status: Type.Union([
           Type.Literal('pending'),
@@ -171,7 +232,8 @@ export default defineToolPlugin({
         ], { description: 'Type of evidence. text = low confidence. Default: text.' })),
         verbose: Type.Optional(Type.Boolean({ description: 'Default false: returns criterion + slim summary. true: returns criterion + full summary.' })),
       }),
-      execute: async (params, config) => {
+      { mutates: true },
+      async (params, config) => {
         const eng = getManager(config).getEngine()
         const updated = await eng.validateCriterion({
           criterionId: params.criterion_id,
@@ -185,12 +247,13 @@ export default defineToolPlugin({
           ? { criterion: updated, summary }
           : { criterion: updated, summary: slimSummary(summary) }
       },
-    }),
+    )()),
 
-    tool({
-      name: 'confirm_criterion',
-      description: 'Reviewer confirmation of a self-claimed passed criterion. MUST be called by an independent reviewer agent (e.g. a subagent that did not do the work), NOT by the agent that performed the task. The reviewer must independently re-verify the criterion (re-run tests, re-check files) and provide that fresh evidence here. Requires high-confidence evidence_type (command/file/url); text is rejected. Converts self-claimed to formal pass, unblocking can_complete_goal.',
-      parameters: Type.Object({
+    tool(makeTool(
+      'confirm_criterion',
+      'Confirm Criterion',
+      'Reviewer confirmation of a self-claimed passed criterion. MUST be called by an independent reviewer agent (e.g. a subagent that did not do the work), NOT by the agent that performed the task. The reviewer must independently re-verify the criterion (re-run tests, re-check files) and provide that fresh evidence here. Requires high-confidence evidence_type (command/file/url); text is rejected. Converts self-claimed to formal pass, unblocking can_complete_goal.',
+      Type.Object({
         criterion_id: Type.String({ description: 'Criterion id to confirm. Must currently be passed and self-claimed.' }),
         evidence: Type.String({ description: 'Independent re-verification evidence gathered by the reviewer (not copied from the original validation).' }),
         evidence_type: Type.Union([
@@ -199,7 +262,8 @@ export default defineToolPlugin({
           Type.Literal('url'),
         ], { description: 'Type of evidence. Must be high-confidence; text is not accepted.' }),
       }),
-      execute: async (params, config) => {
+      { mutates: true },
+      async (params, config) => {
         const mgr = getManager(config)
         const updated = await mgr.getEngine().confirmCriterion({
           criterionId: params.criterion_id,
@@ -209,12 +273,13 @@ export default defineToolPlugin({
         const summary = mgr.getEngine().summarize()
         return { goalId: mgr.getCurrentGoalId(), criterion: updated, summary: slimSummary(summary) }
       },
-    }),
+    )()),
 
-    tool({
-      name: 'update_task_status',
-      description: 'Update the status of a task linked to one or more acceptance criteria. When all tasks linked to a criterion are completed, that criterion becomes ready to validate. Default response is slim; pass verbose=true for full summary.',
-      parameters: Type.Object({
+    tool(makeTool(
+      'update_task_status',
+      'Update Task Status',
+      'Update the status of a task linked to one or more acceptance criteria. When all tasks linked to a criterion are completed, that criterion becomes ready to validate. Default response is slim; pass verbose=true for full summary.',
+      Type.Object({
         task_id: Type.String({ description: 'The task ID to update.' }),
         status: Type.Union([
           Type.Literal('pending'),
@@ -224,7 +289,8 @@ export default defineToolPlugin({
         ], { description: 'New task status.' }),
         verbose: Type.Optional(Type.Boolean({ description: 'Default false: slim summary. true: full summary.' })),
       }),
-      execute: async (params, config) => {
+      { mutates: true },
+      async (params, config) => {
         const mgr = getManager(config)
         await mgr.getEngine().updateTaskStatus({
           taskId: params.task_id,
@@ -236,16 +302,18 @@ export default defineToolPlugin({
           ? { taskId: params.task_id, status: params.status, summary }
           : { taskId: params.task_id, status: params.status, summary: slimSummary(summary) }
       },
-    }),
+    )()),
 
-    tool({
-      name: 'amend_acceptance_criteria',
-      description: 'Append new acceptance criteria after the initial lock. Existing criteria are not modified. Use when requirements expand during execution.',
-      parameters: Type.Object({
+    tool(makeTool(
+      'amend_acceptance_criteria',
+      'Amend Acceptance Criteria',
+      'Append new acceptance criteria after the initial lock. Existing criteria are not modified. Use when requirements expand during execution.',
+      Type.Object({
         criteria: Type.Array(CriterionItem, { description: 'New criteria to append.' }),
         reason: Type.String({ description: 'Human-readable reason for the amendment.' }),
       }),
-      execute: async (params, config) => {
+      { mutates: true },
+      async (params, config) => {
         const mgr = getManager(config)
         const added = await mgr.getEngine().amendCriteria({
           criteria: params.criteria.map(mapCriterion),
@@ -254,86 +322,100 @@ export default defineToolPlugin({
         const summary = mgr.getEngine().summarize()
         return { addedCriteria: added, summary }
       },
-    }),
+    )()),
 
-    tool({
-      name: 'can_complete_goal',
-      description: 'Check whether the goal can be completed based on current acceptance criteria.',
-      parameters: Type.Object({}),
-      execute: async (_params, config) => {
+    tool(makeTool(
+      'can_complete_goal',
+      'Can Complete Goal',
+      'Check whether the goal can be completed based on current acceptance criteria.',
+      Type.Object({}),
+      { mutates: false },
+      async (_params, config) => {
         return getManager(config).getEngine().canComplete()
       },
-    }),
+    )()),
 
-    tool({
-      name: 'set_task_plan',
-      description: 'Set and lock the task decomposition plan for the current goal. Each task must have a unique id, an unambiguous description, and a concrete deliverable. Task dependencies must reference other tasks in the same plan; dependency cycles are rejected. Requires acceptance criteria to be locked first.',
-      parameters: Type.Object({
+    tool(makeTool(
+      'set_task_plan',
+      'Set Task Plan',
+      'Set and lock the task decomposition plan for the current goal. Each task must have a unique id, an unambiguous description, and a concrete deliverable. Task dependencies must reference other tasks in the same plan; dependency cycles are rejected. Requires acceptance criteria to be locked first.',
+      Type.Object({
         tasks: Type.Array(TaskPlanItem, { description: 'Ordered list of atomic tasks.' }),
       }),
-      execute: async (params, config) => {
+      { mutates: true },
+      async (params, config) => {
         const mgr = getManager(config)
         const plan = await mgr.getEngine().setTaskPlan(params.tasks.map(mapTask))
         const summary = mgr.getEngine().summarize()
         return { taskPlan: plan, summary: slimSummary(summary) }
       },
-    }),
+    )()),
 
-    tool({
-      name: 'get_task_plan',
-      description: 'Read the current task decomposition plan with live task statuses.',
-      parameters: Type.Object({}),
-      execute: async (_params, config) => {
+    tool(makeTool(
+      'get_task_plan',
+      'Get Task Plan',
+      'Read the current task decomposition plan with live task statuses.',
+      Type.Object({}),
+      { mutates: false },
+      async (_params, config) => {
         const mgr = getManager(config)
         const plan = mgr.getEngine().getTaskPlan()
         return { goalId: mgr.getCurrentGoalId(), taskPlan: plan }
       },
-    }),
+    )()),
 
-    tool({
-      name: 'start_goal',
-      description: 'Start a new goal with a fresh state. Use this when the current goal is locked and you need to begin a new independent task. Each goal has its own acceptance criteria and task plan. The new goal becomes the active goal.',
-      parameters: Type.Object({
+    tool(makeTool(
+      'start_goal',
+      'Start Goal',
+      'Start a new goal with a fresh state. Use this when the current goal is locked and you need to begin a new independent task. Each goal has its own acceptance criteria and task plan. The new goal becomes the active goal.',
+      Type.Object({
         title: Type.Optional(Type.String({ description: 'Optional human-readable title for the goal.' })),
       }),
-      execute: async (params, config) => {
+      { mutates: true },
+      async (params, config) => {
         const meta = getManager(config).startGoal(params.title)
         return { goal: meta, message: 'New goal started and set as active.' }
       },
-    }),
+    )()),
 
-    tool({
-      name: 'list_goals',
-      description: 'List all goals with their status summaries. Shows goal ID, title, creation time, criteria counts, and which goal is currently active.',
-      parameters: Type.Object({}),
-      execute: async (_params, config) => {
+    tool(makeTool(
+      'list_goals',
+      'List Goals',
+      'List all goals with their status summaries. Shows goal ID, title, creation time, criteria counts, and which goal is currently active.',
+      Type.Object({}),
+      { mutates: false },
+      async (_params, config) => {
         return { goals: getManager(config).listGoals() }
       },
-    }),
+    )()),
 
-    tool({
-      name: 'switch_goal',
-      description: 'Switch the active goal to an existing goal by ID. Use list_goals to find goal IDs.',
-      parameters: Type.Object({
+    tool(makeTool(
+      'switch_goal',
+      'Switch Goal',
+      'Switch the active goal to an existing goal by ID. Use list_goals to find goal IDs.',
+      Type.Object({
         goal_id: Type.String({ description: 'The goal ID to switch to (from list_goals).' }),
       }),
-      execute: async (params, config) => {
+      { mutates: true },
+      async (params, config) => {
         const meta = getManager(config).switchGoal(params.goal_id)
         return { goal: meta, message: 'Switched active goal.' }
       },
-    }),
+    )()),
 
-    tool({
-      name: 'run_and_validate',
-      description: 'Execute a shell command, capture its real stdout/stderr/exitCode, and validate the criterion in one call. Guarantees high-confidence command evidence.',
-      parameters: Type.Object({
+    tool(makeTool(
+      'run_and_validate',
+      'Run And Validate',
+      'Execute a shell command, capture its real stdout/stderr/exitCode, and validate the criterion in one call. Guarantees high-confidence command evidence.',
+      Type.Object({
         criterion_id: Type.String({ description: 'Criterion ID to validate.' }),
         command: Type.String({ description: 'Shell command to execute.' }),
         cwd: Type.Optional(Type.String({ description: 'Optional working directory.' })),
         timeout_ms: Type.Optional(Type.Number({ description: 'Optional timeout in milliseconds.' })),
         verbose: Type.Optional(Type.Boolean({ description: 'Default false: slim summary. true: full summary.' })),
       }),
-      execute: async (params, config) => {
+      { mutates: true },
+      async (params, config) => {
         const mgr = getManager(config)
         const eng = mgr.getEngine()
         let stdout = ''
@@ -376,17 +458,20 @@ export default defineToolPlugin({
           summary: verbose ? summary : slimSummary(summary),
         }
       },
-    }),
-    tool({
-      name: 'quick_start_goal',
-      description: 'Fast-path tool: Start/rotate a goal, lock criteria, and optionally set task plan all in ONE call.',
-      parameters: Type.Object({
+    )()),
+
+    tool(makeTool(
+      'quick_start_goal',
+      'Quick Start Goal',
+      'Fast-path tool: Start/rotate a goal, lock criteria, and optionally set task plan all in ONE call.',
+      Type.Object({
         title: Type.Optional(Type.String({ description: 'Optional short goal title.' })),
         role: Type.Optional(Type.Union([Type.Literal('agent'), Type.Literal('reviewer'), Type.Literal('dual')], { description: 'Role locking criteria.' })),
         criteria: Type.Array(CriterionItem, { description: 'Initial criteria to lock.' }),
         tasks: Type.Optional(Type.Array(TaskPlanItem, { description: 'Optional task plan.' })),
       }),
-      execute: async (params, config) => {
+      { mutates: true },
+      async (params, config) => {
         const mgr = getManager(config)
         const role = params.role || 'agent'
         if (params.title !== undefined) mgr.startGoal(params.title)
@@ -428,15 +513,18 @@ export default defineToolPlugin({
           message: 'Goal initialized and locked successfully.',
         }
       },
-    }),
-    tool({
-      name: 'reset_goal',
-      description: 'Delete the current goal and all its data (criteria, task plan, validations). The goal is permanently removed. Use this to clear a messed-up goal and start fresh.',
-      parameters: Type.Object({}),
-      execute: async (_params, config) => {
+    )()),
+
+    tool(makeTool(
+      'reset_goal',
+      'Reset Goal',
+      'Delete the current goal and all its data (criteria, task plan, validations). The goal is permanently removed. Use this to clear a messed-up goal and start fresh.',
+      Type.Object({}),
+      { clears: true },
+      async (_params, config) => {
         getManager(config).resetGoal()
         return { message: 'Current goal deleted. No active goal. Call set_acceptance_criteria to auto-create a new one, or start_goal.' }
       },
-    }),
+    )()),
   ],
 })

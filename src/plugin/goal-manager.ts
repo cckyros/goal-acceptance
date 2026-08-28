@@ -191,6 +191,12 @@ export class GoalManager {
     return meta
   }
 
+  /** Return the active goal's metadata, or undefined when none is active. */
+  getCurrentGoalMeta(): GoalMeta | undefined {
+    if (this.currentGoalId === null) return undefined
+    return this.loadGoalMeta(this.currentGoalId)
+  }
+
   /** List all goals with status summaries. */
   listGoals(): GoalListItem[] {
     const dir = this.goalsDir
