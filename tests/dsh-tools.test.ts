@@ -47,13 +47,13 @@ async function createHarness() {
 }
 
 describe('Goal Acceptance Tools', () => {
-  it('registers the complete 13-tool protocol', async () => {
+  it('registers the complete 15-tool protocol', async () => {
     const { tools } = await createHarness()
     assert.deepEqual(tools.map(tool => tool.name), [
       'set_acceptance_criteria', 'get_acceptance_criteria', 'validate_criterion',
       'confirm_criterion', 'update_task_status', 'amend_acceptance_criteria',
       'can_complete_goal', 'set_task_plan', 'get_task_plan', 'start_goal',
-      'list_goals', 'switch_goal', 'reset_goal',
+      'list_goals', 'switch_goal', 'run_and_validate', 'quick_start_goal', 'reset_goal',
     ])
   })
 
@@ -64,7 +64,7 @@ describe('Goal Acceptance Tools', () => {
 
     const setResult = await setTool.execute({
       criteria: [
-        { id: 'c1', description: 'API returns 200', required: true, method: 'test' },
+        { id: 'c1', description: 'API returns 200', required: true, method: 'command' },
         { id: 'c2', description: 'Documentation updated', required: false },
       ],
     }, { agent } as never) as { criteria: unknown[]; summary: { totalCount: number } }
@@ -121,7 +121,7 @@ describe('Goal Acceptance Tools', () => {
 
     await setTool.execute({
       criteria: [
-        { id: 'c1', description: 'API returns 200', required: true, method: 'test' },
+        { id: 'c1', description: 'API returns 200', required: true, method: 'command' },
       ],
     }, { agent } as never)
 

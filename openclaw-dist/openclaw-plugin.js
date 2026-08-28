@@ -4,12 +4,18 @@ var __export = (target, all) => {
     __defProp(target, name, { get: all[name], enumerable: true });
 };
 
+// src/plugin/openclaw-plugin.ts
+import { execSync } from "node:child_process";
+
 // src/plugin/engine/errors.ts
 var GoalAcceptanceError = class extends Error {
   code;
-  constructor(message, code) {
-    super(`goal-acceptance: ${message}`);
+  hint;
+  constructor(message, code, hint) {
+    const fullMessage = hint ? `goal-acceptance: ${message} (Hint: ${hint})` : `goal-acceptance: ${message}`;
+    super(fullMessage);
     this.code = code;
+    this.hint = hint;
     this.name = "GoalAcceptanceError";
   }
 };
@@ -243,11 +249,17 @@ var GoalAcceptanceEngine = class {
     this.sync();
     const existing = this.state.criteria.get(spec.criterionId);
     if (existing === void 0) {
-      throw new GoalAcceptanceError(`criterion "${spec.criterionId}" not found`, "GOAL_ACCEPTANCE_CRITERION_NOT_FOUND");
+      const available = Array.from(this.state.criteria.keys());
+      const hint = available.length > 0 ? `Available criterion IDs: [${available.map((id) => `"${id}"`).join(", ")}]. Call get_acceptance_criteria to inspect full list.` : "No criteria have been set for this goal yet. Call set_acceptance_criteria or quick_start_goal first.";
+      throw new GoalAcceptanceError(`criterion "${spec.criterionId}" not found`, "GOAL_ACCEPTANCE_CRITERION_NOT_FOUND", hint);
     }
     const requiresEvidence = spec.status === "passed" || spec.status === "failed";
     if (requiresEvidence && (typeof spec.evidence !== "string" || spec.evidence.trim().length === 0)) {
-      throw new GoalAcceptanceError(`evidence is required when setting criterion to "${spec.status}"`, "GOAL_ACCEPTANCE_EVIDENCE_REQUIRED");
+      throw new GoalAcceptanceError(
+        `evidence is required when setting criterion to "${spec.status}"`,
+        "GOAL_ACCEPTANCE_EVIDENCE_REQUIRED",
+        "Provide command output, test run logs, or file verification content via evidence parameter, or use run_and_validate tool."
+      );
     }
     const evidenceType = spec.evidenceType ?? "text";
     const selfClaimed = spec.status === "passed" && this.state.role === "agent";
@@ -5203,10 +5215,15 @@ function getManager(cfg) {
   return manager;
 }
 var CriterionItem = typebox_exports.Object({
-  id: typebox_exports.String({ description: "Short unique identifier." }),
-  description: typebox_exports.String({ description: "Concrete requirement." }),
-  required: typebox_exports.Optional(typebox_exports.Boolean({ description: "Whether required for goal completion." })),
-  method: typebox_exports.Optional(typebox_exports.String({ description: "Verification method: test, command, browser, manual." })),
+  id: typebox_exports.String({ description: 'Short unique identifier (e.g. "api-health", "test-pass").' }),
+  description: typebox_exports.String({ description: "Concrete requirement description." }),
+  required: typebox_exports.Optional(typebox_exports.Boolean({ description: "Whether required for goal completion. Defaults to true." })),
+  method: typebox_exports.Optional(typebox_exports.Union([
+    typebox_exports.Literal("command"),
+    typebox_exports.Literal("file"),
+    typebox_exports.Literal("url"),
+    typebox_exports.Literal("manual")
+  ], { description: "Verification method: command, file, url, or manual." })),
   task_ids: typebox_exports.Optional(typebox_exports.Array(typebox_exports.String(), { description: "Task IDs linked to this criterion." })),
   depends_on: typebox_exports.Optional(typebox_exports.Array(typebox_exports.String(), { description: "IDs of criteria that must be passed before this one." }))
 });
@@ -5459,6 +5476,111 @@ var openclaw_plugin_default = defineToolPlugin({
       execute: async (params, config) => {
         const meta = getManager(config).switchGoal(params.goal_id);
         return { goal: meta, message: "Switched active goal." };
+      }
+    }),
+    tool({
+      name: "run_and_validate",
+      description: "Execute a shell command, capture its real stdout/stderr/exitCode, and validate the criterion in one call. Guarantees high-confidence command evidence.",
+      parameters: typebox_exports.Object({
+        criterion_id: typebox_exports.String({ description: "Criterion ID to validate." }),
+        command: typebox_exports.String({ description: "Shell command to execute." }),
+        cwd: typebox_exports.Optional(typebox_exports.String({ description: "Optional working directory." })),
+        timeout_ms: typebox_exports.Optional(typebox_exports.Number({ description: "Optional timeout in milliseconds." })),
+        verbose: typebox_exports.Optional(typebox_exports.Boolean({ description: "Default false: slim summary. true: full summary." }))
+      }),
+      execute: async (params, config) => {
+        const mgr = getManager(config);
+        const eng = mgr.getEngine();
+        let stdout = "";
+        let stderr = "";
+        let exitCode = 0;
+        try {
+          stdout = execSync(params.command, {
+            cwd: params.cwd,
+            timeout: params.timeout_ms || 6e4,
+            encoding: "utf8",
+            stdio: ["pipe", "pipe", "pipe"],
+            maxBuffer: 4 * 1024 * 1024
+          });
+        } catch (err) {
+          const execErr = err;
+          stdout = execErr.stdout ?? "";
+          stderr = execErr.stderr ?? (execErr.message || String(err));
+          exitCode = typeof execErr.status === "number" ? execErr.status : 1;
+        }
+        const status = exitCode === 0 ? "passed" : "failed";
+        const rawEvidence = [
+          `$ ${params.command}`,
+          stdout.trim() ? `[stdout]
+${stdout.trim()}` : "",
+          stderr.trim() ? `[stderr]
+${stderr.trim()}` : "",
+          `[exit code] ${exitCode}`
+        ].filter(Boolean).join("\n\n");
+        const updated = await eng.validateCriterion({
+          criterionId: params.criterion_id,
+          status,
+          evidence: rawEvidence,
+          evidenceType: "command"
+        });
+        const verbose = params.verbose === true;
+        const summary = eng.summarize();
+        return {
+          goalId: mgr.getCurrentGoalId(),
+          criterion: updated,
+          commandOutput: { exitCode, stdout, stderr },
+          summary: verbose ? summary : slimSummary(summary)
+        };
+      }
+    }),
+    tool({
+      name: "quick_start_goal",
+      description: "Fast-path tool: Start/rotate a goal, lock criteria, and optionally set task plan all in ONE call.",
+      parameters: typebox_exports.Object({
+        title: typebox_exports.Optional(typebox_exports.String({ description: "Optional short goal title." })),
+        role: typebox_exports.Optional(typebox_exports.Union([typebox_exports.Literal("agent"), typebox_exports.Literal("reviewer"), typebox_exports.Literal("dual")], { description: "Role locking criteria." })),
+        criteria: typebox_exports.Array(CriterionItem, { description: "Initial criteria to lock." }),
+        tasks: typebox_exports.Optional(typebox_exports.Array(TaskPlanItem, { description: "Optional task plan." }))
+      }),
+      execute: async (params, config) => {
+        const mgr = getManager(config);
+        const role = params.role || "agent";
+        if (params.title !== void 0) mgr.startGoal(params.title);
+        let engine = mgr.ensureGoal();
+        let list;
+        let previousGoalId;
+        let previousGoalIncomplete = false;
+        let previousGoalReason;
+        let previousGoalSummary;
+        try {
+          list = await engine.setCriteria(params.criteria.map(mapCriterion), role);
+        } catch (e) {
+          if (e instanceof GoalAcceptanceError && e.code === "GOAL_ACCEPTANCE_ALREADY_LOCKED") {
+            previousGoalId = mgr.getCurrentGoalId() ?? void 0;
+            const completion = engine.canComplete();
+            previousGoalSummary = slimSummary(engine.summarize());
+            previousGoalIncomplete = !completion.allowed;
+            previousGoalReason = completion.reason;
+            mgr.startGoal(params.title);
+            engine = mgr.getEngine();
+            list = await engine.setCriteria(params.criteria.map(mapCriterion), role);
+          } else {
+            throw e;
+          }
+        }
+        let taskPlanRes;
+        if (Array.isArray(params.tasks) && params.tasks.length > 0) {
+          taskPlanRes = await engine.setTaskPlan(params.tasks.map(mapTask));
+        }
+        const summary = engine.summarize();
+        return {
+          goalId: mgr.getCurrentGoalId(),
+          ...previousGoalId ? { previousGoalId, previousGoalIncomplete, previousGoalReason, previousGoalSummary, autoStarted: true } : {},
+          criteria: list,
+          taskPlan: taskPlanRes,
+          summary: slimSummary(summary),
+          message: "Goal initialized and locked successfully."
+        };
       }
     }),
     tool({

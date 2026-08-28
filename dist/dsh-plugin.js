@@ -1,16 +1,23 @@
 // src/plugin/dsh-plugin.ts
+import { execSync as execSync2 } from "node:child_process";
 import { randomUUID as randomUUID2 } from "node:crypto";
 import { Service } from "@deepseek-ai/cordis";
 import z from "@deepseek-ai/schemastery";
 import { createUserMessage } from "@deepseek-ai/dsh-llm";
 import { defineTool } from "@deepseek-ai/dsh-tools";
 
+// src/plugin/tools.ts
+import { execSync } from "node:child_process";
+
 // src/plugin/engine/errors.ts
 var GoalAcceptanceError = class extends Error {
   code;
-  constructor(message, code) {
-    super(`goal-acceptance: ${message}`);
+  hint;
+  constructor(message, code, hint) {
+    const fullMessage = hint ? `goal-acceptance: ${message} (Hint: ${hint})` : `goal-acceptance: ${message}`;
+    super(fullMessage);
     this.code = code;
+    this.hint = hint;
     this.name = "GoalAcceptanceError";
   }
 };
@@ -244,11 +251,17 @@ var GoalAcceptanceEngine = class {
     this.sync();
     const existing = this.state.criteria.get(spec.criterionId);
     if (existing === void 0) {
-      throw new GoalAcceptanceError(`criterion "${spec.criterionId}" not found`, "GOAL_ACCEPTANCE_CRITERION_NOT_FOUND");
+      const available = Array.from(this.state.criteria.keys());
+      const hint = available.length > 0 ? `Available criterion IDs: [${available.map((id) => `"${id}"`).join(", ")}]. Call get_acceptance_criteria to inspect full list.` : "No criteria have been set for this goal yet. Call set_acceptance_criteria or quick_start_goal first.";
+      throw new GoalAcceptanceError(`criterion "${spec.criterionId}" not found`, "GOAL_ACCEPTANCE_CRITERION_NOT_FOUND", hint);
     }
     const requiresEvidence = spec.status === "passed" || spec.status === "failed";
     if (requiresEvidence && (typeof spec.evidence !== "string" || spec.evidence.trim().length === 0)) {
-      throw new GoalAcceptanceError(`evidence is required when setting criterion to "${spec.status}"`, "GOAL_ACCEPTANCE_EVIDENCE_REQUIRED");
+      throw new GoalAcceptanceError(
+        `evidence is required when setting criterion to "${spec.status}"`,
+        "GOAL_ACCEPTANCE_EVIDENCE_REQUIRED",
+        "Provide command output, test run logs, or file verification content via evidence parameter, or use run_and_validate tool."
+      );
     }
     const evidenceType = spec.evidenceType ?? "text";
     const selfClaimed = spec.status === "passed" && this.state.role === "agent";
@@ -845,14 +858,18 @@ var CRITERION_ITEM_SCHEMA = {
   additionalProperties: false,
   required: ["id", "description"],
   properties: {
-    id: { type: "string", description: "Short unique identifier." },
-    description: { type: "string", description: "Concrete requirement." },
-    required: { type: "boolean", description: "Whether required for goal completion." },
-    method: { type: "string", description: "Verification method: test, command, browser, manual." },
+    id: { type: "string", description: 'Short unique identifier (e.g. "api-health", "test-pass").' },
+    description: { type: "string", description: "Concrete requirement description." },
+    required: { type: "boolean", description: "Whether required for goal completion. Defaults to true." },
+    method: {
+      type: "string",
+      enum: ["command", "file", "url", "manual"],
+      description: "Verification method: command (runs shell/test), file (checks file content), url (HTTP request), or manual."
+    },
     task_ids: {
       type: "array",
       items: { type: "string" },
-      description: "Task IDs linked to this criterion."
+      description: "Task IDs linked to this criterion for automatic progress tracking."
     },
     depends_on: {
       type: "array",
@@ -908,7 +925,8 @@ function suggestClosest(input, candidates, threshold = 3) {
 function fail(e) {
   const message = e instanceof Error ? e.message : String(e);
   const code = e instanceof GoalAcceptanceError ? e.code : "GOAL_ACCEPTANCE_INTERNAL_ERROR";
-  return { error: message, code };
+  const hint = e instanceof GoalAcceptanceError ? e.hint : void 0;
+  return { error: message, code, ...hint ? { hint } : {} };
 }
 function slimSummary(s) {
   return {
@@ -1382,6 +1400,168 @@ var tools = [
     }
   },
   {
+    name: "run_and_validate",
+    description: [
+      "Execute a shell command, capture its real stdout/stderr/exitCode, and validate the criterion in one call.",
+      'This guarantees high-confidence evidence_type="command" and eliminates copy-paste errors or missing evidence.',
+      'If command exit code is 0, status defaults to "passed". If non-zero, status defaults to "failed".'
+    ].join("\n"),
+    inputSchema: {
+      type: "object",
+      additionalProperties: false,
+      required: ["criterion_id", "command"],
+      properties: {
+        criterion_id: { type: "string", description: "Criterion ID to validate." },
+        command: { type: "string", description: 'Shell command to execute (e.g. "pnpm test", "git status").' },
+        cwd: { type: "string", description: "Optional working directory for the command execution." },
+        timeout_ms: { type: "number", description: "Optional timeout in milliseconds (default 60000)." },
+        verbose: { type: "boolean", description: "Default false: slim summary. true: full summary." }
+      }
+    },
+    handler: async (args, ctx) => {
+      const mgr = getManager(ctx.config);
+      const engine = mgr.getEngine();
+      const criterionId = args.criterion_id;
+      const command = args.command;
+      const cwd = typeof args.cwd === "string" && args.cwd.trim().length > 0 ? args.cwd.trim() : void 0;
+      const timeout = typeof args.timeout_ms === "number" && args.timeout_ms > 0 ? args.timeout_ms : 6e4;
+      let stdout = "";
+      let stderr = "";
+      let exitCode = 0;
+      try {
+        stdout = execSync(command, {
+          cwd,
+          timeout,
+          encoding: "utf8",
+          stdio: ["pipe", "pipe", "pipe"],
+          maxBuffer: 4 * 1024 * 1024
+        });
+      } catch (err) {
+        const execErr = err;
+        stdout = execErr.stdout ?? "";
+        stderr = execErr.stderr ?? (execErr.message || String(err));
+        exitCode = typeof execErr.status === "number" ? execErr.status : 1;
+      }
+      const status = exitCode === 0 ? "passed" : "failed";
+      const rawEvidence = [
+        `$ ${command}`,
+        stdout.trim() ? `[stdout]
+${stdout.trim()}` : "",
+        stderr.trim() ? `[stderr]
+${stderr.trim()}` : "",
+        `[exit code] ${exitCode}`
+      ].filter(Boolean).join("\n\n");
+      try {
+        const updated = await engine.validateCriterion({
+          criterionId,
+          status,
+          evidence: rawEvidence,
+          evidenceType: "command"
+        });
+        const verbose = args.verbose === true;
+        const summary = engine.summarize();
+        return {
+          goalId: mgr.getCurrentGoalId(),
+          criterion: updated,
+          commandOutput: {
+            exitCode,
+            stdout: stdout.length > 2e3 ? `${stdout.slice(0, 2e3)}... (truncated)` : stdout,
+            stderr: stderr.length > 2e3 ? `${stderr.slice(0, 2e3)}... (truncated)` : stderr
+          },
+          summary: verbose ? summary : slimSummary(summary)
+        };
+      } catch (e) {
+        if (e instanceof GoalAcceptanceError && e.code === "GOAL_ACCEPTANCE_CRITERION_NOT_FOUND") {
+          const allIds = engine.getCriteria().map((c) => c.id);
+          const suggestion = suggestClosest(criterionId, allIds);
+          return fail(new GoalAcceptanceError(
+            `criterion_id "${criterionId}" not found. Available IDs: [${allIds.join(", ")}].${suggestion ? ` Did you mean "${suggestion}"?` : ""} Call get_acceptance_criteria to see the full list.`,
+            "GOAL_ACCEPTANCE_CRITERION_NOT_FOUND"
+          ));
+        }
+        return fail(e);
+      }
+    }
+  },
+  {
+    name: "quick_start_goal",
+    description: [
+      "Fast-path convenience tool: Start or rotate a goal, lock acceptance criteria, and optionally set task plan all in ONE call.",
+      "Recommended for AI agents starting multi-step tasks to avoid multiple round-trips."
+    ].join("\n"),
+    inputSchema: {
+      type: "object",
+      additionalProperties: false,
+      required: ["criteria"],
+      properties: {
+        title: { type: "string", description: "Optional short goal title." },
+        role: {
+          type: "string",
+          enum: ["agent", "reviewer", "dual"],
+          description: "Role locking criteria. agent (default): passed is self-claimed. dual/reviewer: formal pass immediately."
+        },
+        criteria: {
+          type: "array",
+          items: CRITERION_ITEM_SCHEMA,
+          description: "Initial criteria to lock for this goal."
+        },
+        tasks: {
+          type: "array",
+          items: TASK_PLAN_ITEM_SCHEMA,
+          description: "Optional task plan to lock simultaneously."
+        }
+      }
+    },
+    handler: async (args, ctx) => {
+      const mgr = getManager(ctx.config);
+      try {
+        const title = args.title;
+        const rawCriteria = args.criteria ?? [];
+        const rawTasks = args.tasks;
+        const role = args.role ?? "agent";
+        const mappedCriteria = rawCriteria.map(mapCriterion);
+        if (title !== void 0) mgr.startGoal(title);
+        let engine = mgr.ensureGoal();
+        let list;
+        let previousGoalId;
+        let previousGoalIncomplete = false;
+        let previousGoalReason;
+        let previousGoalSummary;
+        try {
+          list = await engine.setCriteria(mappedCriteria, role);
+        } catch (e) {
+          if (e instanceof GoalAcceptanceError && e.code === "GOAL_ACCEPTANCE_ALREADY_LOCKED") {
+            previousGoalId = mgr.getCurrentGoalId() ?? void 0;
+            const completion = engine.canComplete();
+            previousGoalSummary = slimSummary(engine.summarize());
+            previousGoalIncomplete = !completion.allowed;
+            previousGoalReason = completion.reason;
+            mgr.startGoal(title);
+            engine = mgr.getEngine();
+            list = await engine.setCriteria(mappedCriteria, role);
+          } else {
+            throw e;
+          }
+        }
+        let taskPlanRes;
+        if (Array.isArray(rawTasks) && rawTasks.length > 0) {
+          taskPlanRes = await engine.setTaskPlan(rawTasks.map(mapTask));
+        }
+        const summary = engine.summarize();
+        return {
+          goalId: mgr.getCurrentGoalId(),
+          ...previousGoalId ? { previousGoalId, previousGoalIncomplete, previousGoalReason, previousGoalSummary, autoStarted: true } : {},
+          criteria: list,
+          taskPlan: taskPlanRes,
+          summary: slimSummary(summary),
+          message: "Goal initialized and locked successfully."
+        };
+      } catch (e) {
+        return fail(e);
+      }
+    }
+  },
+  {
     name: "reset_goal",
     description: "Delete the current goal and all its data (criteria, task plan, validations). The goal is permanently removed. Use this to clear a messed-up goal and start fresh.",
     inputSchema: {
@@ -1404,7 +1584,7 @@ var tools = [
 // src/plugin/manifest.ts
 var manifest = {
   name: "@cckyros/goal-acceptance",
-  version: "0.2.1",
+  version: "0.2.2",
   // 0.1.x monorepo → 0.2.0 single-package scaffold
   brand: "goal-acceptance",
   description: "Acceptance-criteria-driven goal completion for autonomous agents.",
@@ -1655,7 +1835,11 @@ var CRITERION_ITEM_SCHEMA2 = {
     id: { type: "string", required: true, description: 'Short unique identifier (e.g. "auth-1", "test-pass").' },
     description: { type: "string", required: true, description: "Concrete requirement description." },
     required: { type: "boolean", description: "Whether required for goal completion. Defaults to true." },
-    method: { type: "string", description: 'Verification method: "test", "command", "browser", "manual".' },
+    method: {
+      type: "string",
+      enum: ["command", "file", "url", "manual"],
+      description: 'Verification method: "command", "file", "url", or "manual".'
+    },
     task_ids: {
       type: "array",
       items: { type: "string" },
@@ -1985,6 +2169,139 @@ function createAcceptanceTools(ctx) {
     },
     presentCall: (args) => present("Switch goal", "other", args)
   });
+  const runAndValidateTool = defineTool({
+    name: "run_and_validate",
+    description: description("run_and_validate"),
+    parameters: {
+      criterion_id: { type: "string", required: true, description: "Criterion ID to validate." },
+      command: { type: "string", required: true, description: "Shell command to execute." },
+      cwd: { type: "string", description: "Optional working directory." },
+      timeout_ms: { type: "number", description: "Optional timeout in milliseconds." },
+      verbose: { type: "boolean", description: "Default false: slim summary. true: full summary." }
+    },
+    output: { schema: OUTPUT_OBJECT_SCHEMA, render: (_a, v) => [{ type: "text", text: JSON.stringify(v, null, 2) }] },
+    execute(args, exec) {
+      const { agent, service } = requireService(exec);
+      const criterionId = args.criterion_id;
+      const command = args.command;
+      const cwd = typeof args.cwd === "string" && args.cwd.trim().length > 0 ? args.cwd.trim() : void 0;
+      const timeout = typeof args.timeout_ms === "number" && args.timeout_ms > 0 ? args.timeout_ms : 6e4;
+      let stdout = "";
+      let stderr = "";
+      let exitCode = 0;
+      try {
+        stdout = execSync2(command, {
+          cwd,
+          timeout,
+          encoding: "utf8",
+          stdio: ["pipe", "pipe", "pipe"],
+          maxBuffer: 4 * 1024 * 1024
+        });
+      } catch (err) {
+        const execErr = err;
+        stdout = execErr.stdout ?? "";
+        stderr = execErr.stderr ?? (execErr.message || String(err));
+        exitCode = typeof execErr.status === "number" ? execErr.status : 1;
+      }
+      const status = exitCode === 0 ? "passed" : "failed";
+      const rawEvidence = [
+        `$ ${command}`,
+        stdout.trim() ? `[stdout]
+${stdout.trim()}` : "",
+        stderr.trim() ? `[stderr]
+${stderr.trim()}` : "",
+        `[exit code] ${exitCode}`
+      ].filter(Boolean).join("\n\n");
+      return service.validateCriterion(agent, {
+        criterionId,
+        status,
+        evidence: rawEvidence,
+        evidenceType: "command"
+      }).then((updated) => ({
+        criterion: updated,
+        goalId: service.getActiveGoalId(agent),
+        commandOutput: { exitCode, stdout, stderr },
+        summary: service.summarize(agent)
+      }));
+    },
+    presentCall: (args) => present(`Run and validate criterion "${String(args.criterion_id)}"`, "other", args)
+  });
+  const quickStartTool = defineTool({
+    name: "quick_start_goal",
+    description: description("quick_start_goal"),
+    parameters: {
+      title: { type: "string", description: "Optional short goal title." },
+      role: { type: "string", enum: ["agent", "reviewer", "dual"], description: "Role locking criteria." },
+      criteria: { type: "array", required: true, items: CRITERION_ITEM_SCHEMA2 },
+      tasks: { type: "array", items: TASK_PLAN_ITEM_SCHEMA2 }
+    },
+    output: { schema: OUTPUT_OBJECT_SCHEMA, render: (_a, v) => [{ type: "text", text: JSON.stringify(v, null, 2) }] },
+    async execute(args, exec) {
+      const { agent, service } = requireService(exec);
+      const rawCriteria = args.criteria;
+      const rawTasks = args.tasks;
+      const mappedCriteria = rawCriteria.map((c) => ({
+        id: c.id,
+        description: c.description,
+        ...c.required !== void 0 ? { required: c.required } : {},
+        ...c.method !== void 0 ? { method: c.method } : {},
+        ...c.task_ids !== void 0 ? { taskIds: c.task_ids } : {},
+        ...c.depends_on !== void 0 ? { dependsOn: c.depends_on } : {}
+      }));
+      const role = args.role ?? "agent";
+      const title = args.title;
+      try {
+        if (title !== void 0) await service.startGoal(agent, title);
+        const criteria = await service.setCriteria(agent, mappedCriteria, role);
+        let taskPlan;
+        if (Array.isArray(rawTasks) && rawTasks.length > 0) {
+          taskPlan = await service.setTaskPlan(agent, rawTasks.map((t) => ({
+            id: t.id,
+            description: t.description,
+            deliverable: t.deliverable,
+            ...t.depends_on !== void 0 ? { dependsOn: t.depends_on } : {}
+          })));
+        }
+        return {
+          goalId: service.getActiveGoalId(agent),
+          criteria,
+          taskPlan,
+          summary: service.summarize(agent),
+          message: "Goal initialized and locked successfully."
+        };
+      } catch (e) {
+        if (e instanceof GoalAcceptanceError && e.code === "GOAL_ACCEPTANCE_ALREADY_LOCKED") {
+          const previousGoalId = service.getActiveGoalId(agent);
+          const completion = service.canComplete(agent);
+          const previousGoalSummary = slimSummary2(service.summarize(agent));
+          await service.startGoal(agent, title);
+          const criteria = await service.setCriteria(agent, mappedCriteria, role);
+          let taskPlan;
+          if (Array.isArray(rawTasks) && rawTasks.length > 0) {
+            taskPlan = await service.setTaskPlan(agent, rawTasks.map((t) => ({
+              id: t.id,
+              description: t.description,
+              deliverable: t.deliverable,
+              ...t.depends_on !== void 0 ? { dependsOn: t.depends_on } : {}
+            })));
+          }
+          return {
+            goalId: service.getActiveGoalId(agent),
+            previousGoalId,
+            autoStarted: true,
+            previousGoalIncomplete: !completion.allowed,
+            ...completion.allowed ? {} : { previousGoalReason: completion.reason, previousGoalSummary },
+            criteria,
+            taskPlan,
+            summary: service.summarize(agent),
+            message: "Goal rotated and locked successfully."
+          };
+        }
+        throw e;
+      }
+    },
+    presentCall: (args) => present("Quick start goal", "other", args)
+  });
   const resetTool = defineTool({
     name: "reset_goal",
     description: description("reset_goal"),
@@ -1997,7 +2314,7 @@ function createAcceptanceTools(ctx) {
     },
     presentCall: () => present("Reset goal", "other")
   });
-  return [setTool, getTool, validateTool, confirmTool, updateTaskTool, amendTool, canCompleteTool, setPlanTool, getPlanTool, startTool, listTool, switchTool, resetTool];
+  return [setTool, getTool, validateTool, confirmTool, updateTaskTool, amendTool, canCompleteTool, setPlanTool, getPlanTool, startTool, listTool, switchTool, runAndValidateTool, quickStartTool, resetTool];
 }
 async function apply2(ctx, config = {}) {
   const autoSteer = config.autoSteerUncompleted !== false;

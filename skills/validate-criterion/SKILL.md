@@ -7,6 +7,10 @@ After executing work, call this to validate each acceptance criterion.
 Statuses `passed` and `failed` require concrete evidence from actual
 execution.
 
+💡 **Fast-path**: Use the `run_and_validate` tool to automatically execute a
+shell command and record stdout/stderr/exitCode as high-confidence evidence in
+a single call.
+
 ## Evidence Requirements
 
 **You MUST run the actual command or check before validating.** Do NOT

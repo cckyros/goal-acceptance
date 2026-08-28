@@ -18,6 +18,7 @@
  * transcript — behavior equivalent to the pre-refactor dsh plugin.
  */
 
+import { execSync } from 'node:child_process'
 import { randomUUID } from 'node:crypto'
 import type { Context } from '@deepseek-ai/cordis'
 import { Service } from '@deepseek-ai/cordis'
@@ -216,7 +217,11 @@ const CRITERION_ITEM_SCHEMA = {
     id: { type: 'string', required: true, description: 'Short unique identifier (e.g. "auth-1", "test-pass").' },
     description: { type: 'string', required: true, description: 'Concrete requirement description.' },
     required: { type: 'boolean', description: 'Whether required for goal completion. Defaults to true.' },
-    method: { type: 'string', description: 'Verification method: "test", "command", "browser", "manual".' },
+    method: {
+      type: 'string',
+      enum: ['command', 'file', 'url', 'manual'],
+      description: 'Verification method: "command", "file", "url", or "manual".',
+    },
     task_ids: {
       type: 'array',
       items: { type: 'string' },
@@ -546,6 +551,143 @@ export function createAcceptanceTools(ctx: Context): ToolDefinition[] {
     presentCall: args => present('Switch goal', 'other', args),
   })
 
+  const runAndValidateTool = defineTool({
+    name: 'run_and_validate',
+    description: description('run_and_validate'),
+    parameters: {
+      criterion_id: { type: 'string', required: true, description: 'Criterion ID to validate.' },
+      command: { type: 'string', required: true, description: 'Shell command to execute.' },
+      cwd: { type: 'string', description: 'Optional working directory.' },
+      timeout_ms: { type: 'number', description: 'Optional timeout in milliseconds.' },
+      verbose: { type: 'boolean', description: 'Default false: slim summary. true: full summary.' },
+    },
+    output: { schema: OUTPUT_OBJECT_SCHEMA, render: (_a: unknown, v: unknown) => [{ type: 'text' as const, text: JSON.stringify(v, null, 2) }] },
+    execute(args, exec) {
+      const { agent, service } = requireService(exec)
+      const criterionId = args.criterion_id as string
+      const command = args.command as string
+      const cwd = typeof args.cwd === 'string' && args.cwd.trim().length > 0 ? args.cwd.trim() : undefined
+      const timeout = typeof args.timeout_ms === 'number' && args.timeout_ms > 0 ? args.timeout_ms : 60000
+
+      let stdout = ''
+      let stderr = ''
+      let exitCode = 0
+      try {
+        stdout = execSync(command, {
+          cwd,
+          timeout,
+          encoding: 'utf8',
+          stdio: ['pipe', 'pipe', 'pipe'],
+          maxBuffer: 4 * 1024 * 1024,
+        })
+      } catch (err: unknown) {
+        const execErr = err as { stdout?: string; stderr?: string; status?: number; message?: string }
+        stdout = execErr.stdout ?? ''
+        stderr = execErr.stderr ?? (execErr.message || String(err))
+        exitCode = typeof execErr.status === 'number' ? execErr.status : 1
+      }
+
+      const status: GoalCriterionStatus = exitCode === 0 ? 'passed' : 'failed'
+      const rawEvidence = [
+        `$ ${command}`,
+        stdout.trim() ? `[stdout]\n${stdout.trim()}` : '',
+        stderr.trim() ? `[stderr]\n${stderr.trim()}` : '',
+        `[exit code] ${exitCode}`,
+      ].filter(Boolean).join('\n\n')
+
+      return service.validateCriterion(agent, {
+        criterionId,
+        status,
+        evidence: rawEvidence,
+        evidenceType: 'command',
+      }).then(updated => ({
+        criterion: updated,
+        goalId: service.getActiveGoalId(agent),
+        commandOutput: { exitCode, stdout, stderr },
+        summary: service.summarize(agent),
+      })) as never
+    },
+    presentCall: args => present(`Run and validate criterion "${String(args.criterion_id)}"`, 'other', args),
+  })
+
+  const quickStartTool = defineTool({
+    name: 'quick_start_goal',
+    description: description('quick_start_goal'),
+    parameters: {
+      title: { type: 'string', description: 'Optional short goal title.' },
+      role: { type: 'string', enum: ['agent', 'reviewer', 'dual'], description: 'Role locking criteria.' },
+      criteria: { type: 'array', required: true, items: CRITERION_ITEM_SCHEMA },
+      tasks: { type: 'array', items: TASK_PLAN_ITEM_SCHEMA },
+    },
+    output: { schema: OUTPUT_OBJECT_SCHEMA, render: (_a: unknown, v: unknown) => [{ type: 'text' as const, text: JSON.stringify(v, null, 2) }] },
+    async execute(args, exec) {
+      const { agent, service } = requireService(exec)
+      const rawCriteria = args.criteria as Array<{ id: string; description: string; required?: boolean; method?: string; task_ids?: string[]; depends_on?: string[] }>
+      const rawTasks = args.tasks as Array<{ id: string; description: string; deliverable: string; depends_on?: string[] }> | undefined
+      const mappedCriteria = rawCriteria.map(c => ({
+        id: c.id,
+        description: c.description,
+        ...c.required !== undefined ? { required: c.required } : {},
+        ...c.method !== undefined ? { method: c.method } : {},
+        ...c.task_ids !== undefined ? { taskIds: c.task_ids } : {},
+        ...c.depends_on !== undefined ? { dependsOn: c.depends_on } : {},
+      }))
+      const role = (args.role as GoalRole | undefined) ?? 'agent'
+      const title = args.title as string | undefined
+
+      try {
+        if (title !== undefined) await service.startGoal(agent, title)
+        const criteria = await service.setCriteria(agent, mappedCriteria, role)
+        let taskPlan
+        if (Array.isArray(rawTasks) && rawTasks.length > 0) {
+          taskPlan = await service.setTaskPlan(agent, rawTasks.map(t => ({
+            id: t.id,
+            description: t.description,
+            deliverable: t.deliverable,
+            ...t.depends_on !== undefined ? { dependsOn: t.depends_on } : {},
+          })))
+        }
+        return {
+          goalId: service.getActiveGoalId(agent),
+          criteria,
+          taskPlan,
+          summary: service.summarize(agent),
+          message: 'Goal initialized and locked successfully.',
+        } as never
+      } catch (e) {
+        if (e instanceof GoalAcceptanceError && e.code === 'GOAL_ACCEPTANCE_ALREADY_LOCKED') {
+          const previousGoalId = service.getActiveGoalId(agent)
+          const completion = service.canComplete(agent)
+          const previousGoalSummary = slimSummary(service.summarize(agent))
+          await service.startGoal(agent, title)
+          const criteria = await service.setCriteria(agent, mappedCriteria, role)
+          let taskPlan
+          if (Array.isArray(rawTasks) && rawTasks.length > 0) {
+            taskPlan = await service.setTaskPlan(agent, rawTasks.map(t => ({
+              id: t.id,
+              description: t.description,
+              deliverable: t.deliverable,
+              ...t.depends_on !== undefined ? { dependsOn: t.depends_on } : {},
+            })))
+          }
+          return {
+            goalId: service.getActiveGoalId(agent),
+            previousGoalId,
+            autoStarted: true,
+            previousGoalIncomplete: !completion.allowed,
+            ...completion.allowed ? {} : { previousGoalReason: completion.reason, previousGoalSummary },
+            criteria,
+            taskPlan,
+            summary: service.summarize(agent),
+            message: 'Goal rotated and locked successfully.',
+          } as never
+        }
+        throw e
+      }
+    },
+    presentCall: args => present('Quick start goal', 'other', args),
+  })
+
   const resetTool = defineTool({
     name: 'reset_goal', description: description('reset_goal'), parameters: {},
     output: { schema: OUTPUT_OBJECT_SCHEMA, render: (_a: unknown, v: unknown) => [{ type: 'text' as const, text: JSON.stringify(v, null, 2) }] },
@@ -553,7 +695,7 @@ export function createAcceptanceTools(ctx: Context): ToolDefinition[] {
     presentCall: () => present('Reset goal', 'other'),
   })
 
-  return [setTool, getTool, validateTool, confirmTool, updateTaskTool, amendTool, canCompleteTool, setPlanTool, getPlanTool, startTool, listTool, switchTool, resetTool]
+  return [setTool, getTool, validateTool, confirmTool, updateTaskTool, amendTool, canCompleteTool, setPlanTool, getPlanTool, startTool, listTool, switchTool, runAndValidateTool, quickStartTool, resetTool]
 }
 
 // ------------------------------------------------------------------ apply

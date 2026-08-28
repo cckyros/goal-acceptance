@@ -281,12 +281,20 @@ export class GoalAcceptanceEngine {
 
     const existing = this.state.criteria.get(spec.criterionId)
     if (existing === undefined) {
-      throw new GoalAcceptanceError(`criterion "${spec.criterionId}" not found`, 'GOAL_ACCEPTANCE_CRITERION_NOT_FOUND')
+      const available = Array.from(this.state.criteria.keys())
+      const hint = available.length > 0
+        ? `Available criterion IDs: [${available.map(id => `"${id}"`).join(', ')}]. Call get_acceptance_criteria to inspect full list.`
+        : 'No criteria have been set for this goal yet. Call set_acceptance_criteria or quick_start_goal first.'
+      throw new GoalAcceptanceError(`criterion "${spec.criterionId}" not found`, 'GOAL_ACCEPTANCE_CRITERION_NOT_FOUND', hint)
     }
 
     const requiresEvidence = spec.status === 'passed' || spec.status === 'failed'
     if (requiresEvidence && (typeof spec.evidence !== 'string' || spec.evidence.trim().length === 0)) {
-      throw new GoalAcceptanceError(`evidence is required when setting criterion to "${spec.status}"`, 'GOAL_ACCEPTANCE_EVIDENCE_REQUIRED')
+      throw new GoalAcceptanceError(
+        `evidence is required when setting criterion to "${spec.status}"`,
+        'GOAL_ACCEPTANCE_EVIDENCE_REQUIRED',
+        'Provide command output, test run logs, or file verification content via evidence parameter, or use run_and_validate tool.',
+      )
     }
 
     const evidenceType: EvidenceType = spec.evidenceType ?? 'text'

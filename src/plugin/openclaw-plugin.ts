@@ -8,7 +8,8 @@
  * GoalManager instance per process, dataDir resolved lazily from the first
  * pluginConfig (same stick-after-first-use semantics as the original).
  */
-import { GoalAcceptanceError } from './engine/index.ts'
+import { execSync } from 'node:child_process'
+import { GoalAcceptanceError, type GoalCriterion, type GoalTask } from './engine/index.ts'
 import { GoalManager } from './goal-manager.ts'
 import { defineToolPlugin } from 'openclaw/plugin-sdk/tool-plugin'
 import { Type } from 'typebox'
@@ -26,10 +27,15 @@ function getManager(cfg: { dataDir?: string } | undefined): GoalManager {
 // --- Schemas (unchanged from the original package) ---
 
 const CriterionItem = Type.Object({
-  id: Type.String({ description: 'Short unique identifier.' }),
-  description: Type.String({ description: 'Concrete requirement.' }),
-  required: Type.Optional(Type.Boolean({ description: 'Whether required for goal completion.' })),
-  method: Type.Optional(Type.String({ description: 'Verification method: test, command, browser, manual.' })),
+  id: Type.String({ description: 'Short unique identifier (e.g. "api-health", "test-pass").' }),
+  description: Type.String({ description: 'Concrete requirement description.' }),
+  required: Type.Optional(Type.Boolean({ description: 'Whether required for goal completion. Defaults to true.' })),
+  method: Type.Optional(Type.Union([
+    Type.Literal('command'),
+    Type.Literal('file'),
+    Type.Literal('url'),
+    Type.Literal('manual'),
+  ], { description: 'Verification method: command, file, url, or manual.' })),
   task_ids: Type.Optional(Type.Array(Type.String(), { description: 'Task IDs linked to this criterion.' })),
   depends_on: Type.Optional(Type.Array(Type.String(), { description: 'IDs of criteria that must be passed before this one.' })),
 })
@@ -317,6 +323,112 @@ export default defineToolPlugin({
       },
     }),
 
+    tool({
+      name: 'run_and_validate',
+      description: 'Execute a shell command, capture its real stdout/stderr/exitCode, and validate the criterion in one call. Guarantees high-confidence command evidence.',
+      parameters: Type.Object({
+        criterion_id: Type.String({ description: 'Criterion ID to validate.' }),
+        command: Type.String({ description: 'Shell command to execute.' }),
+        cwd: Type.Optional(Type.String({ description: 'Optional working directory.' })),
+        timeout_ms: Type.Optional(Type.Number({ description: 'Optional timeout in milliseconds.' })),
+        verbose: Type.Optional(Type.Boolean({ description: 'Default false: slim summary. true: full summary.' })),
+      }),
+      execute: async (params, config) => {
+        const mgr = getManager(config)
+        const eng = mgr.getEngine()
+        let stdout = ''
+        let stderr = ''
+        let exitCode = 0
+        try {
+          stdout = execSync(params.command, {
+            cwd: params.cwd,
+            timeout: params.timeout_ms || 60000,
+            encoding: 'utf8',
+            stdio: ['pipe', 'pipe', 'pipe'],
+            maxBuffer: 4 * 1024 * 1024,
+          })
+        } catch (err: unknown) {
+          const execErr = err as { stdout?: string; stderr?: string; status?: number; message?: string }
+          stdout = execErr.stdout ?? ''
+          stderr = execErr.stderr ?? (execErr.message || String(err))
+          exitCode = typeof execErr.status === 'number' ? execErr.status : 1
+        }
+        const status = exitCode === 0 ? 'passed' : 'failed'
+        const rawEvidence = [
+          `$ ${params.command}`,
+          stdout.trim() ? `[stdout]\n${stdout.trim()}` : '',
+          stderr.trim() ? `[stderr]\n${stderr.trim()}` : '',
+          `[exit code] ${exitCode}`,
+        ].filter(Boolean).join('\n\n')
+
+        const updated = await eng.validateCriterion({
+          criterionId: params.criterion_id,
+          status,
+          evidence: rawEvidence,
+          evidenceType: 'command',
+        })
+        const verbose = params.verbose === true
+        const summary = eng.summarize()
+        return {
+          goalId: mgr.getCurrentGoalId(),
+          criterion: updated,
+          commandOutput: { exitCode, stdout, stderr },
+          summary: verbose ? summary : slimSummary(summary),
+        }
+      },
+    }),
+    tool({
+      name: 'quick_start_goal',
+      description: 'Fast-path tool: Start/rotate a goal, lock criteria, and optionally set task plan all in ONE call.',
+      parameters: Type.Object({
+        title: Type.Optional(Type.String({ description: 'Optional short goal title.' })),
+        role: Type.Optional(Type.Union([Type.Literal('agent'), Type.Literal('reviewer'), Type.Literal('dual')], { description: 'Role locking criteria.' })),
+        criteria: Type.Array(CriterionItem, { description: 'Initial criteria to lock.' }),
+        tasks: Type.Optional(Type.Array(TaskPlanItem, { description: 'Optional task plan.' })),
+      }),
+      execute: async (params, config) => {
+        const mgr = getManager(config)
+        const role = params.role || 'agent'
+        if (params.title !== undefined) mgr.startGoal(params.title)
+        let engine = mgr.ensureGoal()
+        let list: GoalCriterion[]
+        let previousGoalId: string | undefined
+        let previousGoalIncomplete = false
+        let previousGoalReason: string | undefined
+        let previousGoalSummary: ReturnType<typeof slimSummary> | undefined
+        try {
+          list = await engine.setCriteria(params.criteria.map(mapCriterion), role)
+        } catch (e) {
+          if (e instanceof GoalAcceptanceError && e.code === 'GOAL_ACCEPTANCE_ALREADY_LOCKED') {
+            previousGoalId = mgr.getCurrentGoalId() ?? undefined
+            const completion = engine.canComplete()
+            previousGoalSummary = slimSummary(engine.summarize())
+            previousGoalIncomplete = !completion.allowed
+            previousGoalReason = completion.reason
+            mgr.startGoal(params.title)
+            engine = mgr.getEngine()
+            list = await engine.setCriteria(params.criteria.map(mapCriterion), role)
+          } else {
+            throw e
+          }
+        }
+
+        let taskPlanRes: GoalTask[] | undefined
+        if (Array.isArray(params.tasks) && params.tasks.length > 0) {
+          taskPlanRes = await engine.setTaskPlan(params.tasks.map(mapTask))
+        }
+
+        const summary = engine.summarize()
+        return {
+          goalId: mgr.getCurrentGoalId(),
+          ...previousGoalId ? { previousGoalId, previousGoalIncomplete, previousGoalReason, previousGoalSummary, autoStarted: true } : {},
+          criteria: list,
+          taskPlan: taskPlanRes,
+          summary: slimSummary(summary),
+          message: 'Goal initialized and locked successfully.',
+        }
+      },
+    }),
     tool({
       name: 'reset_goal',
       description: 'Delete the current goal and all its data (criteria, task plan, validations). The goal is permanently removed. Use this to clear a messed-up goal and start fresh.',

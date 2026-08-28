@@ -1,7 +1,7 @@
 {
   "$schema": "https://agent-plugins.org/schemas/1.0.0/plugin.schema.json",
   "name": "goal-acceptance",
-  "version": "0.2.1",
+  "version": "0.2.2",
   "description": "Acceptance-criteria-driven goal completion for autonomous agents.",
   "author": {
     "name": "cckyros"

@@ -33,7 +33,7 @@ test("initialize returns the manifest's identity", () => {
   assert.equal(res.result?.serverInfo?.version, manifest.version);
 });
 
-test("tools/list exposes all 13 manifest tools", () => {
+test("tools/list exposes all manifest tools", () => {
   const [res] = mcpSession([JSON.stringify({ jsonrpc: "2.0", id: 2, method: "tools/list" })]);
   const names = res.result?.tools?.map((t) => t.name) ?? [];
   assert.equal(names.length, manifest.tools.length);
@@ -111,6 +111,55 @@ test("tools/call against no active goal returns a structured error", () => {
   const data = JSON.parse(text);
   assert.equal(data.code, "GOAL_ACCEPTANCE_NO_ACTIVE_GOAL");
   assert.ok(data.error.includes("no active goal"), data.error);
+});
+
+test("tools/call quick_start_goal initializes goal and task plan in one call", () => {
+  const [res] = mcpSession([
+    JSON.stringify({
+      jsonrpc: "2.0",
+      id: 10,
+      method: "tools/call",
+      params: {
+        name: "quick_start_goal",
+        arguments: {
+          title: "quick test",
+          criteria: [{ id: "c1", description: "check node version", required: true, method: "command" }],
+          tasks: [{ id: "t1", description: "run node -v", deliverable: "version string" }],
+        },
+      },
+    }),
+  ]);
+  const data = JSON.parse(res.result?.content?.[0]?.text ?? "{}");
+  assert.ok(data.goalId);
+  assert.equal(data.criteria.length, 1);
+  assert.equal(data.taskPlan.length, 1);
+});
+
+test("tools/call run_and_validate executes command and records evidence", () => {
+  const [init, run] = mcpSession([
+    JSON.stringify({
+      jsonrpc: "2.0",
+      id: 11,
+      method: "tools/call",
+      params: {
+        name: "set_acceptance_criteria",
+        arguments: { criteria: [{ id: "exec-test", description: "test echo", required: true, method: "command" }] },
+      },
+    }),
+    JSON.stringify({
+      jsonrpc: "2.0",
+      id: 12,
+      method: "tools/call",
+      params: {
+        name: "run_and_validate",
+        arguments: { criterion_id: "exec-test", command: "node -e \"console.log('hello_eval')\"" },
+      },
+    }),
+  ]);
+  const data = JSON.parse(run.result?.content?.[0]?.text ?? "{}");
+  assert.equal(data.criterion.status, "passed");
+  assert.equal(data.commandOutput.exitCode, 0);
+  assert.ok(data.criterion.evidence.includes("hello_eval"));
 });
 
 test("tools/call unknown tool returns a JSON-RPC error", () => {

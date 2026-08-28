@@ -5,8 +5,9 @@
  * goal-acceptance-mcp server (13 tools, same names/descriptions/schemas).
  */
 
+import { execSync } from 'node:child_process'
 import type { ToolContext, ToolDef } from "../framework/manifest.ts";
-import { GoalAcceptanceError, type EvidenceType, type GoalCriterionStatus, type GoalRole, type TaskStatus } from "./engine/index.ts";
+import { GoalAcceptanceError, type EvidenceType, type GoalCriterion, type GoalCriterionStatus, type GoalRole, type GoalTask, type TaskStatus } from "./engine/index.ts";
 import { GoalManager } from "./goal-manager.ts";
 
 const CRITERION_ITEM_SCHEMA = {
@@ -14,14 +15,18 @@ const CRITERION_ITEM_SCHEMA = {
   additionalProperties: false,
   required: ['id', 'description'],
   properties: {
-    id: { type: 'string', description: 'Short unique identifier.' },
-    description: { type: 'string', description: 'Concrete requirement.' },
-    required: { type: 'boolean', description: 'Whether required for goal completion.' },
-    method: { type: 'string', description: 'Verification method: test, command, browser, manual.' },
+    id: { type: 'string', description: 'Short unique identifier (e.g. "api-health", "test-pass").' },
+    description: { type: 'string', description: 'Concrete requirement description.' },
+    required: { type: 'boolean', description: 'Whether required for goal completion. Defaults to true.' },
+    method: {
+      type: 'string',
+      enum: ['command', 'file', 'url', 'manual'],
+      description: 'Verification method: command (runs shell/test), file (checks file content), url (HTTP request), or manual.',
+    },
     task_ids: {
       type: 'array',
       items: { type: 'string' },
-      description: 'Task IDs linked to this criterion.',
+      description: 'Task IDs linked to this criterion for automatic progress tracking.',
     },
     depends_on: {
       type: 'array',
@@ -80,11 +85,12 @@ function suggestClosest(input: string, candidates: readonly string[], threshold 
   return best
 }
 
-/** Structured error result, mirroring the original MCP server's isError shape. */
-function fail(e: unknown): { error: string; code: string } {
+/** Structured error result with actionable hint, mirroring the original MCP server's isError shape. */
+function fail(e: unknown): { error: string; code: string; hint?: string } {
   const message = e instanceof Error ? e.message : String(e)
   const code = e instanceof GoalAcceptanceError ? e.code : 'GOAL_ACCEPTANCE_INTERNAL_ERROR'
-  return { error: message, code }
+  const hint = e instanceof GoalAcceptanceError ? e.hint : undefined
+  return { error: message, code, ...hint ? { hint } : {} }
 }
 
 /** Compact one-line summary for default (non-verbose) responses. */
@@ -584,6 +590,172 @@ export const tools: ToolDef[] = [
         const id = args.goal_id as string
         const meta = mgr.switchGoal(id)
         return { goal: meta, message: 'Switched active goal.' }
+      } catch (e) {
+        return fail(e)
+      }
+    },
+  },
+  {
+    name: 'run_and_validate',
+    description: [
+      'Execute a shell command, capture its real stdout/stderr/exitCode, and validate the criterion in one call.',
+      'This guarantees high-confidence evidence_type="command" and eliminates copy-paste errors or missing evidence.',
+      'If command exit code is 0, status defaults to "passed". If non-zero, status defaults to "failed".',
+    ].join('\n'),
+    inputSchema: {
+      type: 'object',
+      additionalProperties: false,
+      required: ['criterion_id', 'command'],
+      properties: {
+        criterion_id: { type: 'string', description: 'Criterion ID to validate.' },
+        command: { type: 'string', description: 'Shell command to execute (e.g. "pnpm test", "git status").' },
+        cwd: { type: 'string', description: 'Optional working directory for the command execution.' },
+        timeout_ms: { type: 'number', description: 'Optional timeout in milliseconds (default 60000).' },
+        verbose: { type: 'boolean', description: 'Default false: slim summary. true: full summary.' },
+      },
+    },
+    handler: async (args, ctx: ToolContext) => {
+      const mgr = getManager(ctx.config as { pluginData?: string })
+      const engine = mgr.getEngine()
+      const criterionId = args.criterion_id as string
+      const command = args.command as string
+      const cwd = typeof args.cwd === 'string' && args.cwd.trim().length > 0 ? args.cwd.trim() : undefined
+      const timeout = typeof args.timeout_ms === 'number' && args.timeout_ms > 0 ? args.timeout_ms : 60000
+
+      let stdout = ''
+      let stderr = ''
+      let exitCode = 0
+      try {
+        stdout = execSync(command, {
+          cwd,
+          timeout,
+          encoding: 'utf8',
+          stdio: ['pipe', 'pipe', 'pipe'],
+          maxBuffer: 4 * 1024 * 1024,
+        })
+      } catch (err: unknown) {
+        const execErr = err as { stdout?: string; stderr?: string; status?: number; message?: string }
+        stdout = execErr.stdout ?? ''
+        stderr = execErr.stderr ?? (execErr.message || String(err))
+        exitCode = typeof execErr.status === 'number' ? execErr.status : 1
+      }
+
+      const status: GoalCriterionStatus = exitCode === 0 ? 'passed' : 'failed'
+      const rawEvidence = [
+        `$ ${command}`,
+        stdout.trim() ? `[stdout]\n${stdout.trim()}` : '',
+        stderr.trim() ? `[stderr]\n${stderr.trim()}` : '',
+        `[exit code] ${exitCode}`,
+      ].filter(Boolean).join('\n\n')
+
+      try {
+        const updated = await engine.validateCriterion({
+          criterionId,
+          status,
+          evidence: rawEvidence,
+          evidenceType: 'command',
+        })
+        const verbose = args.verbose === true
+        const summary = engine.summarize()
+        return {
+          goalId: mgr.getCurrentGoalId(),
+          criterion: updated,
+          commandOutput: {
+            exitCode,
+            stdout: stdout.length > 2000 ? `${stdout.slice(0, 2000)}... (truncated)` : stdout,
+            stderr: stderr.length > 2000 ? `${stderr.slice(0, 2000)}... (truncated)` : stderr,
+          },
+          summary: verbose ? summary : slimSummary(summary),
+        }
+      } catch (e) {
+        if (e instanceof GoalAcceptanceError && e.code === 'GOAL_ACCEPTANCE_CRITERION_NOT_FOUND') {
+          const allIds = engine.getCriteria().map(c => c.id)
+          const suggestion = suggestClosest(criterionId, allIds)
+          return fail(new GoalAcceptanceError(
+            `criterion_id "${criterionId}" not found. Available IDs: [${allIds.join(', ')}].${suggestion ? ` Did you mean "${suggestion}"?` : ''} Call get_acceptance_criteria to see the full list.`,
+            'GOAL_ACCEPTANCE_CRITERION_NOT_FOUND',
+          ))
+        }
+        return fail(e)
+      }
+    },
+  },
+  {
+    name: 'quick_start_goal',
+    description: [
+      'Fast-path convenience tool: Start or rotate a goal, lock acceptance criteria, and optionally set task plan all in ONE call.',
+      'Recommended for AI agents starting multi-step tasks to avoid multiple round-trips.',
+    ].join('\n'),
+    inputSchema: {
+      type: 'object',
+      additionalProperties: false,
+      required: ['criteria'],
+      properties: {
+        title: { type: 'string', description: 'Optional short goal title.' },
+        role: {
+          type: 'string',
+          enum: ['agent', 'reviewer', 'dual'],
+          description: 'Role locking criteria. agent (default): passed is self-claimed. dual/reviewer: formal pass immediately.',
+        },
+        criteria: {
+          type: 'array',
+          items: CRITERION_ITEM_SCHEMA,
+          description: 'Initial criteria to lock for this goal.',
+        },
+        tasks: {
+          type: 'array',
+          items: TASK_PLAN_ITEM_SCHEMA,
+          description: 'Optional task plan to lock simultaneously.',
+        },
+      },
+    },
+    handler: async (args, ctx: ToolContext) => {
+      const mgr = getManager(ctx.config as { pluginData?: string })
+      try {
+        const title = args.title as string | undefined
+        const rawCriteria = (args.criteria ?? []) as CriterionInput[]
+        const rawTasks = args.tasks as TaskInput[] | undefined
+        const role = (args.role as GoalRole | undefined) ?? 'agent'
+        const mappedCriteria = rawCriteria.map(mapCriterion)
+
+        if (title !== undefined) mgr.startGoal(title)
+        let engine = mgr.ensureGoal()
+        let list: GoalCriterion[]
+        let previousGoalId: string | undefined
+        let previousGoalIncomplete = false
+        let previousGoalReason: string | undefined
+        let previousGoalSummary: ReturnType<typeof slimSummary> | undefined
+        try {
+          list = await engine.setCriteria(mappedCriteria, role)
+        } catch (e) {
+          if (e instanceof GoalAcceptanceError && e.code === 'GOAL_ACCEPTANCE_ALREADY_LOCKED') {
+            previousGoalId = mgr.getCurrentGoalId() ?? undefined
+            const completion = engine.canComplete()
+            previousGoalSummary = slimSummary(engine.summarize())
+            previousGoalIncomplete = !completion.allowed
+            previousGoalReason = completion.reason
+            mgr.startGoal(title)
+            engine = mgr.getEngine()
+            list = await engine.setCriteria(mappedCriteria, role)
+          } else {
+            throw e
+          }
+        }
+
+        let taskPlanRes: GoalTask[] | undefined
+        if (Array.isArray(rawTasks) && rawTasks.length > 0) {
+          taskPlanRes = await engine.setTaskPlan(rawTasks.map(mapTask))
+        }
+
+        const summary = engine.summarize()
+        return {
+          goalId: mgr.getCurrentGoalId(),
+          ...previousGoalId ? { previousGoalId, previousGoalIncomplete, previousGoalReason, previousGoalSummary, autoStarted: true } : {},
+          criteria: list,
+          taskPlan: taskPlanRes,
+          summary: slimSummary(summary),
+          message: 'Goal initialized and locked successfully.',
+        }
       } catch (e) {
         return fail(e)
       }

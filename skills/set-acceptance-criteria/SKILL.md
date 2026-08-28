@@ -7,6 +7,9 @@ Before implementing, lock the goal's acceptance criteria. Criteria must be
 observable, have a unique id, and declare whether they are required for
 completion. Once locked, they cannot be modified for the current goal.
 
+💡 **Fast-path**: Use the `quick_start_goal` tool to lock criteria and optional
+task plans in a single tool call.
+
 ## When to Plan First
 
 For any multi-step task (implement, fix, refactor), do NOT write criteria
