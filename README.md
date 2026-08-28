@@ -46,9 +46,9 @@ plugin dirs, marketplace shims) from one generated portable package
 (`plugin.json` / `mcp.json` / `.mcp.json` / `skills/` / `openclaw.plugin.json` /
 `openclaw-dist/`).
 
-### 3. MCP server with 13 tools
+### 3. MCP server with 15 tools
 
-The CLI exposes 13 tools covering the full goal-acceptance lifecycle:
+The CLI exposes 15 tools covering the full goal-acceptance lifecycle:
 
 - **Criteria management**: set, get, amend
 - **Task plan management**: set task plan, get task plan
@@ -56,6 +56,8 @@ The CLI exposes 13 tools covering the full goal-acceptance lifecycle:
 - **Progress tracking**: update task status
 - **Completion gate**: can complete goal
 - **Multi-goal management**: start goal, list goals, switch goal, reset goal
+- **Fast path**: quick start goal (start + criteria + optional task plan in one call)
+- **Run and validate**: execute a shell command and validate a criterion in one call
 
 See [MCP Tools](#mcp-tools) below for the full list.
 
@@ -111,10 +113,11 @@ src/
 ├── plugin/
 │   ├── engine/             # Event-sourced state machine (core)
 │   ├── goal-manager.ts     # Multi-goal manager (shared by all paths)
-│   ├── tools.ts            # 13 ToolDefs (manifest.tools data source)
+│   ├── tools.ts            # 15 ToolDefs (manifest.tools data source)
 │   ├── manifest.ts         # Single source of identity
 │   ├── dsh-plugin.ts       # DeepSeek Harness Cordis plugin
 │   ├── openclaw-plugin.ts  # OpenClaw native plugin (typebox, in-process)
+│   ├── openclaw-session-sync.ts  # Sync active goal to OpenClaw SessionEntry.goal
 │   ├── prompt.ts           # dsh system-prompt guidance
 │   ├── invariant.ts        # dsh session invariant companion
 │   └── targets/            # 22 install adapters
@@ -180,18 +183,28 @@ If `PLUGIN_DATA` is not set, state is in-memory only (lost on restart).
 
 `openclaw-dist/` carries the in-process plugin (bundle + minimal package.json
 with the `openclaw.extensions` contract) and `openclaw.plugin.json` declares
-the 13-tool contracts:
+the 15-tool contracts:
 
 ```sh
+openclaw plugins install @cckyros/goal-acceptance
+# or, for a local build:
 openclaw plugins install /path/to/goal-acceptance/openclaw-dist
-# or, when materialized by the installer:
-openclaw plugins install ~/.goal-acceptance/plugin
 openclaw gateway restart
 openclaw plugins list            # goal-acceptance: loaded
 ```
 
-The 13 tools are available in OpenClaw sessions. `Shape: non-capability` is
+The 15 tools are available in OpenClaw sessions. `Shape: non-capability` is
 normal for tool plugins — tools are registered via `defineToolPlugin`.
+
+After every tool that mutates goal state (`start_goal`, `set_acceptance_criteria`,
+`validate_criterion`, `confirm_criterion`, `amend_acceptance_criteria`,
+`update_task_status`, `set_task_plan`, `run_and_validate`, `quick_start_goal`,
+`switch_goal`, `reset_goal`), the plugin mirrors the active acceptance goal into
+OpenClaw's canonical `SessionEntry.goal` slot. This means OpenClaw's built-in
+`get_goal` and `update_goal` tools see a live snapshot of the acceptance goal.
+The mirror is write-through: calling `update_goal` directly updates
+`SessionEntry.goal`, and subsequent plugin tools re-sync the slot from the
+plugin's own event-sourced state.
 
 ### DeepSeek Harness (Cordis plugin)
 
@@ -210,7 +223,7 @@ ordering.
 
 The plugin:
 
-- Registers the same 13 model tools as the MCP adapter
+- Registers the same 15 model tools as the MCP adapter
 - Injects a `policy:goal-acceptance` system prompt section with task progress and next-actionable ordering
 - Intercepts `agent/turn-stopping` and steers the agent back with dependency-aware
   priority ordering for pending work and self-claimed criteria awaiting reviewer confirmation
@@ -273,6 +286,8 @@ console.log(allowed, reason)
 | `start_goal` | Start a new independent goal with fresh state (optional `title`). The new goal becomes active. Use when the current goal is locked and you need a new task. |
 | `list_goals` | List all goals with ID, title, criteria counts, and active flag. |
 | `switch_goal` | Switch the active goal to an existing goal by ID. |
+| `quick_start_goal` | Convenience fast path: start or rotate a goal, lock acceptance criteria, and optionally set a task plan in one call. |
+| `run_and_validate` | Execute a shell command and validate a criterion in one call. Captures stdout/stderr/exitCode as evidence_type=command evidence. |
 | `reset_goal` | Delete the current goal and all its data permanently. |
 
 ## Skills
@@ -359,7 +374,7 @@ class MyDbStore implements GoalAcceptanceStore {
 
 | Capability | dsh Cordis plugin | CLI MCP server | Agent Plugin | OpenClaw native |
 |------------|:---:|:---:|:---:|:---:|
-| Model tools | 13 tools (see [MCP Tools](#mcp-tools)) | 13 tools (see [MCP Tools](#mcp-tools)) | same as MCP | same as MCP (in-process) |
+| Model tools | 15 tools (see [MCP Tools](#mcp-tools)) | 15 tools (see [MCP Tools](#mcp-tools)) | same as MCP | same as MCP (in-process) |
 | System prompt / Skills | `policy:goal-acceptance` | `skills/` | `skills/` | `skills/` |
 | Turn-stopping enforcement | yes (`agent.steer()`, dependency-aware) | no | no | no |
 | Cross-client portable | no (Harness only) | yes (any MCP client) | yes (any Agent Plugins client) | no (OpenClaw only) |
@@ -387,9 +402,10 @@ src/
 │   ├── manifest.ts         # Identity single source (name, tools, markers, config)
 │   ├── engine/             # Event-sourced state machine (zero-dependency)
 │   ├── goal-manager.ts     # Multi-goal manager + stores (shared by all paths)
-│   ├── tools.ts            # 13 ToolDefs
+│   ├── tools.ts            # 15 ToolDefs
 │   ├── dsh-plugin.ts       # Cordis plugin (service, tools, steer, prompt)
 │   ├── openclaw-plugin.ts  # OpenClaw native plugin
+│   ├── openclaw-session-sync.ts  # Sync active goal to OpenClaw SessionEntry.goal
 │   ├── prompt.ts           # dsh system-prompt guidance
 │   ├── invariant.ts        # dsh session invariant
 │   └── targets/            # 22 install adapters

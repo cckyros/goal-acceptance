@@ -41,7 +41,7 @@
 `.mcp.json` / `skills/` / `openclaw.plugin.json` / `openclaw-dist/`）
 写入客户端原生配置。
 
-### 3. MCP server 提供 13 个工具
+### 3. MCP server 提供 15 个工具
 
 MCP server 覆盖完整的目标验收生命周期：
 
@@ -51,6 +51,8 @@ MCP server 覆盖完整的目标验收生命周期：
 - **进度跟踪**：`update_task_status`
 - **完成门禁**：`can_complete_goal`
 - **多目标管理**：`start_goal`、`list_goals`、`switch_goal`、`reset_goal`
+- **快速开始**：`quick_start_goal`（一步完成开始/切换目标、锁定标准、可选设置任务计划）
+- **运行并验证**：`run_and_validate`（执行 shell 命令并一步完成标准验证）
 
 完整列表见下文 [MCP 工具](#mcp-工具)。
 
@@ -96,10 +98,11 @@ src/
 ├── plugin/
 │   ├── engine/             # 事件源状态机（core）
 │   ├── goal-manager.ts     # 多目标管理器（所有通路共享）
-│   ├── tools.ts            # 13 个 ToolDef（manifest.tools 数据源）
+│   ├── tools.ts            # 15 个 ToolDef（manifest.tools 数据源）
 │   ├── manifest.ts         # 身份唯一来源
 │   ├── dsh-plugin.ts       # DeepSeek Harness Cordis 插件
 │   ├── openclaw-plugin.ts  # OpenClaw 原生插件（typebox、进程内）
+│   ├── openclaw-session-sync.ts  # 将活动目标同步到 OpenClaw SessionEntry.goal
 │   ├── prompt.ts           # dsh 系统提示指引
 │   ├── invariant.ts        # dsh session 不变量伴生插件
 │   └── targets/            # 22 个安装适配器
@@ -164,18 +167,26 @@ PLUGIN_DATA=/path/to/data node dist/cli.js mcp
 ### OpenClaw 原生插件
 
 `openclaw-dist/` 携带进程内插件（bundle + 带 `openclaw.extensions` 契约的最小
-package.json），`openclaw.plugin.json` 声明 13 个工具契约：
+package.json），`openclaw.plugin.json` 声明 15 个工具契约：
 
 ```sh
+openclaw plugins install @cckyros/goal-acceptance
+# 或本地构建：
 openclaw plugins install /path/to/goal-acceptance/openclaw-dist
-# 或使用安装器 materialize 后的目录：
-openclaw plugins install ~/.goal-acceptance/plugin
 openclaw gateway restart
 openclaw plugins list            # goal-acceptance: loaded
 ```
 
-13 个工具可在 OpenClaw 会话中使用。`Shape: non-capability` 对工具插件是正常的
+15 个工具可在 OpenClaw 会话中使用。`Shape: non-capability` 对工具插件是正常的
 ——工具经 `defineToolPlugin` 注册，不经过 capability 系统。
+
+每次会改变目标状态的工具调用后（`start_goal`、`set_acceptance_criteria`、
+`validate_criterion`、`confirm_criterion`、`amend_acceptance_criteria`、
+`update_task_status`、`set_task_plan`、`run_and_validate`、`quick_start_goal`、
+`switch_goal`、`reset_goal`），插件都会把当前 acceptance 目标镜像到 OpenClaw
+的 `SessionEntry.goal` 槽。这样 OpenClaw 内置的 `get_goal` 和 `update_goal`
+就能看到这个活动目标。`update_goal` 直接修改 `SessionEntry.goal` 后，如果后续
+再调用插件工具，插件会按自身事件源状态重新同步该槽。
 
 ### DeepSeek Harness（Cordis 插件）
 
@@ -192,7 +203,7 @@ openclaw plugins list            # goal-acceptance: loaded
 
 该插件：
 
-- 注册与 MCP 适配器相同的 13 个模型工具
+- 注册与 MCP 适配器相同的 15 个模型工具
 - 注入 `policy:goal-acceptance` 系统提示段落，给出任务进度与 next-actionable 排序
 - 拦截 `agent/turn-stopping`，按依赖感知优先级把 Agent 拉回待办工作，
   以及等待 reviewer 确认的自评标准
@@ -253,6 +264,8 @@ console.log(allowed, reason)
 | `start_goal` | 以全新状态开始新的独立目标（可选 `title`）。新目标成为活动目标。当前目标已锁定且需要新任务时使用。 |
 | `list_goals` | 列出所有目标：ID、标题、标准计数与活动标记。 |
 | `switch_goal` | 按 ID 切换活动目标。 |
+| `quick_start_goal` | 便捷快速路径：一步完成开始/切换目标、锁定验收标准，并可选同时设置任务计划。 |
+| `run_and_validate` | 执行 shell 命令并一步完成标准验证。捕获 stdout/stderr/exitCode 作为 evidence_type=command 证据。 |
 | `reset_goal` | 永久删除当前目标及其全部数据。 |
 
 ## 技能（Skills）
@@ -337,7 +350,7 @@ class MyDbStore implements GoalAcceptanceStore {
 
 | 能力 | dsh Cordis 插件 | CLI MCP server | Agent Plugin | OpenClaw 原生 |
 |------------|:---:|:---:|:---:|:---:|
-| 模型工具 | 13 个（见 [MCP 工具](#mcp-工具)） | 13 个（见 [MCP 工具](#mcp-工具)） | 与 MCP 相同 | 与 MCP 相同（进程内） |
+| 模型工具 | 15 个（见 [MCP 工具](#mcp-工具)） | 15 个（见 [MCP 工具](#mcp-工具)） | 与 MCP 相同 | 与 MCP 相同（进程内） |
 | 系统提示 / 技能 | `policy:goal-acceptance` | `skills/` | `skills/` | `skills/` |
 | 停止时强制 | 是（`agent.steer()`，依赖感知） | 否 | 否 | 否 |
 | 跨客户端便携 | 否（仅 Harness） | 是（任意 MCP 客户端） | 是（任意 Agent Plugins 客户端） | 否（仅 OpenClaw） |
@@ -363,9 +376,10 @@ src/
 │   ├── manifest.ts         # 身份唯一来源（name、tools、markers、config）
 │   ├── engine/             # 事件源状态机（零依赖）
 │   ├── goal-manager.ts     # 多目标管理器 + store（所有通路共享）
-│   ├── tools.ts            # 13 个 ToolDef
+│   ├── tools.ts            # 15 个 ToolDef
 │   ├── dsh-plugin.ts       # Cordis 插件（service、tools、steer、prompt）
 │   ├── openclaw-plugin.ts  # OpenClaw 原生插件
+│   ├── openclaw-session-sync.ts  # 将活动目标同步到 OpenClaw SessionEntry.goal
 │   ├── prompt.ts           # dsh 系统提示指引
 │   ├── invariant.ts        # dsh session 不变量
 │   └── targets/            # 22 个安装适配器

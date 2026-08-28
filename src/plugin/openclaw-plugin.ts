@@ -1,5 +1,5 @@
 /**
- * OpenClaw native plugin entry for goal-acceptance. Registers 13 tools that
+ * OpenClaw native plugin entry for goal-acceptance. Registers 15 tools that
  * directly call the shared GoalManager (no MCP stdio needed). Multi-goal:
  * each goal has its own event file under <dataDir>/goals/.
  *
