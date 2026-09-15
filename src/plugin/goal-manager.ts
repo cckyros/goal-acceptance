@@ -65,6 +65,7 @@ export class FileAcceptanceStore implements GoalAcceptanceStore {
 interface GoalMeta {
   readonly id: string
   readonly title: string
+  readonly description?: string
   readonly createdAt: number
 }
 
@@ -138,9 +139,14 @@ export class GoalManager {
   }
 
   /** Start a new goal. Generates a UUID, persists metadata, sets it as current. */
-  startGoal(title?: string): GoalMeta {
+  startGoal(title?: string, description?: string): GoalMeta {
     const id = randomUUID()
-    const meta: GoalMeta = { id, title: title ?? '', createdAt: Date.now() }
+    const meta: GoalMeta = {
+      id,
+      title: title ?? '',
+      ...description !== undefined ? { description } : {},
+      createdAt: Date.now(),
+    }
     const dir = this.goalsDir
     if (dir) {
       mkdirSync(dir, { recursive: true })

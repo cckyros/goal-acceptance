@@ -1,7 +1,7 @@
 /**
  * dsh (DeepSeek Harness) native cordis plugin — the single-package evolution of
  * the original `goal-acceptance` dsh package. Registers the per-agent
- * GoalAcceptanceService, the 13 acceptance tools (names/descriptions aligned
+ * GoalAcceptanceService, the acceptance tools (names/descriptions aligned
  * with the MCP manifest), the system-prompt policy section, turn-stopping
  * steering, and the invariant companion.
  *
@@ -78,7 +78,7 @@ export class GoalAcceptanceService extends Service {
   static inject = ['agents']
 
   private readonly engines = new WeakMap<Agent, GoalAcceptanceEngine>()
-  private readonly goals = new WeakMap<Agent, Map<string, { engine: GoalAcceptanceEngine; title: string; createdAt: number }>>()
+  private readonly goals = new WeakMap<Agent, Map<string, { engine: GoalAcceptanceEngine; title: string; description?: string; createdAt: number }>>()
   private readonly activeGoals = new WeakMap<Agent, string>()
 
   constructor(ctx: Context) {
@@ -100,10 +100,10 @@ export class GoalAcceptanceService extends Service {
 
   private goalMap(agent: Agent) { this.getEngine(agent); return this.goals.get(agent)! }
 
-  startGoal(agent: Agent, title?: string) {
+  startGoal(agent: Agent, title?: string, description?: string) {
     const goals = this.goalMap(agent)
     const id = randomUUID()
-    const meta = { id, title: title ?? '', createdAt: Date.now() }
+    const meta = { id, title: title ?? '', ...description !== undefined ? { description } : {}, createdAt: Date.now() }
     goals.set(id, { ...meta, engine: new GoalAcceptanceEngine(new InMemoryAcceptanceStore()) })
     this.activeGoals.set(agent, id)
     this.engines.set(agent, goals.get(id)!.engine)
@@ -114,7 +114,7 @@ export class GoalAcceptanceService extends Service {
     const active = this.activeGoals.get(agent)
     return Array.from(this.goalMap(agent).entries()).map(([id, goal]) => {
       const summary = goal.engine.summarize()
-      return { id, title: goal.title, createdAt: goal.createdAt, criteriaCount: summary.totalCount, passedCount: summary.passedCount, allRequiredPassed: summary.allRequiredPassed, isActive: id === active }
+      return { id, title: goal.title, description: goal.description, createdAt: goal.createdAt, criteriaCount: summary.totalCount, passedCount: summary.passedCount, allRequiredPassed: summary.allRequiredPassed, isActive: id === active }
     }).sort((a, b) => b.createdAt - a.createdAt)
   }
 
@@ -123,7 +123,7 @@ export class GoalAcceptanceService extends Service {
     if (goal === undefined) throw new GoalAcceptanceError(`goal ${id} not found`, 'GOAL_ACCEPTANCE_NOT_FOUND')
     this.activeGoals.set(agent, id)
     this.engines.set(agent, goal.engine)
-    return { id, title: goal.title, createdAt: goal.createdAt }
+    return { id, title: goal.title, description: goal.description, createdAt: goal.createdAt }
   }
 
   resetGoal(agent: Agent): void {
@@ -537,6 +537,26 @@ export function createAcceptanceTools(ctx: Context): ToolDefinition[] {
     presentCall: args => present('Start goal', 'other', args),
   })
 
+  const createTool = defineTool({
+    name: 'create_goal', description: description('create_goal'),
+    parameters: {
+      name: { type: 'string', required: true, description: 'Short goal name (stored as the goal title).' },
+      description: { type: 'string', description: 'Optional longer description of what the goal achieves.' },
+    },
+    output: { schema: OUTPUT_OBJECT_SCHEMA, render: (_a: unknown, v: unknown) => [{ type: 'text' as const, text: JSON.stringify(v, null, 2) }] },
+    execute(args, exec) {
+      const { agent, service } = requireService(exec)
+      const name = args.name
+      if (typeof name !== 'string' || name.trim().length === 0) {
+        throw new GoalAcceptanceError('create_goal requires a non-empty "name" string.', 'GOAL_ACCEPTANCE_INVALID_ARGS', 'Call create_goal with {name: "...", description?: "..."}.')
+      }
+      const description = typeof args.description === 'string' ? args.description : undefined
+      const meta = service.startGoal(agent, name.trim(), description)
+      return Promise.resolve({ goalId: meta.id, goal: meta, message: 'New goal created and set as active.' }) as never
+    },
+    presentCall: args => present('Create goal', 'other', args),
+  })
+
   const listTool = defineTool({
     name: 'list_goals', description: description('list_goals'), parameters: {},
     output: { schema: OUTPUT_OBJECT_SCHEMA, render: (_a: unknown, v: unknown) => [{ type: 'text' as const, text: JSON.stringify(v, null, 2) }] },
@@ -695,7 +715,7 @@ export function createAcceptanceTools(ctx: Context): ToolDefinition[] {
     presentCall: () => present('Reset goal', 'other'),
   })
 
-  return [setTool, getTool, validateTool, confirmTool, updateTaskTool, amendTool, canCompleteTool, setPlanTool, getPlanTool, startTool, listTool, switchTool, runAndValidateTool, quickStartTool, resetTool]
+  return [setTool, getTool, validateTool, confirmTool, updateTaskTool, amendTool, canCompleteTool, setPlanTool, getPlanTool, startTool, createTool, listTool, switchTool, runAndValidateTool, quickStartTool, resetTool]
 }
 
 // ------------------------------------------------------------------ apply

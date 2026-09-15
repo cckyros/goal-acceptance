@@ -678,9 +678,14 @@ var GoalManager = class {
     return this.getEngine();
   }
   /** Start a new goal. Generates a UUID, persists metadata, sets it as current. */
-  startGoal(title) {
+  startGoal(title, description2) {
     const id = randomUUID();
-    const meta = { id, title: title ?? "", createdAt: Date.now() };
+    const meta = {
+      id,
+      title: title ?? "",
+      ...description2 !== void 0 ? { description: description2 } : {},
+      createdAt: Date.now()
+    };
     const dir = this.goalsDir;
     if (dir) {
       mkdirSync(dir, { recursive: true });
@@ -1362,6 +1367,37 @@ var tools = [
     }
   },
   {
+    name: "create_goal",
+    description: "Create a new named goal and set it as active. Each goal has its own acceptance criteria and task plan. Unlike set_acceptance_criteria (which auto-creates only when none is active), this always starts a fresh goal; any previous goal keeps its events and stays reachable via list_goals / switch_goal. name and description are recorded in the goal metadata shown by list_goals.",
+    inputSchema: {
+      type: "object",
+      additionalProperties: false,
+      required: ["name"],
+      properties: {
+        name: { type: "string", description: "Short goal name (stored as the goal title, shown by list_goals)." },
+        description: { type: "string", description: "Optional longer description of what the goal achieves." }
+      }
+    },
+    handler: async (args, ctx) => {
+      const mgr = getManager(ctx.config);
+      try {
+        const name3 = args.name;
+        if (typeof name3 !== "string" || name3.trim().length === 0) {
+          return fail(new GoalAcceptanceError(
+            'create_goal requires a non-empty "name" string.',
+            "GOAL_ACCEPTANCE_INVALID_ARGS",
+            'Call create_goal with {name: "...", description?: "..."}.'
+          ));
+        }
+        const description2 = typeof args.description === "string" ? args.description : void 0;
+        const meta = mgr.startGoal(name3.trim(), description2);
+        return { goalId: meta.id, goal: meta, message: "New goal created and set as active." };
+      } catch (e) {
+        return fail(e);
+      }
+    }
+  },
+  {
     name: "list_goals",
     description: "List all goals with their status summaries. Shows goal ID, title, creation time, criteria counts, and which goal is currently active.",
     inputSchema: {
@@ -1589,7 +1625,7 @@ ${stderr.trim()}` : "",
 // src/plugin/manifest.ts
 var manifest = {
   name: "@cckyros/goal-acceptance",
-  version: "0.2.4",
+  version: "0.2.6",
   // 0.1.x monorepo → 0.2.0 single-package scaffold
   brand: "goal-acceptance",
   description: "Acceptance-criteria-driven goal completion for autonomous agents.",
@@ -1739,10 +1775,10 @@ var GoalAcceptanceService = class extends Service {
     this.getEngine(agent);
     return this.goals.get(agent);
   }
-  startGoal(agent, title) {
+  startGoal(agent, title, description2) {
     const goals = this.goalMap(agent);
     const id = randomUUID2();
-    const meta = { id, title: title ?? "", createdAt: Date.now() };
+    const meta = { id, title: title ?? "", ...description2 !== void 0 ? { description: description2 } : {}, createdAt: Date.now() };
     goals.set(id, { ...meta, engine: new GoalAcceptanceEngine(new InMemoryAcceptanceStore()) });
     this.activeGoals.set(agent, id);
     this.engines.set(agent, goals.get(id).engine);
@@ -1752,7 +1788,7 @@ var GoalAcceptanceService = class extends Service {
     const active = this.activeGoals.get(agent);
     return Array.from(this.goalMap(agent).entries()).map(([id, goal]) => {
       const summary = goal.engine.summarize();
-      return { id, title: goal.title, createdAt: goal.createdAt, criteriaCount: summary.totalCount, passedCount: summary.passedCount, allRequiredPassed: summary.allRequiredPassed, isActive: id === active };
+      return { id, title: goal.title, description: goal.description, createdAt: goal.createdAt, criteriaCount: summary.totalCount, passedCount: summary.passedCount, allRequiredPassed: summary.allRequiredPassed, isActive: id === active };
     }).sort((a, b) => b.createdAt - a.createdAt);
   }
   switchGoal(agent, id) {
@@ -1760,7 +1796,7 @@ var GoalAcceptanceService = class extends Service {
     if (goal === void 0) throw new GoalAcceptanceError(`goal ${id} not found`, "GOAL_ACCEPTANCE_NOT_FOUND");
     this.activeGoals.set(agent, id);
     this.engines.set(agent, goal.engine);
-    return { id, title: goal.title, createdAt: goal.createdAt };
+    return { id, title: goal.title, description: goal.description, createdAt: goal.createdAt };
   }
   resetGoal(agent) {
     const goals = this.goalMap(agent);
@@ -2152,6 +2188,26 @@ function createAcceptanceTools(ctx) {
     },
     presentCall: (args) => present("Start goal", "other", args)
   });
+  const createTool = defineTool({
+    name: "create_goal",
+    description: description("create_goal"),
+    parameters: {
+      name: { type: "string", required: true, description: "Short goal name (stored as the goal title)." },
+      description: { type: "string", description: "Optional longer description of what the goal achieves." }
+    },
+    output: { schema: OUTPUT_OBJECT_SCHEMA, render: (_a, v) => [{ type: "text", text: JSON.stringify(v, null, 2) }] },
+    execute(args, exec) {
+      const { agent, service } = requireService(exec);
+      const name3 = args.name;
+      if (typeof name3 !== "string" || name3.trim().length === 0) {
+        throw new GoalAcceptanceError('create_goal requires a non-empty "name" string.', "GOAL_ACCEPTANCE_INVALID_ARGS", 'Call create_goal with {name: "...", description?: "..."}.');
+      }
+      const description2 = typeof args.description === "string" ? args.description : void 0;
+      const meta = service.startGoal(agent, name3.trim(), description2);
+      return Promise.resolve({ goalId: meta.id, goal: meta, message: "New goal created and set as active." });
+    },
+    presentCall: (args) => present("Create goal", "other", args)
+  });
   const listTool = defineTool({
     name: "list_goals",
     description: description("list_goals"),
@@ -2319,7 +2375,7 @@ ${stderr.trim()}` : "",
     },
     presentCall: () => present("Reset goal", "other")
   });
-  return [setTool, getTool, validateTool, confirmTool, updateTaskTool, amendTool, canCompleteTool, setPlanTool, getPlanTool, startTool, listTool, switchTool, runAndValidateTool, quickStartTool, resetTool];
+  return [setTool, getTool, validateTool, confirmTool, updateTaskTool, amendTool, canCompleteTool, setPlanTool, getPlanTool, startTool, createTool, listTool, switchTool, runAndValidateTool, quickStartTool, resetTool];
 }
 async function apply2(ctx, config = {}) {
   const autoSteer = config.autoSteerUncompleted !== false;

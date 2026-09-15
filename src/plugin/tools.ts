@@ -2,7 +2,8 @@
  * Model-facing tools for setting, reading, validating, and amending
  * acceptance criteria. Registered via manifest.tools — the framework's MCP
  * runtime serves them over stdio JSON-RPC. Ported from the original
- * goal-acceptance-mcp server (13 tools, same names/descriptions/schemas).
+ * goal-acceptance-mcp server (13 tools, same names/descriptions/schemas);
+ * run_and_validate, quick_start_goal and create_goal were added later.
  */
 
 import { execSync } from 'node:child_process'
@@ -547,6 +548,37 @@ export const tools: ToolDef[] = [
         const title = args.title as string | undefined
         const meta = mgr.startGoal(title)
         return { goal: meta, message: 'New goal started and set as active.' }
+      } catch (e) {
+        return fail(e)
+      }
+    },
+  },
+  {
+    name: 'create_goal',
+    description: 'Create a new named goal and set it as active. Each goal has its own acceptance criteria and task plan. Unlike set_acceptance_criteria (which auto-creates only when none is active), this always starts a fresh goal; any previous goal keeps its events and stays reachable via list_goals / switch_goal. name and description are recorded in the goal metadata shown by list_goals.',
+    inputSchema: {
+      type: 'object',
+      additionalProperties: false,
+      required: ['name'],
+      properties: {
+        name: { type: 'string', description: 'Short goal name (stored as the goal title, shown by list_goals).' },
+        description: { type: 'string', description: 'Optional longer description of what the goal achieves.' },
+      },
+    },
+    handler: async (args, ctx: ToolContext) => {
+      const mgr = getManager(ctx.config as { pluginData?: string })
+      try {
+        const name = args.name
+        if (typeof name !== 'string' || name.trim().length === 0) {
+          return fail(new GoalAcceptanceError(
+            'create_goal requires a non-empty "name" string.',
+            'GOAL_ACCEPTANCE_INVALID_ARGS',
+            'Call create_goal with {name: "...", description?: "..."}.',
+          ))
+        }
+        const description = typeof args.description === 'string' ? args.description : undefined
+        const meta = mgr.startGoal(name.trim(), description)
+        return { goalId: meta.id, goal: meta, message: 'New goal created and set as active.' }
       } catch (e) {
         return fail(e)
       }

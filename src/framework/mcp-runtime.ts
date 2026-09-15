@@ -68,7 +68,12 @@ async function handleRequest(manifest: PluginManifest, req: JsonRpcRequest): Pro
     const args = (req.params?.arguments as Record<string, unknown> | undefined) ?? {};
     const tool = manifest.tools.find((t) => t.name === name);
     if (!tool) {
-      errorResponse(id, -32602, `unknown tool: ${String(name)}`);
+      // Tool-level error, not a protocol error: some clients report any
+      // JSON-RPC error on tools/call as a transport failure ("Failed to
+      // connect"), which misleads debugging — the server is alive, the tool
+      // name is wrong. Listing available names makes the fix obvious.
+      const available = manifest.tools.map((t) => t.name).join(", ");
+      toolResult(id, `error: unknown tool "${String(name)}". Available tools: ${available}`, true);
       return;
     }
     try {
@@ -77,9 +82,17 @@ async function handleRequest(manifest: PluginManifest, req: JsonRpcRequest): Pro
         log: (msg: string) => process.stderr.write(`[${manifest.name}] ${msg}\n`),
       };
       const result = await tool.handler(args, ctx);
-      toolResult(id, JSON.stringify(result, null, 2));
+      // Handlers report expected failures as {error, code} objects; surface
+      // them as tool errors so clients flag the call instead of showing a
+      // successful result that happens to contain an error payload.
+      const failed =
+        typeof result === "object" && result !== null && "error" in result;
+      toolResult(id, JSON.stringify(result, null, 2), failed);
     } catch (e) {
-      toolResult(id, `error: ${e instanceof Error ? e.message : e}`, true);
+      // Uncaught handler exception: keep it tool-level and include the stack
+      // so the caller sees the real cause, not a connection-level misreport.
+      const detail = e instanceof Error ? (e.stack ?? e.message) : String(e);
+      toolResult(id, `error: ${detail}`, true);
     }
     return;
   }

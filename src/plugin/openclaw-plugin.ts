@@ -379,6 +379,21 @@ export default defineToolPlugin({
     )()),
 
     tool(makeTool(
+      'create_goal',
+      'Create Goal',
+      'Create a new named goal and set it as active. Always starts a fresh goal; name and description are recorded in the goal metadata shown by list_goals.',
+      Type.Object({
+        name: Type.String({ description: 'Short goal name (stored as the goal title, shown by list_goals).' }),
+        description: Type.Optional(Type.String({ description: 'Optional longer description of what the goal achieves.' })),
+      }),
+      { mutates: true },
+      async (params, config) => {
+        const meta = getManager(config).startGoal(params.name, params.description)
+        return { goalId: meta.id, goal: meta, message: 'New goal created and set as active.' }
+      },
+    )()),
+
+    tool(makeTool(
       'list_goals',
       'List Goals',
       'List all goals with their status summaries. Shows goal ID, title, creation time, criteria counts, and which goal is currently active.',

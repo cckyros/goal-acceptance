@@ -220,6 +220,7 @@ export type GoalAcceptanceErrorCode =
   | 'GOAL_ACCEPTANCE_NO_ACTIVE_GOAL'
   | 'GOAL_ACCEPTANCE_NOT_SELF_CLAIMED'
   | 'GOAL_ACCEPTANCE_LOW_CONFIDENCE_EVIDENCE'
+  | 'GOAL_ACCEPTANCE_INVALID_ARGS'
 
 /** Event payload when initial criteria are locked. */
 export interface GoalAcceptanceSetEvent {

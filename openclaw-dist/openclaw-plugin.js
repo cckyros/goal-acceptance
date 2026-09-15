@@ -5087,9 +5087,14 @@ var GoalManager = class {
     return this.getEngine();
   }
   /** Start a new goal. Generates a UUID, persists metadata, sets it as current. */
-  startGoal(title) {
+  startGoal(title, description) {
     const id = randomUUID();
-    const meta = { id, title: title ?? "", createdAt: Date.now() };
+    const meta = {
+      id,
+      title: title ?? "",
+      ...description !== void 0 ? { description } : {},
+      createdAt: Date.now()
+    };
     const dir = this.goalsDir;
     if (dir) {
       mkdirSync(dir, { recursive: true });
@@ -5581,6 +5586,20 @@ var openclaw_plugin_default = defineToolPlugin({
       async (params, config) => {
         const meta = getManager(config).startGoal(params.title);
         return { goal: meta, message: "New goal started and set as active." };
+      }
+    )()),
+    tool(makeTool(
+      "create_goal",
+      "Create Goal",
+      "Create a new named goal and set it as active. Always starts a fresh goal; name and description are recorded in the goal metadata shown by list_goals.",
+      typebox_exports.Object({
+        name: typebox_exports.String({ description: "Short goal name (stored as the goal title, shown by list_goals)." }),
+        description: typebox_exports.Optional(typebox_exports.String({ description: "Optional longer description of what the goal achieves." }))
+      }),
+      { mutates: true },
+      async (params, config) => {
+        const meta = getManager(config).startGoal(params.name, params.description);
+        return { goalId: meta.id, goal: meta, message: "New goal created and set as active." };
       }
     )()),
     tool(makeTool(

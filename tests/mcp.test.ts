@@ -11,7 +11,7 @@ const CLI = join(import.meta.dirname, "..", "dist", "cli.js");
 
 interface Rpc {
   id?: unknown;
-  result?: { serverInfo?: { name?: string; version?: string }; tools?: Array<{ name: string }>; content?: Array<{ type: string; text: string }> };
+  result?: { serverInfo?: { name?: string; version?: string }; tools?: Array<{ name: string }>; content?: Array<{ type: string; text: string }>; isError?: boolean };
   error?: { code: number; message: string };
 }
 
@@ -111,6 +111,9 @@ test("tools/call against no active goal returns a structured error", () => {
   const data = JSON.parse(text);
   assert.equal(data.code, "GOAL_ACCEPTANCE_NO_ACTIVE_GOAL");
   assert.ok(data.error.includes("no active goal"), data.error);
+  // Structured {error, code} payloads surface as tool-level errors so clients
+  // flag the call as failed rather than as a successful result.
+  assert.equal(res.result?.isError, true);
 });
 
 test("tools/call quick_start_goal initializes goal and task plan in one call", () => {
@@ -162,7 +165,50 @@ test("tools/call run_and_validate executes command and records evidence", () => 
   assert.ok(data.criterion.evidence.includes("hello_eval"));
 });
 
-test("tools/call unknown tool returns a JSON-RPC error", () => {
+test("tools/call create_goal creates a named active goal", () => {
+  const [created, read] = mcpSession([
+    JSON.stringify({
+      jsonrpc: "2.0",
+      id: 20,
+      method: "tools/call",
+      params: { name: "create_goal", arguments: { name: "t", description: "t" } },
+    }),
+    JSON.stringify({
+      jsonrpc: "2.0",
+      id: 21,
+      method: "tools/call",
+      params: { name: "get_acceptance_criteria", arguments: {} },
+    }),
+  ]);
+  const createdData = JSON.parse(created.result?.content?.[0]?.text ?? "{}");
+  assert.ok(createdData.goalId, "goalId present");
+  assert.equal(createdData.goal.title, "t");
+  assert.equal(createdData.goal.description, "t");
+  const readData = JSON.parse(read.result?.content?.[0]?.text ?? "{}");
+  assert.equal(readData.goalId, createdData.goalId);
+});
+
+test("tools/call create_goal without name returns a tool-level error", () => {
+  const [res] = mcpSession([
+    JSON.stringify({
+      jsonrpc: "2.0",
+      id: 22,
+      method: "tools/call",
+      params: { name: "create_goal", arguments: {} },
+    }),
+  ]);
+  assert.equal(res.result?.isError, true);
+  const data = JSON.parse(res.result?.content?.[0]?.text ?? "{}");
+  assert.equal(data.code, "GOAL_ACCEPTANCE_INVALID_ARGS");
+});
+
+test("tools/call unknown tool returns a tool-level error, not a protocol error", () => {
+  // A JSON-RPC error here is misreported by some clients as a connection
+  // failure; the tool result keeps the real message visible.
   const [res] = mcpSession([JSON.stringify({ jsonrpc: "2.0", id: 5, method: "tools/call", params: { name: "nope" } })]);
-  assert.equal(res.error?.code, -32602);
+  assert.equal(res.error, undefined);
+  assert.equal(res.result?.isError, true);
+  const text = res.result?.content?.[0]?.text ?? "";
+  assert.ok(text.includes('unknown tool "nope"'), text);
+  assert.ok(text.includes("set_acceptance_criteria"), "lists available tools");
 });
