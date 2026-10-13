@@ -8,7 +8,7 @@
       "name": "goal-acceptance",
       "source": "./",
       "description": "Acceptance-criteria-driven goal completion for autonomous agents.",
-      "version": "0.2.8",
+      "version": "0.2.9",
       "author": {
         "name": "cckyros"
       },

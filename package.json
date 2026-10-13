@@ -1,6 +1,6 @@
 {
   "name": "@cckyros/goal-acceptance",
-  "version": "0.2.8",
+  "version": "0.2.9",
   "description": "Acceptance-criteria-driven goal completion for autonomous agents — MCP server, dsh Cordis plugin, and OpenClaw plugin in one package.",
   "license": "MIT",
   "type": "module",
@@ -18,6 +18,11 @@
   "main": "dist/dsh-plugin.js",
   "openclaw": {
     "extensions": ["./openclaw-dist/openclaw-plugin.js"]
+  },
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    }
   },
   "files": [
     "dist/",
