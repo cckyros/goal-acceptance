@@ -143,6 +143,28 @@ node dist/cli.js install --target openclaw
 node dist/cli.js list-targets           # show all 22
 ```
 
+### Plugin marketplaces
+
+This repo doubles as a self-hosted plugin marketplace — the plugin source is
+`./` (the repo root), so adding the repo makes the plugin discoverable:
+
+```sh
+# Claude Code (reads .claude-plugin/marketplace.json)
+claude plugin marketplace add cckyros/goal-acceptance
+# then: /plugin install goal-acceptance@cckyros
+
+# Codex CLI / ChatGPT (reads .agents/plugins/marketplace.json)
+codex plugin marketplace add cckyros/goal-acceptance
+# then: codex plugin add goal-acceptance@cckyros
+
+# Cursor (reads .cursor-plugin/marketplace.json): add the repo as a plugin
+# marketplace in Settings → Plugins
+```
+
+The repo also carries `server.json`, the descriptor for the **official MCP
+registry** (`mcp-publisher publish` after `mcp-publisher login github` —
+namespace `io.github.cckyros/goal-acceptance`).
+
 ### MCP server (any MCP client)
 
 ```json

@@ -1,0 +1,23 @@
+{
+  "name": "cckyros",
+  "interface": {
+    "displayName": "cckyros"
+  },
+  "plugins": [
+    {
+      "name": "goal-acceptance",
+      "source": "./",
+      "description": "Acceptance-criteria-driven goal completion for autonomous agents.",
+      "version": "0.2.8",
+      "author": {
+        "name": "cckyros"
+      },
+      "license": "MIT",
+      "policy": {
+        "installation": "AVAILABLE",
+        "authentication": "ON_INSTALL"
+      },
+      "category": "development"
+    }
+  ]
+}

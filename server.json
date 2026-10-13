@@ -1,0 +1,22 @@
+{
+  "$schema": "https://static.modelcontextprotocol.io/schemas/2025-09-29/server.schema.json",
+  "name": "io.github.cckyros/goal-acceptance",
+  "description": "Acceptance-criteria-driven goal completion for autonomous agents.",
+  "title": "goal-acceptance",
+  "repository": {
+    "url": "https://github.com/cckyros/goal-acceptance",
+    "source": "github"
+  },
+  "version": "0.2.8",
+  "packages": [
+    {
+      "registryType": "npm",
+      "identifier": "@cckyros/goal-acceptance",
+      "version": "0.2.8",
+      "runtimeHint": "npx",
+      "transport": {
+        "type": "stdio"
+      }
+    }
+  ]
+}

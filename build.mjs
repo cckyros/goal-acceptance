@@ -196,6 +196,80 @@ const marketplaceJson = {
 };
 await writeFile(join(root, "marketplace.json"), JSON.stringify(marketplaceJson, null, 2) + "\n", "utf8");
 
+// -------------------------------------------------- agent marketplace shims
+// Repo-root marketplace.json covers agent-plugins consumers; agent CLIs each
+// look for the catalog under their own well-known dir. Codex's discovery list
+// is .agents/plugins/, .claude-plugin/, .cursor-plugin/ — one catalog serves
+// Claude Code + Cursor, the Codex-native dir carries its own shape. source
+// "./" = the plugin is this repo root (self-hosted marketplace + plugin).
+const catalogEntry = {
+  name: manifest.brand,
+  source: "./",
+  description: manifest.description,
+  version: manifest.version,
+  author: { name: authorName },
+  license: "MIT",
+};
+const claudeCatalog = {
+  name: authorName,
+  owner: { name: authorName },
+  metadata: { description: manifest.description, version: manifest.version },
+  plugins: [catalogEntry],
+};
+const codexCatalog = {
+  name: authorName,
+  interface: { displayName: authorName },
+  plugins: [
+    {
+      ...catalogEntry,
+      policy: { installation: "AVAILABLE", authentication: "ON_INSTALL" },
+      category: "development",
+    },
+  ],
+};
+await mkdir(join(root, ".claude-plugin"), { recursive: true });
+await writeFile(join(root, ".claude-plugin", "plugin.json"), JSON.stringify(pluginJson, null, 2) + "\n", "utf8");
+await writeFile(join(root, ".claude-plugin", "marketplace.json"), JSON.stringify(claudeCatalog, null, 2) + "\n", "utf8");
+await mkdir(join(root, ".agents", "plugins"), { recursive: true });
+await writeFile(join(root, ".agents", "plugins", "marketplace.json"), JSON.stringify(codexCatalog, null, 2) + "\n", "utf8");
+await mkdir(join(root, ".cursor-plugin"), { recursive: true });
+await writeFile(join(root, ".cursor-plugin", "plugin.json"), JSON.stringify(pluginJson, null, 2) + "\n", "utf8");
+await writeFile(join(root, ".cursor-plugin", "marketplace.json"), JSON.stringify(claudeCatalog, null, 2) + "\n", "utf8");
+await mkdir(join(root, ".codex-plugin"), { recursive: true });
+await writeFile(join(root, ".codex-plugin", "plugin.json"), JSON.stringify(pluginJson, null, 2) + "\n", "utf8");
+
+// dsh plugin descriptor — same shape the original dsh package shipped; kept
+// generated so the version can never drift from the manifest again.
+const dshPluginJson = {
+  name: manifest.brand,
+  description: "Acceptance-criteria-driven goal completion and validation enforcement plugin for DeepSeek Harness.",
+  version: manifest.version,
+  entry: { name: manifest.name, inject: ["agents", "tools", "systemPrompt"] },
+  client: { platform: "node" },
+};
+await writeFile(join(root, "dsh.plugin.json"), JSON.stringify(dshPluginJson, null, 2) + "\n", "utf8");
+
+// Official MCP registry descriptor — `mcp-publisher publish` reads this. The
+// io.github.* namespace verifies via GitHub auth at publish time.
+const serverJson = {
+  $schema: "https://static.modelcontextprotocol.io/schemas/2025-09-29/server.schema.json",
+  name: `io.github.${manifest.githubSlug}`,
+  description: manifest.description,
+  title: manifest.brand,
+  repository: { url: homepage, source: "github" },
+  version: manifest.version,
+  packages: [
+    {
+      registryType: "npm",
+      identifier: manifest.name,
+      version: manifest.version,
+      runtimeHint: "npx",
+      transport: { type: "stdio" },
+    },
+  ],
+};
+await writeFile(join(root, "server.json"), JSON.stringify(serverJson, null, 2) + "\n", "utf8");
+
 // dsh activation patch: id stays stable so re-installs replace, never duplicate.
 // id = brand (unscoped cordis identifier, matching dsh's own patch convention);
 // name = the npm package specifier cordis imports it by, so it keeps the scope

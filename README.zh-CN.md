@@ -128,6 +128,24 @@ node dist/cli.js install --target openclaw
 node dist/cli.js list-targets           # 查看全部 22 个
 ```
 
+### 插件市场
+
+本仓库自身即插件市场 —— 插件源为 `./`（仓库根目录），添加仓库即可发现插件：
+
+```sh
+# Claude Code（读取 .claude-plugin/marketplace.json）
+claude plugin marketplace add cckyros/goal-acceptance
+# 然后：/plugin install goal-acceptance@cckyros
+
+# Codex CLI / ChatGPT（读取 .agents/plugins/marketplace.json）
+codex plugin marketplace add cckyros/goal-acceptance
+# 然后：codex plugin add goal-acceptance@cckyros
+
+# Cursor（读取 .cursor-plugin/marketplace.json）：在 Settings → Plugins 中添加本仓库为插件市场
+```
+
+仓库还带有 `server.json` —— **官方 MCP registry** 的描述文件（`mcp-publisher login github` 后执行 `mcp-publisher publish`，命名空间 `io.github.cckyros/goal-acceptance`）。
+
 ### MCP server（任意 MCP 客户端）
 
 ```json

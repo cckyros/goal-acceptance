@@ -60,6 +60,38 @@ test("marketplace.json versions match", () => {
   assert.equal(marketplace.plugins[0].version, manifest.version);
 });
 
+test("agent marketplace shims: catalogs resolve the brand, versions sync", () => {
+  // Codex CLI discovers .agents/plugins/, .claude-plugin/ and .cursor-plugin/;
+  // Claude Code reads .claude-plugin/marketplace.json. source "./" = repo root
+  // is the plugin (self-hosted marketplace + plugin in one repo).
+  for (const p of [".claude-plugin", ".cursor-plugin"]) {
+    const catalog = JSON.parse(read(`${p}/marketplace.json`));
+    assert.equal(catalog.plugins[0].name, manifest.brand, `${p} entry name`);
+    assert.equal(catalog.plugins[0].version, manifest.version, `${p} entry version`);
+    assert.equal(catalog.plugins[0].source, "./", `${p} entry source`);
+    const pj = JSON.parse(read(`${p}/plugin.json`));
+    assert.equal(pj.name, manifest.brand, `${p} plugin.json name`);
+    assert.equal(pj.version, manifest.version, `${p} plugin.json version`);
+  }
+  const codex = JSON.parse(read(".agents/plugins/marketplace.json"));
+  assert.equal(codex.plugins[0].name, manifest.brand);
+  assert.equal(codex.plugins[0].version, manifest.version);
+  assert.equal(codex.plugins[0].source, "./");
+  const codexPj = JSON.parse(read(".codex-plugin/plugin.json"));
+  assert.equal(codexPj.name, manifest.brand);
+});
+
+test("dsh.plugin.json + server.json stay version-synced", () => {
+  const dsh = JSON.parse(read("dsh.plugin.json"));
+  assert.equal(dsh.version, manifest.version);
+  assert.equal(dsh.name, manifest.brand);
+  assert.equal(dsh.entry.name, manifest.name);
+  const server = JSON.parse(read("server.json"));
+  assert.equal(server.name, `io.github.${manifest.githubSlug}`);
+  assert.equal(server.version, manifest.version);
+  assert.equal(server.packages[0].identifier, manifest.name);
+});
+
 test("cordis.patch.yml activates the brand id, imports the scoped npm name", () => {
   assert.ok(cordisPatch.includes(`id: ${manifest.brand}`), cordisPatch);
   assert.ok(cordisPatch.includes(`name: "${manifest.name}"`), cordisPatch);
