@@ -305,6 +305,60 @@ export default defineToolPlugin({
     )()),
 
     tool(makeTool(
+      'claim_task',
+      'Claim Task',
+      'Task dispatch node for the orchestrated worker/reviewer loop. Claims a task for a worker: marks it in_progress and returns the task plus its linked acceptance criteria. Without task_id, claims the first pending task whose dependencies are all completed.',
+      Type.Object({
+        task_id: Type.Optional(Type.String({ description: 'Task id to claim. When omitted, the next dependency-ready task in plan order is claimed.' })),
+      }),
+      { mutates: true },
+      async (params, config) => {
+        const mgr = getManager(config)
+        const result = await mgr.getEngine().claimTask(params.task_id)
+        return { goalId: mgr.getCurrentGoalId(), ...result }
+      },
+    )()),
+
+    tool(makeTool(
+      'review_task',
+      'Review Task',
+      'Task acceptance node for the orchestrated worker/reviewer loop. Records the independent reviewer\'s verdicts on the claimed task\'s linked criteria. Verdicts are formal (never self-claimed). All linked required criteria formally passed → task completes and the next dependency-ready task is returned; otherwise blockingCriteria is the rework feedback for the next round.',
+      Type.Object({
+        task_id: Type.String({ description: 'The in_progress task being reviewed.' }),
+        verdicts: Type.Array(Type.Object({
+          criterion_id: Type.String({ description: 'A criterion linked to this task.' }),
+          status: Type.Union([
+            Type.Literal('pending'),
+            Type.Literal('in_progress'),
+            Type.Literal('passed'),
+            Type.Literal('failed'),
+            Type.Literal('blocked'),
+            Type.Literal('not_run'),
+          ], { description: 'Reviewed outcome.' }),
+          evidence: Type.String({ description: 'Fresh verification evidence gathered by the reviewer.' }),
+          evidence_type: Type.Optional(Type.Union([
+            Type.Literal('command'),
+            Type.Literal('file'),
+            Type.Literal('url'),
+            Type.Literal('text'),
+          ], { description: 'Evidence type.' })),
+        }), { description: 'Reviewer verdicts, one per linked criterion being judged this round.' }),
+      }),
+      { mutates: true },
+      async (params, config) => {
+        const mgr = getManager(config)
+        const verdicts = params.verdicts.map((v: { criterion_id: string; status: 'pending' | 'in_progress' | 'passed' | 'failed' | 'blocked' | 'not_run'; evidence: string; evidence_type?: 'command' | 'file' | 'url' | 'text' }) => ({
+          criterionId: v.criterion_id,
+          status: v.status,
+          evidence: v.evidence,
+          ...v.evidence_type !== undefined ? { evidenceType: v.evidence_type } : {},
+        }))
+        const result = await mgr.getEngine().reviewTask(params.task_id, verdicts)
+        return { goalId: mgr.getCurrentGoalId(), ...result }
+      },
+    )()),
+
+    tool(makeTool(
       'amend_acceptance_criteria',
       'Amend Acceptance Criteria',
       'Append new acceptance criteria after the initial lock. Existing criteria are not modified. Use when requirements expand during execution.',

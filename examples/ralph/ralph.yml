@@ -1,0 +1,58 @@
+# ralph.yml — goal-acceptance as the loop's completion gate.
+#
+# Ralph iterates an agent until it emits LOOP_COMPLETE. This config makes
+# goal-acceptance the "definition of done": the agent manages criteria via
+# the goal-acceptance MCP server while it works, and the pre.loop.complete
+# hook hard-blocks any LOOP_COMPLETE claim the criteria don't back.
+#
+# Setup (once per workspace):
+#
+#   1. Share ONE data dir between the agent's MCP server and the hooks.
+#      Set it on the `ralph run` process so hooks inherit it:
+#        PowerShell:  $env:PLUGIN_DATA = "$PWD\.ralph\goal-acceptance"
+#        bash:        export PLUGIN_DATA="$PWD/.ralph/goal-acceptance"
+#
+#   2. Register the MCP server for the agent's backend with the SAME dir.
+#      Claude backend → .mcp.json in this workspace:
+#        {
+#          "mcpServers": {
+#            "goal-acceptance": {
+#              "command": "goal-acceptance",
+#              "args": ["mcp"],
+#              "env": { "PLUGIN_DATA": "<same absolute dir as step 1>" }
+#            }
+#          }
+#        }
+#      (`goal-acceptance install --target claude` writes the entry; add the
+#      env block so both sides read the same store.)
+#
+#   3. ralph run -c ralph.yml -p "Implement <feature>; use goal-acceptance
+#      to track the acceptance criteria."
+
+event_loop:
+  completion_promise: "LOOP_COMPLETE"
+  max_iterations: 50
+
+cli:
+  backend: "claude"
+
+core:
+  guardrails:
+    - "Track the work with the goal-acceptance MCP tools: set criteria first, then validate each criterion with real evidence."
+    - "Do not emit LOOP_COMPLETE until every required criterion is formally passed; self-claimed passes need confirm_criterion by a reviewer."
+    - "The goal-acceptance gate hook rejects premature LOOP_COMPLETE claims and the loop continues."
+
+hooks:
+  enabled: true
+  events:
+    # Optional visibility: log the current goal state when the loop starts.
+    post.loop.start:
+      - name: goal-acceptance-status
+        command: ["goal-acceptance", "status"]
+        on_error: warn
+    # The hard gate: `goal-acceptance check` exits 1 while required criteria
+    # are unmet, which blocks the completion and keeps the loop going.
+    pre.loop.complete:
+      - name: goal-acceptance-gate
+        command: ["goal-acceptance", "check"]
+        on_error: block

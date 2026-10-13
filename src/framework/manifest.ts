@@ -145,6 +145,8 @@ export interface PluginManifest {
 export interface BizCliContext {
   log: (msg: string) => void;
   fail: (msg: string) => never;
+  /** Resolved config values (env > project config > global config > defaults). */
+  config: Record<string, string | number | boolean | undefined>;
 }
 
 /** Default markers derived from a package name — scaffolds call this with

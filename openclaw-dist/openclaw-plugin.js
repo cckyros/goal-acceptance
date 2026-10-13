@@ -4673,7 +4673,7 @@ var GoalAcceptanceEngine = class {
       );
     }
     const evidenceType = spec.evidenceType ?? "text";
-    const selfClaimed = spec.status === "passed" && this.state.role === "agent";
+    const selfClaimed = spec.status === "passed" && this.state.role === "agent" && spec.byReviewer !== true;
     const now = Date.now();
     const event = {
       type: "goal-acceptance/validate",
@@ -4779,6 +4779,121 @@ var GoalAcceptanceEngine = class {
       ...this.state.taskPlan.get(id),
       status: this.state.taskStatuses.get(id) ?? this.state.taskPlan.get(id).status
     }));
+  }
+  /** Pending tasks whose dependencies are all completed, in declaration order. */
+  readyTasks() {
+    return this.getTaskPlan().filter(
+      (t) => t.status === "pending" && t.dependsOn.every((dep) => (this.state.taskStatuses.get(dep) ?? "pending") === "completed")
+    );
+  }
+  /** Criteria linked to a task via criterion.taskIds — its acceptance contract. */
+  linkedCriteria(taskId) {
+    return this.getCriteria().filter((c) => c.taskIds.includes(taskId));
+  }
+  /**
+   * Task dispatch node: claim a task for a worker. Marks the task in_progress
+   * and returns it with its linked criteria (the work + acceptance contract).
+   * Without taskId, claims the first dependency-ready task in plan order.
+   */
+  async claimTask(taskId) {
+    this.sync();
+    if (this.state.taskPlan.size === 0) {
+      throw new GoalAcceptanceError("no task plan set \u2014 call set_task_plan first", "GOAL_ACCEPTANCE_INVALID_TASK_PLAN");
+    }
+    let task;
+    if (taskId !== void 0) {
+      task = this.getTaskPlan().find((t) => t.id === taskId);
+      if (task === void 0) {
+        throw new GoalAcceptanceError(`task "${taskId}" not found`, "GOAL_ACCEPTANCE_TASK_NOT_FOUND");
+      }
+      if (task.status !== "pending") {
+        throw new GoalAcceptanceError(
+          `task "${taskId}" is not claimable (status: ${task.status})`,
+          "GOAL_ACCEPTANCE_TASK_NOT_CLAIMABLE"
+        );
+      }
+      const unmet = task.dependsOn.filter(
+        (dep) => (this.state.taskStatuses.get(dep) ?? "pending") !== "completed"
+      );
+      if (unmet.length > 0) {
+        throw new GoalAcceptanceError(
+          `task "${taskId}" has unmet dependencies: [${unmet.join(", ")}]`,
+          "GOAL_ACCEPTANCE_TASK_NOT_CLAIMABLE"
+        );
+      }
+    } else {
+      task = this.readyTasks()[0];
+      if (task === void 0) {
+        const plan = this.getTaskPlan();
+        const pending = plan.filter((t) => t.status === "pending");
+        const reason = pending.length === 0 ? "no pending tasks \u2014 all tasks are claimed or done" : `no claimable tasks \u2014 ${pending.length} pending task(s) are blocked by unmet dependencies: [${pending.map((t) => t.id).join(", ")}]`;
+        return { task: null, criteria: [], reason };
+      }
+    }
+    await this.updateTaskStatus({ taskId: task.id, status: "in_progress" });
+    const claimed = this.getTaskPlan().find((t) => t.id === task.id);
+    return { task: claimed, criteria: this.linkedCriteria(task.id) };
+  }
+  /**
+   * Task acceptance node: reviewer verdicts on the task's linked criteria.
+   * Verdicts are formal (never self-claimed) — the reviewer is the single
+   * authority. All linked required criteria formally passed → task completes
+   * and dependent tasks unlock. Otherwise the task stays in_progress and the
+   * blocking criteria are returned as rework feedback for the next round.
+   */
+  async reviewTask(taskId, verdicts) {
+    this.sync();
+    if (!Array.isArray(verdicts) || verdicts.length === 0) {
+      throw new GoalAcceptanceError("verdicts must be a non-empty array", "GOAL_ACCEPTANCE_INVALID_ARGS");
+    }
+    const task = this.getTaskPlan().find((t) => t.id === taskId);
+    if (task === void 0) {
+      throw new GoalAcceptanceError(`task "${taskId}" not found`, "GOAL_ACCEPTANCE_TASK_NOT_FOUND");
+    }
+    if (task.status !== "in_progress") {
+      throw new GoalAcceptanceError(
+        `task "${taskId}" is not in_progress (status: ${task.status}) \u2014 claim it first`,
+        "GOAL_ACCEPTANCE_TASK_NOT_IN_PROGRESS"
+      );
+    }
+    const linked = this.linkedCriteria(taskId);
+    if (linked.length === 0) {
+      throw new GoalAcceptanceError(
+        `task "${taskId}" has no linked criteria \u2014 nothing to review against`,
+        "GOAL_ACCEPTANCE_TASK_NO_LINKED_CRITERIA"
+      );
+    }
+    const linkedIds = new Set(linked.map((c) => c.id));
+    for (const v of verdicts) {
+      if (!linkedIds.has(v.criterionId)) {
+        throw new GoalAcceptanceError(
+          `criterion "${v.criterionId}" is not linked to task "${taskId}". Linked: [${linked.map((c) => c.id).join(", ")}]`,
+          "GOAL_ACCEPTANCE_CRITERION_NOT_IN_TASK"
+        );
+      }
+    }
+    for (const v of verdicts) {
+      await this.validateCriterion({ ...v, byReviewer: true });
+    }
+    const blocking = this.linkedCriteria(taskId).filter(
+      (c) => c.required && !(c.status === "passed" && c.selfClaimed !== true)
+    );
+    if (blocking.length > 0) {
+      return {
+        taskCompleted: false,
+        task: this.getTaskPlan().find((t) => t.id === taskId),
+        blockingCriteria: blocking
+      };
+    }
+    await this.updateTaskStatus({ taskId, status: "completed" });
+    const next = this.readyTasks()[0];
+    return {
+      taskCompleted: true,
+      task: this.getTaskPlan().find((t) => t.id === taskId),
+      blockingCriteria: [],
+      nextTask: next ?? null,
+      nextTaskCriteria: next ? this.linkedCriteria(next.id) : []
+    };
   }
   /** Get all criteria in declaration order. */
   getCriteria() {
@@ -5517,6 +5632,58 @@ var openclaw_plugin_default = defineToolPlugin({
         const verbose = params.verbose === true;
         const summary = mgr.getEngine().summarize();
         return verbose ? { taskId: params.task_id, status: params.status, summary } : { taskId: params.task_id, status: params.status, summary: slimSummary(summary) };
+      }
+    )()),
+    tool(makeTool(
+      "claim_task",
+      "Claim Task",
+      "Task dispatch node for the orchestrated worker/reviewer loop. Claims a task for a worker: marks it in_progress and returns the task plus its linked acceptance criteria. Without task_id, claims the first pending task whose dependencies are all completed.",
+      typebox_exports.Object({
+        task_id: typebox_exports.Optional(typebox_exports.String({ description: "Task id to claim. When omitted, the next dependency-ready task in plan order is claimed." }))
+      }),
+      { mutates: true },
+      async (params, config) => {
+        const mgr = getManager(config);
+        const result = await mgr.getEngine().claimTask(params.task_id);
+        return { goalId: mgr.getCurrentGoalId(), ...result };
+      }
+    )()),
+    tool(makeTool(
+      "review_task",
+      "Review Task",
+      "Task acceptance node for the orchestrated worker/reviewer loop. Records the independent reviewer's verdicts on the claimed task's linked criteria. Verdicts are formal (never self-claimed). All linked required criteria formally passed \u2192 task completes and the next dependency-ready task is returned; otherwise blockingCriteria is the rework feedback for the next round.",
+      typebox_exports.Object({
+        task_id: typebox_exports.String({ description: "The in_progress task being reviewed." }),
+        verdicts: typebox_exports.Array(typebox_exports.Object({
+          criterion_id: typebox_exports.String({ description: "A criterion linked to this task." }),
+          status: typebox_exports.Union([
+            typebox_exports.Literal("pending"),
+            typebox_exports.Literal("in_progress"),
+            typebox_exports.Literal("passed"),
+            typebox_exports.Literal("failed"),
+            typebox_exports.Literal("blocked"),
+            typebox_exports.Literal("not_run")
+          ], { description: "Reviewed outcome." }),
+          evidence: typebox_exports.String({ description: "Fresh verification evidence gathered by the reviewer." }),
+          evidence_type: typebox_exports.Optional(typebox_exports.Union([
+            typebox_exports.Literal("command"),
+            typebox_exports.Literal("file"),
+            typebox_exports.Literal("url"),
+            typebox_exports.Literal("text")
+          ], { description: "Evidence type." }))
+        }), { description: "Reviewer verdicts, one per linked criterion being judged this round." })
+      }),
+      { mutates: true },
+      async (params, config) => {
+        const mgr = getManager(config);
+        const verdicts = params.verdicts.map((v) => ({
+          criterionId: v.criterion_id,
+          status: v.status,
+          evidence: v.evidence,
+          ...v.evidence_type !== void 0 ? { evidenceType: v.evidence_type } : {}
+        }));
+        const result = await mgr.getEngine().reviewTask(params.task_id, verdicts);
+        return { goalId: mgr.getCurrentGoalId(), ...result };
       }
     )()),
     tool(makeTool(

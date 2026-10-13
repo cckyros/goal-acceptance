@@ -46,9 +46,9 @@ plugin dirs, marketplace shims) from one generated portable package
 (`plugin.json` / `mcp.json` / `.mcp.json` / `skills/` / `openclaw.plugin.json` /
 `openclaw-dist/`).
 
-### 3. MCP server with 16 tools
+### 3. MCP server with 18 tools
 
-The CLI exposes 16 tools covering the full goal-acceptance lifecycle:
+The CLI exposes 18 tools covering the full goal-acceptance lifecycle:
 
 - **Criteria management**: set, get, amend
 - **Task plan management**: set task plan, get task plan
@@ -113,7 +113,7 @@ src/
 ├── plugin/
 │   ├── engine/             # Event-sourced state machine (core)
 │   ├── goal-manager.ts     # Multi-goal manager (shared by all paths)
-│   ├── tools.ts            # 16 ToolDefs (manifest.tools data source)
+│   ├── tools.ts            # 18 ToolDefs (manifest.tools data source)
 │   ├── manifest.ts         # Single source of identity
 │   ├── dsh-plugin.ts       # DeepSeek Harness Cordis plugin
 │   ├── openclaw-plugin.ts  # OpenClaw native plugin (typebox, in-process)
@@ -179,11 +179,18 @@ If `PLUGIN_DATA` is not set, state is in-memory only (lost on restart).
 5. **Confirm** — `confirm_criterion` (independent reviewer agent only) with fresh `evidence_type=command`/`file`/`url` evidence. Converts self-claimed to formal pass.
 6. **Check** — `can_complete_goal` to verify all required criteria are formally passed
 
+**Orchestrated task loop** (worker + reviewer subagents, single-layer review):
+
+1. **Dispatch** — `claim_task` marks the next dependency-ready task `in_progress` and returns it with its linked criteria (the task-level acceptance contract)
+2. **Review** — an independent reviewer subagent calls `review_task` with per-criterion verdicts. Verdicts are formal: a single validation layer, no self-claim/confirm chain
+3. **Loop** — rejection keeps the task `in_progress`, `blockingCriteria` is the rework feedback; fix and `review_task` again. On full pass the task completes and `nextTask` is returned, ready to claim
+4. **Gate** — `can_complete_goal` (or `goal-acceptance check`) still guards overall goal completion
+
 ### OpenClaw native plugin
 
 `openclaw-dist/` carries the in-process plugin (bundle + minimal package.json
 with the `openclaw.extensions` contract) and `openclaw.plugin.json` declares
-the 16-tool contracts:
+the 18-tool contracts:
 
 ```sh
 openclaw plugins install @cckyros/goal-acceptance
@@ -193,7 +200,7 @@ openclaw gateway restart
 openclaw plugins list            # goal-acceptance: loaded
 ```
 
-The 16 tools are available in OpenClaw sessions. `Shape: non-capability` is
+The 18 tools are available in OpenClaw sessions. `Shape: non-capability` is
 normal for tool plugins — tools are registered via `defineToolPlugin`.
 
 After every tool that mutates goal state (`start_goal`, `set_acceptance_criteria`,
@@ -223,7 +230,7 @@ ordering.
 
 The plugin:
 
-- Registers the same 16 model tools as the MCP adapter
+- Registers the same 18 model tools as the MCP adapter
 - Injects a `policy:goal-acceptance` system prompt section with task progress and next-actionable ordering
 - Intercepts `agent/turn-stopping` and steers the agent back with dependency-aware
   priority ordering for pending work and self-claimed criteria awaiting reviewer confirmation
@@ -270,6 +277,38 @@ console.log(allowed, reason)
 // true, undefined
 ```
 
+## Headless gate for orchestrators
+
+`check` and `status` expose the completion verdict without speaking MCP, so
+external loop-drivers (ralph-orchestrator hooks, CI gates, shell scripts) can
+use `can_complete_goal` as a hard backpressure gate. Both resolve the data
+directory exactly like the MCP server (`PLUGIN_DATA` env / `pluginData`
+config) — point the orchestrator and the agent's MCP server at the same dir.
+
+```sh
+goal-acceptance check    # exit 0 when the goal may complete; exit 1 + the
+                         # blocking criteria list on stderr otherwise
+goal-acceptance status   # JSON summary: goalId, allowed, criteria, counts
+```
+
+### ralph-orchestrator
+
+Wire `check` into ralph's `pre.loop.complete` hook with `on_error: block`:
+the agent works the criteria via the goal-acceptance MCP server inside the
+loop, and any `LOOP_COMPLETE` claim the criteria don't back is rejected, so
+the loop keeps grinding until the goal is genuinely done. A ready-made
+config lives at [`examples/ralph/ralph.yml`](examples/ralph/ralph.yml):
+
+```yaml
+hooks:
+  enabled: true
+  events:
+    pre.loop.complete:
+      - name: goal-acceptance-gate
+        command: ["goal-acceptance", "check"]
+        on_error: block
+```
+
 ## MCP Tools
 
 | Tool | Description |
@@ -281,6 +320,8 @@ console.log(allowed, reason)
 | `validate_criterion` | Record status (`pending`/`in_progress`/`passed`/`failed`/`blocked`/`not_run`) and evidence. `passed` and `failed` require evidence. Optional `evidence_type` (`command`/`file`/`url`/`text`, default `text`). When `role=agent` (default), `passed` is marked self-claimed. Optional `verbose` (default `false`). |
 | `confirm_criterion` | **Reviewer-only.** Confirm a self-claimed passed criterion with independent re-verification evidence. Requires `evidence_type` of `command`/`file`/`url` (text rejected). Converts self-claimed to formal pass, unblocking `can_complete_goal`. Must be called by an independent reviewer agent, not the agent that did the work. |
 | `update_task_status` | Update a linked task's status (`pending`/`in_progress`/`completed`/`failed`). When all tasks linked to a criterion are completed, it becomes ready to validate. Optional `verbose` (default `false`). |
+| `claim_task` | Task dispatch node: claim the next dependency-ready task (or a specific `task_id`) for a worker — marks it `in_progress` and returns the task + its linked criteria as the work contract. |
+| `review_task` | Task acceptance node: an independent reviewer records formal verdicts on the task's linked criteria (single validation layer — never self-claimed). All linked required criteria formally passed → task completes and dependents unlock (`nextTask` returned); otherwise `blockingCriteria` is the rework feedback for the next round. |
 | `amend_acceptance_criteria` | Append new criteria after the initial lock. Requires a reason. Existing criteria are not modified. |
 | `can_complete_goal` | Check whether all required criteria are formally passed (self-claimed does not count). Returns `{ allowed: boolean, reason?: string }`. |
 | `start_goal` | Start a new independent goal with fresh state (optional `title`). The new goal becomes active. Use when the current goal is locked and you need a new task. |
@@ -375,7 +416,7 @@ class MyDbStore implements GoalAcceptanceStore {
 
 | Capability | dsh Cordis plugin | CLI MCP server | Agent Plugin | OpenClaw native |
 |------------|:---:|:---:|:---:|:---:|
-| Model tools | 16 tools (see [MCP Tools](#mcp-tools)) | 16 tools (see [MCP Tools](#mcp-tools)) | same as MCP | same as MCP (in-process) |
+| Model tools | 18 tools (see [MCP Tools](#mcp-tools)) | 18 tools (see [MCP Tools](#mcp-tools)) | same as MCP | same as MCP (in-process) |
 | System prompt / Skills | `policy:goal-acceptance` | `skills/` | `skills/` | `skills/` |
 | Turn-stopping enforcement | yes (`agent.steer()`, dependency-aware) | no | no | no |
 | Cross-client portable | no (Harness only) | yes (any MCP client) | yes (any Agent Plugins client) | no (OpenClaw only) |
@@ -403,7 +444,7 @@ src/
 │   ├── manifest.ts         # Identity single source (name, tools, markers, config)
 │   ├── engine/             # Event-sourced state machine (zero-dependency)
 │   ├── goal-manager.ts     # Multi-goal manager + stores (shared by all paths)
-│   ├── tools.ts            # 16 ToolDefs
+│   ├── tools.ts            # 18 ToolDefs
 │   ├── dsh-plugin.ts       # Cordis plugin (service, tools, steer, prompt)
 │   ├── openclaw-plugin.ts  # OpenClaw native plugin
 │   ├── openclaw-session-sync.ts  # Sync active goal to OpenClaw SessionEntry.goal

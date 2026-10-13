@@ -8,6 +8,7 @@ import type { GoalAcceptanceStore } from './store.ts'
 import type {
   AcceptanceSummary,
   AmendSpec,
+  ClaimTaskResult,
   ConfirmCriterionSpec,
   CriterionSpec,
   CriterionTaskProgress,
@@ -21,6 +22,7 @@ import type {
   GoalCriterion,
   GoalRole,
   GoalTask,
+  ReviewTaskResult,
   TaskPlanSpec,
   TaskStatus,
   TaskUpdateSpec,
@@ -298,7 +300,7 @@ export class GoalAcceptanceEngine {
     }
 
     const evidenceType: EvidenceType = spec.evidenceType ?? 'text'
-    const selfClaimed = spec.status === 'passed' && this.state.role === 'agent'
+    const selfClaimed = spec.status === 'passed' && this.state.role === 'agent' && spec.byReviewer !== true
 
     const now = Date.now()
     const event: GoalAcceptanceValidateEvent = {
@@ -425,6 +427,134 @@ export class GoalAcceptanceEngine {
       ...this.state.taskPlan.get(id)!,
       status: this.state.taskStatuses.get(id) ?? this.state.taskPlan.get(id)!.status,
     }))
+  }
+
+  /** Pending tasks whose dependencies are all completed, in declaration order. */
+  private readyTasks(): GoalTask[] {
+    return this.getTaskPlan().filter(
+      t =>
+        t.status === 'pending' &&
+        t.dependsOn.every(dep => (this.state.taskStatuses.get(dep) ?? 'pending') === 'completed'),
+    )
+  }
+
+  /** Criteria linked to a task via criterion.taskIds — its acceptance contract. */
+  private linkedCriteria(taskId: string): GoalCriterion[] {
+    return this.getCriteria().filter(c => c.taskIds.includes(taskId))
+  }
+
+  /**
+   * Task dispatch node: claim a task for a worker. Marks the task in_progress
+   * and returns it with its linked criteria (the work + acceptance contract).
+   * Without taskId, claims the first dependency-ready task in plan order.
+   */
+  async claimTask(taskId?: string): Promise<ClaimTaskResult> {
+    this.sync()
+    if (this.state.taskPlan.size === 0) {
+      throw new GoalAcceptanceError('no task plan set — call set_task_plan first', 'GOAL_ACCEPTANCE_INVALID_TASK_PLAN')
+    }
+
+    let task: GoalTask | undefined
+    if (taskId !== undefined) {
+      task = this.getTaskPlan().find(t => t.id === taskId)
+      if (task === undefined) {
+        throw new GoalAcceptanceError(`task "${taskId}" not found`, 'GOAL_ACCEPTANCE_TASK_NOT_FOUND')
+      }
+      if (task.status !== 'pending') {
+        throw new GoalAcceptanceError(
+          `task "${taskId}" is not claimable (status: ${task.status})`,
+          'GOAL_ACCEPTANCE_TASK_NOT_CLAIMABLE',
+        )
+      }
+      const unmet = task.dependsOn.filter(
+        dep => (this.state.taskStatuses.get(dep) ?? 'pending') !== 'completed',
+      )
+      if (unmet.length > 0) {
+        throw new GoalAcceptanceError(
+          `task "${taskId}" has unmet dependencies: [${unmet.join(', ')}]`,
+          'GOAL_ACCEPTANCE_TASK_NOT_CLAIMABLE',
+        )
+      }
+    } else {
+      task = this.readyTasks()[0]
+      if (task === undefined) {
+        const plan = this.getTaskPlan()
+        const pending = plan.filter(t => t.status === 'pending')
+        const reason =
+          pending.length === 0
+            ? 'no pending tasks — all tasks are claimed or done'
+            : `no claimable tasks — ${pending.length} pending task(s) are blocked by unmet dependencies: [${pending.map(t => t.id).join(', ')}]`
+        return { task: null, criteria: [], reason }
+      }
+    }
+
+    await this.updateTaskStatus({ taskId: task.id, status: 'in_progress' })
+    const claimed = this.getTaskPlan().find(t => t.id === task!.id)!
+    return { task: claimed, criteria: this.linkedCriteria(task.id) }
+  }
+
+  /**
+   * Task acceptance node: reviewer verdicts on the task's linked criteria.
+   * Verdicts are formal (never self-claimed) — the reviewer is the single
+   * authority. All linked required criteria formally passed → task completes
+   * and dependent tasks unlock. Otherwise the task stays in_progress and the
+   * blocking criteria are returned as rework feedback for the next round.
+   */
+  async reviewTask(taskId: string, verdicts: readonly ValidateCriterionSpec[]): Promise<ReviewTaskResult> {
+    this.sync()
+    if (!Array.isArray(verdicts) || verdicts.length === 0) {
+      throw new GoalAcceptanceError('verdicts must be a non-empty array', 'GOAL_ACCEPTANCE_INVALID_ARGS')
+    }
+    const task = this.getTaskPlan().find(t => t.id === taskId)
+    if (task === undefined) {
+      throw new GoalAcceptanceError(`task "${taskId}" not found`, 'GOAL_ACCEPTANCE_TASK_NOT_FOUND')
+    }
+    if (task.status !== 'in_progress') {
+      throw new GoalAcceptanceError(
+        `task "${taskId}" is not in_progress (status: ${task.status}) — claim it first`,
+        'GOAL_ACCEPTANCE_TASK_NOT_IN_PROGRESS',
+      )
+    }
+    const linked = this.linkedCriteria(taskId)
+    if (linked.length === 0) {
+      throw new GoalAcceptanceError(
+        `task "${taskId}" has no linked criteria — nothing to review against`,
+        'GOAL_ACCEPTANCE_TASK_NO_LINKED_CRITERIA',
+      )
+    }
+    const linkedIds = new Set(linked.map(c => c.id))
+    for (const v of verdicts) {
+      if (!linkedIds.has(v.criterionId)) {
+        throw new GoalAcceptanceError(
+          `criterion "${v.criterionId}" is not linked to task "${taskId}". Linked: [${linked.map(c => c.id).join(', ')}]`,
+          'GOAL_ACCEPTANCE_CRITERION_NOT_IN_TASK',
+        )
+      }
+    }
+    for (const v of verdicts) {
+      await this.validateCriterion({ ...v, byReviewer: true })
+    }
+
+    const blocking = this.linkedCriteria(taskId).filter(
+      c => c.required && !(c.status === 'passed' && c.selfClaimed !== true),
+    )
+    if (blocking.length > 0) {
+      return {
+        taskCompleted: false,
+        task: this.getTaskPlan().find(t => t.id === taskId)!,
+        blockingCriteria: blocking,
+      }
+    }
+
+    await this.updateTaskStatus({ taskId, status: 'completed' })
+    const next = this.readyTasks()[0]
+    return {
+      taskCompleted: true,
+      task: this.getTaskPlan().find(t => t.id === taskId)!,
+      blockingCriteria: [],
+      nextTask: next ?? null,
+      nextTaskCriteria: next ? this.linkedCriteria(next.id) : [],
+    }
   }
 
   /** Get all criteria in declaration order. */

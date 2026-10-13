@@ -28,7 +28,7 @@ import type { Agent } from '@deepseek-ai/dsh-agent'
 import { defineTool, type GenericCallView, type ToolDefinition } from '@deepseek-ai/dsh-tools'
 import { manifest } from './manifest.ts'
 import { SessionAcceptanceStore } from './goal-manager.ts'
-import { GoalAcceptanceEngine, GoalAcceptanceError, InMemoryAcceptanceStore, type AcceptanceSummary, type AmendSpec, type ConfirmCriterionSpec, type CriterionSpec, type EvidenceType, type GoalCriterion, type GoalCriterionStatus, type GoalRole, type GoalTask, type TaskPlanSpec, type TaskStatus, type TaskUpdateSpec, type ValidateCriterionSpec } from './engine/index.ts'
+import { GoalAcceptanceEngine, GoalAcceptanceError, InMemoryAcceptanceStore, type AcceptanceSummary, type AmendSpec, type ClaimTaskResult, type ConfirmCriterionSpec, type CriterionSpec, type EvidenceType, type GoalCriterion, type GoalCriterionStatus, type GoalRole, type GoalTask, type ReviewTaskResult, type TaskPlanSpec, type TaskStatus, type TaskUpdateSpec, type ValidateCriterionSpec } from './engine/index.ts'
 import { renderAcceptanceGuidance } from './prompt.ts'
 import * as invariant from './invariant.ts'
 
@@ -165,6 +165,16 @@ export class GoalAcceptanceService extends Service {
   /** Update the status of a linked task. */
   updateTaskStatus(agent: Agent, spec: TaskUpdateSpec): Promise<void> {
     return this.getEngine(agent).updateTaskStatus(spec)
+  }
+
+  /** Task dispatch node: claim a task (next dependency-ready, or by id). */
+  claimTask(agent: Agent, taskId?: string): Promise<ClaimTaskResult> {
+    return this.getEngine(agent).claimTask(taskId)
+  }
+
+  /** Task acceptance node: reviewer verdicts on the task's linked criteria. */
+  reviewTask(agent: Agent, taskId: string, verdicts: readonly ValidateCriterionSpec[]): Promise<ReviewTaskResult> {
+    return this.getEngine(agent).reviewTask(taskId, verdicts)
   }
 
   /** Get all criteria for the given agent in declaration order. */
@@ -438,6 +448,80 @@ export function createAcceptanceTools(ctx: Context): ToolDefinition[] {
       })) as never
     },
     presentCall: args => present(`Update task "${String(args.task_id)}" -> ${String(args.status)}`, 'other', args),
+  })
+
+  const claimTaskTool = defineTool({
+    name: 'claim_task',
+    description: description('claim_task'),
+    parameters: {
+      task_id: {
+        type: 'string',
+        description: 'Optional task id to claim. When omitted, the next dependency-ready task in plan order is claimed.',
+      },
+    },
+    output: {
+      schema: OUTPUT_OBJECT_SCHEMA,
+      render: (_args: unknown, value: unknown) => [{ type: 'text' as const, text: JSON.stringify(value, null, 2) }],
+    },
+    execute(args, exec) {
+      const agent = exec.agent
+      if (agent === undefined) throw new Error('acceptance tools require a calling agent')
+      const service = ctx.get('goalAcceptance')
+      if (service === undefined) throw new Error('goalAcceptance service is not mounted')
+      return service.claimTask(agent, args.task_id as string | undefined).then(result => ({
+        goalId: service.getActiveGoalId(agent),
+        ...result,
+      })) as never
+    },
+    presentCall: args => present(`Claim task${args.task_id !== undefined ? ` "${String(args.task_id)}"` : ''}`, 'other', args),
+  })
+
+  const reviewTaskTool = defineTool({
+    name: 'review_task',
+    description: description('review_task'),
+    parameters: {
+      task_id: {
+        type: 'string',
+        required: true,
+        description: 'The in_progress task being reviewed.',
+      },
+      verdicts: {
+        type: 'array',
+        required: true,
+        description: 'Reviewer verdicts, one per linked criterion being judged this round.',
+        items: {
+          type: 'object',
+          additionalProperties: false,
+          properties: {
+            criterion_id: { type: 'string', required: true, description: 'A criterion linked to this task.' },
+            status: { type: 'string', required: true, enum: STATUSES, description: 'Reviewed outcome.' },
+            evidence: { type: 'string', required: true, description: 'Fresh verification evidence gathered by the reviewer.' },
+            evidence_type: { type: 'string', enum: ['command', 'file', 'url', 'text'], description: 'Evidence type.' },
+          },
+        },
+      },
+    },
+    output: {
+      schema: OUTPUT_OBJECT_SCHEMA,
+      render: (_args: unknown, value: unknown) => [{ type: 'text' as const, text: JSON.stringify(value, null, 2) }],
+    },
+    execute(args, exec) {
+      const agent = exec.agent
+      if (agent === undefined) throw new Error('acceptance tools require a calling agent')
+      const service = ctx.get('goalAcceptance')
+      if (service === undefined) throw new Error('goalAcceptance service is not mounted')
+      const verdicts = (args.verdicts as Array<Record<string, unknown>>).map(v => ({
+        criterionId: v.criterion_id as string,
+        status: v.status as GoalCriterionStatus,
+        evidence: v.evidence as string,
+        ...v.evidence_type !== undefined ? { evidenceType: v.evidence_type as EvidenceType } : {},
+      }))
+      return service.reviewTask(agent, args.task_id as string, verdicts).then(result => ({
+        goalId: service.getActiveGoalId(agent),
+        ...result,
+      })) as never
+    },
+    presentCall: args => present(`Review task "${String(args.task_id)}"`, 'other', args),
   })
 
   const amendTool = defineTool({
@@ -715,7 +799,7 @@ export function createAcceptanceTools(ctx: Context): ToolDefinition[] {
     presentCall: () => present('Reset goal', 'other'),
   })
 
-  return [setTool, getTool, validateTool, confirmTool, updateTaskTool, amendTool, canCompleteTool, setPlanTool, getPlanTool, startTool, createTool, listTool, switchTool, runAndValidateTool, quickStartTool, resetTool]
+  return [setTool, getTool, validateTool, confirmTool, updateTaskTool, claimTaskTool, reviewTaskTool, amendTool, canCompleteTool, setPlanTool, getPlanTool, startTool, createTool, listTool, switchTool, runAndValidateTool, quickStartTool, resetTool]
 }
 
 // ------------------------------------------------------------------ apply

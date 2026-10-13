@@ -2,11 +2,12 @@
 // Everything else (plugin.json / mcp.json / .mcp.json / marketplace.json /
 // cordis.patch.yml) is derived by build.mjs. All values are plain literals.
 import type { PluginManifest } from "../framework/manifest.ts";
+import { checkCli, statusCli } from "./biz-cli.ts";
 import { tools } from "./tools.ts";
 
 export const manifest: PluginManifest = {
   name: "@cckyros/goal-acceptance",
-  version: "0.2.6", // 0.1.x monorepo → 0.2.0 single-package scaffold
+  version: "0.2.7", // 0.1.x monorepo → 0.2.0 single-package scaffold
   brand: "goal-acceptance",
   description: "Acceptance-criteria-driven goal completion for autonomous agents.",
   githubSlug: "cckyros/goal-acceptance",
@@ -58,6 +59,14 @@ export const manifest: PluginManifest = {
   // Skill body ships as assets/SKILL.md (byte-synced to skills/<skillDir>/).
   skill: { filename: "SKILL.md" },
 
-  // No hook / bizCli / doctorChecks — goal acceptance is tool-driven; the
+  // Headless subcommands for external orchestrators (ralph-orchestrator
+  // pre.loop.complete hooks, CI gates): `check` exits 0 only when
+  // can_complete_goal allows, `status` prints the JSON summary.
+  bizCli: {
+    check: checkCli,
+    status: statusCli,
+  },
+
+  // No hook / doctorChecks — goal acceptance is tool-driven; the
   // dsh steering behavior lives in src/plugin/dsh-plugin.ts (cordis plugin).
 };

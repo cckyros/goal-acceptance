@@ -647,3 +647,145 @@ describe('GoalAcceptanceEngine — task plan', () => {
     assert.equal(engine2.summarize().taskPlan.length, 1)
   })
 })
+
+describe('GoalAcceptanceEngine — orchestrated task loop', () => {
+  function createEngine() {
+    return new GoalAcceptanceEngine(new InMemoryAcceptanceStore())
+  }
+
+  async function setupTwoTaskGoal(engine: GoalAcceptanceEngine, role: 'agent' | 'reviewer' = 'agent') {
+    await engine.setCriteria([
+      { id: 'c1', description: 'task one done right', taskIds: ['t1'] },
+      { id: 'c2', description: 'task two done right', taskIds: ['t2'] },
+    ], role)
+    await engine.setTaskPlan([
+      { id: 't1', description: 'Do task one', deliverable: 'one.txt' },
+      { id: 't2', description: 'Do task two', deliverable: 'two.txt', dependsOn: ['t1'] },
+    ])
+  }
+
+  it('claimTask claims the first dependency-ready task with its criteria', async () => {
+    const engine = createEngine()
+    await setupTwoTaskGoal(engine)
+
+    const result = await engine.claimTask()
+    assert.equal(result.task?.id, 't1')
+    assert.equal(result.task?.status, 'in_progress')
+    assert.deepEqual(result.criteria.map(c => c.id), ['c1'])
+
+    // t2 is still blocked on t1 — claiming it directly is rejected.
+    await assert.rejects(engine.claimTask('t2'), (e: { code?: string }) => e.code === 'GOAL_ACCEPTANCE_TASK_NOT_CLAIMABLE')
+    // t1 is already claimed — re-claim is rejected.
+    await assert.rejects(engine.claimTask('t1'), (e: { code?: string }) => e.code === 'GOAL_ACCEPTANCE_TASK_NOT_CLAIMABLE')
+  })
+
+  it('claimTask reports the reason when nothing is claimable', async () => {
+    const engine = createEngine()
+    await setupTwoTaskGoal(engine)
+    await engine.updateTaskStatus({ taskId: 't1', status: 'in_progress' })
+
+    const result = await engine.claimTask()
+    assert.equal(result.task, null)
+    assert.ok(result.reason?.includes('unmet dependencies'), result.reason ?? 'missing')
+  })
+
+  it('reviewTask fail keeps the task in_progress and returns rework feedback', async () => {
+    const engine = createEngine()
+    await setupTwoTaskGoal(engine)
+    await engine.claimTask('t1')
+
+    const result = await engine.reviewTask('t1', [
+      { criterionId: 'c1', status: 'failed', evidence: 'output wrong', evidenceType: 'command' },
+    ])
+    assert.equal(result.taskCompleted, false)
+    assert.equal(result.task.status, 'in_progress')
+    assert.deepEqual(result.blockingCriteria.map(c => c.id), ['c1'])
+  })
+
+  it('reviewTask verdicts are formal — single layer, no confirm needed', async () => {
+    const engine = createEngine()
+    await setupTwoTaskGoal(engine, 'agent') // agent role would normally self-claim
+    await engine.claimTask('t1')
+
+    await engine.reviewTask('t1', [
+      { criterionId: 'c1', status: 'passed', evidence: 're-verified by reviewer', evidenceType: 'command' },
+    ])
+    const c1 = engine.getCriterion('c1')
+    assert.equal(c1?.status, 'passed')
+    assert.notEqual(c1?.selfClaimed, true, 'reviewer verdict must be formal')
+  })
+
+  it('review→rework→re-review loop completes task and unlocks dependents', async () => {
+    const engine = createEngine()
+    await setupTwoTaskGoal(engine)
+    await engine.claimTask('t1')
+
+    // Round 1: reviewer rejects.
+    const r1 = await engine.reviewTask('t1', [
+      { criterionId: 'c1', status: 'failed', evidence: 'still broken', evidenceType: 'command' },
+    ])
+    assert.equal(r1.taskCompleted, false)
+
+    // Worker fixes; round 2: reviewer passes.
+    const r2 = await engine.reviewTask('t1', [
+      { criterionId: 'c1', status: 'passed', evidence: 'output now correct', evidenceType: 'command' },
+    ])
+    assert.equal(r2.taskCompleted, true)
+    assert.equal(r2.task.status, 'completed')
+    assert.equal(r2.nextTask?.id, 't2', 't2 unlocked by t1 completion')
+    assert.deepEqual(r2.nextTaskCriteria?.map(c => c.id), ['c2'])
+
+    // t2 is now claimable.
+    const claim = await engine.claimTask()
+    assert.equal(claim.task?.id, 't2')
+  })
+
+  it('reviewTask rejects verdicts on criteria not linked to the task', async () => {
+    const engine = createEngine()
+    await setupTwoTaskGoal(engine)
+    await engine.claimTask('t1')
+
+    await assert.rejects(
+      engine.reviewTask('t1', [{ criterionId: 'c2', status: 'passed', evidence: 'x' }]),
+      (e: { code?: string }) => e.code === 'GOAL_ACCEPTANCE_CRITERION_NOT_IN_TASK',
+    )
+  })
+
+  it('reviewTask requires an in_progress task with linked criteria', async () => {
+    const engine = createEngine()
+    await setupTwoTaskGoal(engine)
+
+    // t1 never claimed → pending, not reviewable.
+    await assert.rejects(
+      engine.reviewTask('t1', [{ criterionId: 'c1', status: 'passed', evidence: 'x' }]),
+      (e: { code?: string }) => e.code === 'GOAL_ACCEPTANCE_TASK_NOT_IN_PROGRESS',
+    )
+  })
+
+  it('reviewTask rejects a task with no linked criteria', async () => {
+    const engine = createEngine()
+    await engine.setCriteria([{ id: 'c1', description: 'unlinked' }])
+    await engine.setTaskPlan([{ id: 't1', description: 'No criteria', deliverable: 'x.txt' }])
+    await engine.claimTask('t1')
+
+    // The no-linked-criteria guard fires before verdict scoping.
+    await assert.rejects(
+      engine.reviewTask('t1', [{ criterionId: 'c1', status: 'passed', evidence: 'x' }]),
+      (e: { code?: string }) => e.code === 'GOAL_ACCEPTANCE_TASK_NO_LINKED_CRITERIA',
+    )
+  })
+
+  it('full orchestrated loop: claim→work→review→complete→goal gate opens', async () => {
+    const engine = createEngine()
+    await setupTwoTaskGoal(engine)
+
+    for (const [taskId, criterionId] of [['t1', 'c1'], ['t2', 'c2']] as const) {
+      await engine.claimTask(taskId)
+      const result = await engine.reviewTask(taskId, [
+        { criterionId, status: 'passed', evidence: 'verified', evidenceType: 'command' },
+      ])
+      assert.equal(result.taskCompleted, true)
+    }
+    assert.equal(engine.canComplete().allowed, true)
+  })
+})

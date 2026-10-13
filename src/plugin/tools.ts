@@ -165,7 +165,7 @@ export const tools: ToolDef[] = [
       'WORKFLOW (follow in order):',
       '1. PLANNING: For multi-step tasks, spawn a planning subagent (subagent_explore profile) to explore the codebase, draft criteria with goal-backward coverage analysis (every requirement mapped to a criterion, no overlaps, no gaps), then call this tool. Do NOT write criteria directly under execution pressure.',
       '2. TASK PLAN: Call set_task_plan to decompose the goal into atomic tasks with dependencies.',
-      '3. EXECUTE: update_task_status as tasks progress.',
+      '3. EXECUTE: update_task_status as tasks progress. Orchestrated variant: claim_task dispatches the next dependency-ready task to a worker (returns task + linked criteria as the contract); review_task — called by an independent reviewer subagent — records formal verdicts and either completes the task (unlocking dependents) or returns blockingCriteria as rework feedback.',
       '4. VALIDATE: validate_criterion with evidence_type=command/file/url (NEVER text). You MUST run the actual command before validating.',
       '5. CONFIRM: confirm_criterion MUST be called by an independent reviewer agent with fresh high-confidence evidence. Converts self-claimed passes to formal passes.',
       '6. COMPLETE: can_complete_goal checks all required criteria are formally passed. Self-claimed required criteria block completion.',
@@ -418,6 +418,93 @@ export const tools: ToolDef[] = [
           status: args.status,
           summary: verbose ? summary : slimSummary(summary),
         }
+      } catch (e) {
+        return fail(e)
+      }
+    },
+  },
+  {
+    name: 'claim_task',
+    description: [
+      'Task dispatch node for the orchestrated worker/reviewer loop. Claims a task for a worker: marks it in_progress and returns the task plus its linked acceptance criteria — the work contract.',
+      '',
+      'Without task_id, claims the first pending task whose dependencies are all completed. With task_id, claims that specific task (its dependencies must be completed).',
+      '',
+      'The worker executes the returned task against the returned criteria. The worker should NOT validate — validation belongs to review_task, called by an independent reviewer subagent.',
+    ].join('\n'),
+    inputSchema: {
+      type: 'object',
+      additionalProperties: false,
+      properties: {
+        task_id: {
+          type: 'string',
+          description: 'Optional task id to claim. When omitted, the next dependency-ready task in plan order is claimed.',
+        },
+      },
+    },
+    handler: async (args, ctx: ToolContext) => {
+      const mgr = getManager(ctx.config as { pluginData?: string })
+      try {
+        const engine = mgr.getEngine()
+        const result = await engine.claimTask(args.task_id as string | undefined)
+        return { goalId: mgr.getCurrentGoalId(), ...result }
+      } catch (e) {
+        return fail(e)
+      }
+    },
+  },
+  {
+    name: 'review_task',
+    description: [
+      'Task acceptance node for the orchestrated worker/reviewer loop. Records the independent reviewer\'s verdicts on the claimed task\'s linked criteria.',
+      '',
+      'CALLER: a reviewer agent that is NOT the worker — it re-verifies each criterion with fresh evidence. Verdicts are formal (never self-claimed): this is the single validation layer.',
+      '',
+      'Semantics: verdicts may only cover criteria linked to the task. All linked required criteria formally passed → task completes and the next dependency-ready task is returned for claiming. Any required criterion not formally passed → task stays in_progress and blockingCriteria is the rework feedback the worker should fix before the next review round.',
+    ].join('\n'),
+    inputSchema: {
+      type: 'object',
+      additionalProperties: false,
+      required: ['task_id', 'verdicts'],
+      properties: {
+        task_id: { type: 'string', description: 'The in_progress task being reviewed.' },
+        verdicts: {
+          type: 'array',
+          description: 'Reviewer verdicts, one per linked criterion being judged this round.',
+          items: {
+            type: 'object',
+            additionalProperties: false,
+            required: ['criterion_id', 'status', 'evidence'],
+            properties: {
+              criterion_id: { type: 'string', description: 'A criterion linked to this task.' },
+              status: {
+                type: 'string',
+                enum: ['pending', 'in_progress', 'passed', 'failed', 'blocked', 'not_run'],
+                description: 'Reviewed outcome for this criterion.',
+              },
+              evidence: { type: 'string', description: 'Fresh verification evidence gathered by the reviewer. Required for passed/failed.' },
+              evidence_type: {
+                type: 'string',
+                enum: ['command', 'file', 'url', 'text'],
+                description: 'Evidence type. command/file/url are high-confidence.',
+              },
+            },
+          },
+        },
+      },
+    },
+    handler: async (args, ctx: ToolContext) => {
+      const mgr = getManager(ctx.config as { pluginData?: string })
+      try {
+        const engine = mgr.getEngine()
+        const verdicts = (args.verdicts as Array<Record<string, unknown>>).map(v => ({
+          criterionId: v.criterion_id as string,
+          status: v.status as GoalCriterionStatus,
+          evidence: v.evidence as string,
+          evidenceType: v.evidence_type as EvidenceType | undefined,
+        }))
+        const result = await engine.reviewTask(args.task_id as string, verdicts)
+        return { goalId: mgr.getCurrentGoalId(), ...result }
       } catch (e) {
         return fail(e)
       }

@@ -107,6 +107,10 @@ export interface ValidateCriterionSpec {
   readonly evidence?: string | undefined
   /** Type of evidence. Defaults to 'text' (low confidence). */
   readonly evidenceType?: EvidenceType
+  /** True when the verdict comes from a designated reviewer (e.g. a review
+   * subagent in the orchestrated task loop). The verdict is formal — never
+   * self-claimed — regardless of the goal's locking role. */
+  readonly byReviewer?: boolean
 }
 
 /** Input for reviewer confirmation of a self-claimed passed criterion. */
@@ -133,6 +137,30 @@ export interface AmendSpec {
   readonly criteria: readonly CriterionSpec[]
   /** Human-readable reason for the amendment (audit trail). */
   readonly reason: string
+}
+
+/** Result of claiming a task for a worker (task dispatch node). */
+export interface ClaimTaskResult {
+  /** The claimed task (marked in_progress), or null when nothing is claimable. */
+  readonly task: GoalTask | null
+  /** Criteria linked to the claimed task — the task-granularity acceptance contract. */
+  readonly criteria: readonly GoalCriterion[]
+  /** Why no task was claimable, when task is null. */
+  readonly reason?: string
+}
+
+/** Result of a task review round (task acceptance node). */
+export interface ReviewTaskResult {
+  /** True when all linked required criteria are formally passed and the task completed. */
+  readonly taskCompleted: boolean
+  /** The reviewed task with its post-review status. */
+  readonly task: GoalTask
+  /** Linked required criteria still blocking completion — rework feedback for the worker. */
+  readonly blockingCriteria: readonly GoalCriterion[]
+  /** Next claimable task after completion (dependencies unlocked), if any. */
+  readonly nextTask?: GoalTask | null
+  /** Criteria linked to nextTask — the next work contract. */
+  readonly nextTaskCriteria?: readonly GoalCriterion[]
 }
 
 /** Per-criterion task progress computed by the engine. */
@@ -221,6 +249,10 @@ export type GoalAcceptanceErrorCode =
   | 'GOAL_ACCEPTANCE_NOT_SELF_CLAIMED'
   | 'GOAL_ACCEPTANCE_LOW_CONFIDENCE_EVIDENCE'
   | 'GOAL_ACCEPTANCE_INVALID_ARGS'
+  | 'GOAL_ACCEPTANCE_TASK_NOT_CLAIMABLE'
+  | 'GOAL_ACCEPTANCE_TASK_NOT_IN_PROGRESS'
+  | 'GOAL_ACCEPTANCE_TASK_NO_LINKED_CRITERIA'
+  | 'GOAL_ACCEPTANCE_CRITERION_NOT_IN_TASK'
 
 /** Event payload when initial criteria are locked. */
 export interface GoalAcceptanceSetEvent {

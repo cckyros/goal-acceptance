@@ -7,7 +7,7 @@ allowed-tools: Bash Read
 
 # {{brand}} — goal acceptance skill
 
-This plugin ships 13 MCP/agent tools that drive acceptance-criteria-based
+This plugin ships 18 MCP/agent tools that drive acceptance-criteria-based
 goal completion: you lock criteria before implementing, track task progress,
 validate each criterion with real evidence, and block completion until an
 independent reviewer confirms the work.
@@ -30,6 +30,30 @@ independent reviewer confirms the work.
 4. **Confirm** — have an independent reviewer agent re-verify self-claimed
    passes with `confirm_criterion` (fresh evidence, high-confidence type).
 5. **Complete** — only when `can_complete_goal` returns `allowed: true`.
+
+## Orchestrated task loop (worker + reviewer subagents)
+
+For task-granularity orchestration — an orchestrator dispatching work to a
+worker agent and routing each finished task to an independent reviewer
+subagent — use the two task nodes instead of free-form status updates:
+
+1. **Dispatch** — `claim_task` (or `claim_task` with a task_id) marks the
+   next dependency-ready task `in_progress` and returns it with its linked
+   criteria: the task-granularity acceptance contract. The worker executes
+   against exactly those criteria — workers do not validate.
+2. **Review** — a reviewer subagent re-verifies the task and calls
+   `review_task` with per-criterion verdicts (fresh evidence). Verdicts are
+   formal — a single validation layer, no confirm step.
+3. **Loop** — rejection keeps the task `in_progress`; `blockingCriteria`
+   is the rework feedback. The worker fixes and the reviewer calls
+   `review_task` again. On full pass the task completes and its dependents
+   unlock — the response returns `nextTask` ready to claim.
+4. **Gate** — `can_complete_goal` (or `goal-acceptance check` headlessly)
+   still guards goal completion across all tasks.
+
+Criteria link to tasks via `task_ids` at `set_acceptance_criteria` /
+`amend_acceptance_criteria` time; link every criterion to the task that
+produces its evidence.
 
 ## Companion skills
 

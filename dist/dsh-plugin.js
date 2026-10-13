@@ -6,8 +6,10 @@ import z from "@deepseek-ai/schemastery";
 import { createUserMessage } from "@deepseek-ai/dsh-llm";
 import { defineTool } from "@deepseek-ai/dsh-tools";
 
-// src/plugin/tools.ts
-import { execSync } from "node:child_process";
+// src/plugin/goal-manager.ts
+import { randomUUID } from "node:crypto";
+import { existsSync, mkdirSync, readdirSync, readFileSync, unlinkSync, writeFileSync } from "node:fs";
+import { join } from "node:path";
 
 // src/plugin/engine/errors.ts
 var GoalAcceptanceError = class extends Error {
@@ -264,7 +266,7 @@ var GoalAcceptanceEngine = class {
       );
     }
     const evidenceType = spec.evidenceType ?? "text";
-    const selfClaimed = spec.status === "passed" && this.state.role === "agent";
+    const selfClaimed = spec.status === "passed" && this.state.role === "agent" && spec.byReviewer !== true;
     const now = Date.now();
     const event = {
       type: "goal-acceptance/validate",
@@ -370,6 +372,121 @@ var GoalAcceptanceEngine = class {
       ...this.state.taskPlan.get(id),
       status: this.state.taskStatuses.get(id) ?? this.state.taskPlan.get(id).status
     }));
+  }
+  /** Pending tasks whose dependencies are all completed, in declaration order. */
+  readyTasks() {
+    return this.getTaskPlan().filter(
+      (t) => t.status === "pending" && t.dependsOn.every((dep) => (this.state.taskStatuses.get(dep) ?? "pending") === "completed")
+    );
+  }
+  /** Criteria linked to a task via criterion.taskIds — its acceptance contract. */
+  linkedCriteria(taskId) {
+    return this.getCriteria().filter((c) => c.taskIds.includes(taskId));
+  }
+  /**
+   * Task dispatch node: claim a task for a worker. Marks the task in_progress
+   * and returns it with its linked criteria (the work + acceptance contract).
+   * Without taskId, claims the first dependency-ready task in plan order.
+   */
+  async claimTask(taskId) {
+    this.sync();
+    if (this.state.taskPlan.size === 0) {
+      throw new GoalAcceptanceError("no task plan set \u2014 call set_task_plan first", "GOAL_ACCEPTANCE_INVALID_TASK_PLAN");
+    }
+    let task;
+    if (taskId !== void 0) {
+      task = this.getTaskPlan().find((t) => t.id === taskId);
+      if (task === void 0) {
+        throw new GoalAcceptanceError(`task "${taskId}" not found`, "GOAL_ACCEPTANCE_TASK_NOT_FOUND");
+      }
+      if (task.status !== "pending") {
+        throw new GoalAcceptanceError(
+          `task "${taskId}" is not claimable (status: ${task.status})`,
+          "GOAL_ACCEPTANCE_TASK_NOT_CLAIMABLE"
+        );
+      }
+      const unmet = task.dependsOn.filter(
+        (dep) => (this.state.taskStatuses.get(dep) ?? "pending") !== "completed"
+      );
+      if (unmet.length > 0) {
+        throw new GoalAcceptanceError(
+          `task "${taskId}" has unmet dependencies: [${unmet.join(", ")}]`,
+          "GOAL_ACCEPTANCE_TASK_NOT_CLAIMABLE"
+        );
+      }
+    } else {
+      task = this.readyTasks()[0];
+      if (task === void 0) {
+        const plan = this.getTaskPlan();
+        const pending = plan.filter((t) => t.status === "pending");
+        const reason = pending.length === 0 ? "no pending tasks \u2014 all tasks are claimed or done" : `no claimable tasks \u2014 ${pending.length} pending task(s) are blocked by unmet dependencies: [${pending.map((t) => t.id).join(", ")}]`;
+        return { task: null, criteria: [], reason };
+      }
+    }
+    await this.updateTaskStatus({ taskId: task.id, status: "in_progress" });
+    const claimed = this.getTaskPlan().find((t) => t.id === task.id);
+    return { task: claimed, criteria: this.linkedCriteria(task.id) };
+  }
+  /**
+   * Task acceptance node: reviewer verdicts on the task's linked criteria.
+   * Verdicts are formal (never self-claimed) — the reviewer is the single
+   * authority. All linked required criteria formally passed → task completes
+   * and dependent tasks unlock. Otherwise the task stays in_progress and the
+   * blocking criteria are returned as rework feedback for the next round.
+   */
+  async reviewTask(taskId, verdicts) {
+    this.sync();
+    if (!Array.isArray(verdicts) || verdicts.length === 0) {
+      throw new GoalAcceptanceError("verdicts must be a non-empty array", "GOAL_ACCEPTANCE_INVALID_ARGS");
+    }
+    const task = this.getTaskPlan().find((t) => t.id === taskId);
+    if (task === void 0) {
+      throw new GoalAcceptanceError(`task "${taskId}" not found`, "GOAL_ACCEPTANCE_TASK_NOT_FOUND");
+    }
+    if (task.status !== "in_progress") {
+      throw new GoalAcceptanceError(
+        `task "${taskId}" is not in_progress (status: ${task.status}) \u2014 claim it first`,
+        "GOAL_ACCEPTANCE_TASK_NOT_IN_PROGRESS"
+      );
+    }
+    const linked = this.linkedCriteria(taskId);
+    if (linked.length === 0) {
+      throw new GoalAcceptanceError(
+        `task "${taskId}" has no linked criteria \u2014 nothing to review against`,
+        "GOAL_ACCEPTANCE_TASK_NO_LINKED_CRITERIA"
+      );
+    }
+    const linkedIds = new Set(linked.map((c) => c.id));
+    for (const v of verdicts) {
+      if (!linkedIds.has(v.criterionId)) {
+        throw new GoalAcceptanceError(
+          `criterion "${v.criterionId}" is not linked to task "${taskId}". Linked: [${linked.map((c) => c.id).join(", ")}]`,
+          "GOAL_ACCEPTANCE_CRITERION_NOT_IN_TASK"
+        );
+      }
+    }
+    for (const v of verdicts) {
+      await this.validateCriterion({ ...v, byReviewer: true });
+    }
+    const blocking = this.linkedCriteria(taskId).filter(
+      (c) => c.required && !(c.status === "passed" && c.selfClaimed !== true)
+    );
+    if (blocking.length > 0) {
+      return {
+        taskCompleted: false,
+        task: this.getTaskPlan().find((t) => t.id === taskId),
+        blockingCriteria: blocking
+      };
+    }
+    await this.updateTaskStatus({ taskId, status: "completed" });
+    const next = this.readyTasks()[0];
+    return {
+      taskCompleted: true,
+      task: this.getTaskPlan().find((t) => t.id === taskId),
+      blockingCriteria: [],
+      nextTask: next ?? null,
+      nextTaskCriteria: next ? this.linkedCriteria(next.id) : []
+    };
   }
   /** Get all criteria in declaration order. */
   getCriteria() {
@@ -597,9 +714,6 @@ function dependsOnTransitive(criterion, targetId, criteria, visited) {
 }
 
 // src/plugin/goal-manager.ts
-import { randomUUID } from "node:crypto";
-import { existsSync, mkdirSync, readdirSync, readFileSync, unlinkSync, writeFileSync } from "node:fs";
-import { join } from "node:path";
 var FileAcceptanceStore = class {
   path;
   constructor(path) {
@@ -862,7 +976,60 @@ function toGoalAcceptanceEvent(event) {
   return { ...event.data, type: event.type };
 }
 
+// src/plugin/biz-cli.ts
+function managerFor(config) {
+  return new GoalManager(String(config.pluginData ?? ""));
+}
+async function checkCli(_argv, ctx) {
+  const mgr = managerFor(ctx.config);
+  const goalId = mgr.getCurrentGoalId();
+  if (goalId === null) ctx.fail("check: no active goal");
+  const result = mgr.getEngine().canComplete();
+  if (result.allowed) {
+    ctx.log(`check: allowed (goal ${goalId})`);
+    return;
+  }
+  const blocking = mgr.getEngine().getCriteria().filter((c) => c.required && (c.status !== "passed" || c.selfClaimed === true)).map((c) => {
+    const flags = [c.status];
+    if (c.selfClaimed === true) flags.push("self-claimed, needs confirm_criterion");
+    return `  - ${c.id}: ${c.description} [${flags.join(", ")}]`;
+  }).join("\n");
+  ctx.fail(`check: blocked (goal ${goalId})
+${result.reason ?? ""}${blocking ? `
+blocking criteria:
+${blocking}` : ""}`);
+}
+async function statusCli(_argv, ctx) {
+  const mgr = managerFor(ctx.config);
+  const goalId = mgr.getCurrentGoalId();
+  if (goalId === null) {
+    ctx.log(JSON.stringify({ goalId: null, allowed: false, reason: "no active goal" }));
+    return;
+  }
+  const engine = mgr.getEngine();
+  const result = engine.canComplete();
+  const summary = engine.summarize();
+  const meta = mgr.getCurrentGoalMeta();
+  ctx.log(
+    JSON.stringify({
+      goalId,
+      goal: meta ? { id: meta.id, title: meta.title, description: meta.description } : void 0,
+      allowed: result.allowed,
+      reason: result.reason,
+      criteria: engine.getCriteria().map((c) => ({
+        id: c.id,
+        description: c.description,
+        status: c.status,
+        required: c.required,
+        selfClaimed: c.selfClaimed === true
+      })),
+      summary
+    })
+  );
+}
+
 // src/plugin/tools.ts
+import { execSync } from "node:child_process";
 var CRITERION_ITEM_SCHEMA = {
   type: "object",
   additionalProperties: false,
@@ -983,7 +1150,7 @@ var tools = [
       "WORKFLOW (follow in order):",
       "1. PLANNING: For multi-step tasks, spawn a planning subagent (subagent_explore profile) to explore the codebase, draft criteria with goal-backward coverage analysis (every requirement mapped to a criterion, no overlaps, no gaps), then call this tool. Do NOT write criteria directly under execution pressure.",
       "2. TASK PLAN: Call set_task_plan to decompose the goal into atomic tasks with dependencies.",
-      "3. EXECUTE: update_task_status as tasks progress.",
+      "3. EXECUTE: update_task_status as tasks progress. Orchestrated variant: claim_task dispatches the next dependency-ready task to a worker (returns task + linked criteria as the contract); review_task \u2014 called by an independent reviewer subagent \u2014 records formal verdicts and either completes the task (unlocking dependents) or returns blockingCriteria as rework feedback.",
       "4. VALIDATE: validate_criterion with evidence_type=command/file/url (NEVER text). You MUST run the actual command before validating.",
       "5. CONFIRM: confirm_criterion MUST be called by an independent reviewer agent with fresh high-confidence evidence. Converts self-claimed passes to formal passes.",
       "6. COMPLETE: can_complete_goal checks all required criteria are formally passed. Self-claimed required criteria block completion.",
@@ -1231,6 +1398,93 @@ var tools = [
           status: args.status,
           summary: verbose ? summary : slimSummary(summary)
         };
+      } catch (e) {
+        return fail(e);
+      }
+    }
+  },
+  {
+    name: "claim_task",
+    description: [
+      "Task dispatch node for the orchestrated worker/reviewer loop. Claims a task for a worker: marks it in_progress and returns the task plus its linked acceptance criteria \u2014 the work contract.",
+      "",
+      "Without task_id, claims the first pending task whose dependencies are all completed. With task_id, claims that specific task (its dependencies must be completed).",
+      "",
+      "The worker executes the returned task against the returned criteria. The worker should NOT validate \u2014 validation belongs to review_task, called by an independent reviewer subagent."
+    ].join("\n"),
+    inputSchema: {
+      type: "object",
+      additionalProperties: false,
+      properties: {
+        task_id: {
+          type: "string",
+          description: "Optional task id to claim. When omitted, the next dependency-ready task in plan order is claimed."
+        }
+      }
+    },
+    handler: async (args, ctx) => {
+      const mgr = getManager(ctx.config);
+      try {
+        const engine = mgr.getEngine();
+        const result = await engine.claimTask(args.task_id);
+        return { goalId: mgr.getCurrentGoalId(), ...result };
+      } catch (e) {
+        return fail(e);
+      }
+    }
+  },
+  {
+    name: "review_task",
+    description: [
+      "Task acceptance node for the orchestrated worker/reviewer loop. Records the independent reviewer's verdicts on the claimed task's linked criteria.",
+      "",
+      "CALLER: a reviewer agent that is NOT the worker \u2014 it re-verifies each criterion with fresh evidence. Verdicts are formal (never self-claimed): this is the single validation layer.",
+      "",
+      "Semantics: verdicts may only cover criteria linked to the task. All linked required criteria formally passed \u2192 task completes and the next dependency-ready task is returned for claiming. Any required criterion not formally passed \u2192 task stays in_progress and blockingCriteria is the rework feedback the worker should fix before the next review round."
+    ].join("\n"),
+    inputSchema: {
+      type: "object",
+      additionalProperties: false,
+      required: ["task_id", "verdicts"],
+      properties: {
+        task_id: { type: "string", description: "The in_progress task being reviewed." },
+        verdicts: {
+          type: "array",
+          description: "Reviewer verdicts, one per linked criterion being judged this round.",
+          items: {
+            type: "object",
+            additionalProperties: false,
+            required: ["criterion_id", "status", "evidence"],
+            properties: {
+              criterion_id: { type: "string", description: "A criterion linked to this task." },
+              status: {
+                type: "string",
+                enum: ["pending", "in_progress", "passed", "failed", "blocked", "not_run"],
+                description: "Reviewed outcome for this criterion."
+              },
+              evidence: { type: "string", description: "Fresh verification evidence gathered by the reviewer. Required for passed/failed." },
+              evidence_type: {
+                type: "string",
+                enum: ["command", "file", "url", "text"],
+                description: "Evidence type. command/file/url are high-confidence."
+              }
+            }
+          }
+        }
+      }
+    },
+    handler: async (args, ctx) => {
+      const mgr = getManager(ctx.config);
+      try {
+        const engine = mgr.getEngine();
+        const verdicts = args.verdicts.map((v) => ({
+          criterionId: v.criterion_id,
+          status: v.status,
+          evidence: v.evidence,
+          evidenceType: v.evidence_type
+        }));
+        const result = await engine.reviewTask(args.task_id, verdicts);
+        return { goalId: mgr.getCurrentGoalId(), ...result };
       } catch (e) {
         return fail(e);
       }
@@ -1625,7 +1879,7 @@ ${stderr.trim()}` : "",
 // src/plugin/manifest.ts
 var manifest = {
   name: "@cckyros/goal-acceptance",
-  version: "0.2.6",
+  version: "0.2.7",
   // 0.1.x monorepo → 0.2.0 single-package scaffold
   brand: "goal-acceptance",
   description: "Acceptance-criteria-driven goal completion for autonomous agents.",
@@ -1673,8 +1927,15 @@ var manifest = {
   ],
   tools,
   // Skill body ships as assets/SKILL.md (byte-synced to skills/<skillDir>/).
-  skill: { filename: "SKILL.md" }
-  // No hook / bizCli / doctorChecks — goal acceptance is tool-driven; the
+  skill: { filename: "SKILL.md" },
+  // Headless subcommands for external orchestrators (ralph-orchestrator
+  // pre.loop.complete hooks, CI gates): `check` exits 0 only when
+  // can_complete_goal allows, `status` prints the JSON summary.
+  bizCli: {
+    check: checkCli,
+    status: statusCli
+  }
+  // No hook / doctorChecks — goal acceptance is tool-driven; the
   // dsh steering behavior lives in src/plugin/dsh-plugin.ts (cordis plugin).
 };
 
@@ -1834,6 +2095,14 @@ var GoalAcceptanceService = class extends Service {
   /** Update the status of a linked task. */
   updateTaskStatus(agent, spec) {
     return this.getEngine(agent).updateTaskStatus(spec);
+  }
+  /** Task dispatch node: claim a task (next dependency-ready, or by id). */
+  claimTask(agent, taskId) {
+    return this.getEngine(agent).claimTask(taskId);
+  }
+  /** Task acceptance node: reviewer verdicts on the task's linked criteria. */
+  reviewTask(agent, taskId, verdicts) {
+    return this.getEngine(agent).reviewTask(taskId, verdicts);
   }
   /** Get all criteria for the given agent in declaration order. */
   getCriteria(agent) {
@@ -2081,6 +2350,78 @@ function createAcceptanceTools(ctx) {
       }));
     },
     presentCall: (args) => present(`Update task "${String(args.task_id)}" -> ${String(args.status)}`, "other", args)
+  });
+  const claimTaskTool = defineTool({
+    name: "claim_task",
+    description: description("claim_task"),
+    parameters: {
+      task_id: {
+        type: "string",
+        description: "Optional task id to claim. When omitted, the next dependency-ready task in plan order is claimed."
+      }
+    },
+    output: {
+      schema: OUTPUT_OBJECT_SCHEMA,
+      render: (_args, value) => [{ type: "text", text: JSON.stringify(value, null, 2) }]
+    },
+    execute(args, exec) {
+      const agent = exec.agent;
+      if (agent === void 0) throw new Error("acceptance tools require a calling agent");
+      const service = ctx.get("goalAcceptance");
+      if (service === void 0) throw new Error("goalAcceptance service is not mounted");
+      return service.claimTask(agent, args.task_id).then((result) => ({
+        goalId: service.getActiveGoalId(agent),
+        ...result
+      }));
+    },
+    presentCall: (args) => present(`Claim task${args.task_id !== void 0 ? ` "${String(args.task_id)}"` : ""}`, "other", args)
+  });
+  const reviewTaskTool = defineTool({
+    name: "review_task",
+    description: description("review_task"),
+    parameters: {
+      task_id: {
+        type: "string",
+        required: true,
+        description: "The in_progress task being reviewed."
+      },
+      verdicts: {
+        type: "array",
+        required: true,
+        description: "Reviewer verdicts, one per linked criterion being judged this round.",
+        items: {
+          type: "object",
+          additionalProperties: false,
+          properties: {
+            criterion_id: { type: "string", required: true, description: "A criterion linked to this task." },
+            status: { type: "string", required: true, enum: STATUSES, description: "Reviewed outcome." },
+            evidence: { type: "string", required: true, description: "Fresh verification evidence gathered by the reviewer." },
+            evidence_type: { type: "string", enum: ["command", "file", "url", "text"], description: "Evidence type." }
+          }
+        }
+      }
+    },
+    output: {
+      schema: OUTPUT_OBJECT_SCHEMA,
+      render: (_args, value) => [{ type: "text", text: JSON.stringify(value, null, 2) }]
+    },
+    execute(args, exec) {
+      const agent = exec.agent;
+      if (agent === void 0) throw new Error("acceptance tools require a calling agent");
+      const service = ctx.get("goalAcceptance");
+      if (service === void 0) throw new Error("goalAcceptance service is not mounted");
+      const verdicts = args.verdicts.map((v) => ({
+        criterionId: v.criterion_id,
+        status: v.status,
+        evidence: v.evidence,
+        ...v.evidence_type !== void 0 ? { evidenceType: v.evidence_type } : {}
+      }));
+      return service.reviewTask(agent, args.task_id, verdicts).then((result) => ({
+        goalId: service.getActiveGoalId(agent),
+        ...result
+      }));
+    },
+    presentCall: (args) => present(`Review task "${String(args.task_id)}"`, "other", args)
   });
   const amendTool = defineTool({
     name: "amend_acceptance_criteria",
@@ -2375,7 +2716,7 @@ ${stderr.trim()}` : "",
     },
     presentCall: () => present("Reset goal", "other")
   });
-  return [setTool, getTool, validateTool, confirmTool, updateTaskTool, amendTool, canCompleteTool, setPlanTool, getPlanTool, startTool, createTool, listTool, switchTool, runAndValidateTool, quickStartTool, resetTool];
+  return [setTool, getTool, validateTool, confirmTool, updateTaskTool, claimTaskTool, reviewTaskTool, amendTool, canCompleteTool, setPlanTool, getPlanTool, startTool, createTool, listTool, switchTool, runAndValidateTool, quickStartTool, resetTool];
 }
 async function apply2(ctx, config = {}) {
   const autoSteer = config.autoSteerUncompleted !== false;

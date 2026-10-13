@@ -429,6 +429,7 @@ export async function runCli(deps: CliDeps, argv: string[] = process.argv.slice(
         await biz(positionals.slice(1), {
           log: (msg) => process.stdout.write(msg + "\n"),
           fail: (msg) => fail(manifest, msg),
+          config: resolveConfig(manifest, process.cwd()).values,
         });
         return 0;
       }
