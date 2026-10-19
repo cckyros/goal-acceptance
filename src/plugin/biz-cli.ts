@@ -27,11 +27,18 @@ export async function checkCli(_argv: string[], ctx: BizCliContext): Promise<voi
   const goalId = mgr.getCurrentGoalId();
   if (goalId === null) ctx.fail("check: no active goal");
 
-  const result = mgr.getEngine().canComplete();
+  const engine = mgr.getEngine();
+  const result = engine.canComplete();
   if (result.allowed) {
     ctx.log(`check: allowed (goal ${goalId})`);
     return;
   }
+
+  const drifted = engine
+    .checkArtifactDrift()
+    .drifted.filter((d) => d.criterion.required)
+    .map((d) => `  - ${d.criterion.id}: drifted artifacts [${d.reasons.map((r) => `${r.path}(${r.kind})`).join(", ")}]`)
+    .join("\n");
 
   const blocking = mgr
     .getEngine()
@@ -43,7 +50,7 @@ export async function checkCli(_argv: string[], ctx: BizCliContext): Promise<voi
       return `  - ${c.id}: ${c.description} [${flags.join(", ")}]`;
     })
     .join("\n");
-  ctx.fail(`check: blocked (goal ${goalId})\n${result.reason ?? ""}${blocking ? `\nblocking criteria:\n${blocking}` : ""}`);
+  ctx.fail(`check: blocked (goal ${goalId})\n${result.reason ?? ""}${drifted ? `\ndrifted artifacts:\n${drifted}` : ""}${blocking ? `\nblocking criteria:\n${blocking}` : ""}`);
 }
 
 /** `goal-acceptance status` — machine-readable summary for scripts/hats. */
@@ -58,6 +65,7 @@ export async function statusCli(_argv: string[], ctx: BizCliContext): Promise<vo
   const engine = mgr.getEngine();
   const result = engine.canComplete();
   const summary = engine.summarize();
+  const drift = engine.checkArtifactDrift();
   const meta = mgr.getCurrentGoalMeta();
   ctx.log(
     JSON.stringify({
@@ -65,6 +73,7 @@ export async function statusCli(_argv: string[], ctx: BizCliContext): Promise<vo
       goal: meta ? { id: meta.id, title: meta.title, description: meta.description } : undefined,
       allowed: result.allowed,
       reason: result.reason,
+      ...(drift.drifted.length > 0 ? { drift: drift.drifted } : {}),
       criteria: engine.getCriteria().map((c) => ({
         id: c.id,
         description: c.description,

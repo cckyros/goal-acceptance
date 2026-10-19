@@ -139,7 +139,7 @@ test("tools/call quick_start_goal initializes goal and task plan in one call", (
 });
 
 test("tools/call run_and_validate executes command and records evidence", () => {
-  const [init, run] = mcpSession([
+  const [, run] = mcpSession([
     JSON.stringify({
       jsonrpc: "2.0",
       id: 11,

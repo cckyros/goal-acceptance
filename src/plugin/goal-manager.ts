@@ -10,7 +10,7 @@
  */
 
 import { randomUUID } from 'node:crypto'
-import { existsSync, mkdirSync, readdirSync, readFileSync, unlinkSync, writeFileSync } from 'node:fs'
+import { existsSync, mkdirSync, readdirSync, readFileSync, rmSync, statSync, unlinkSync, writeFileSync } from 'node:fs'
 import { join } from 'node:path'
 // Type-only: erased at build; keeps the dsh session adapter in this shared file
 // without pulling @deepseek-ai/* into the MCP/OpenClaw bundles.
@@ -60,6 +60,43 @@ export class FileAcceptanceStore implements GoalAcceptanceStore {
     events.push(event)
     await this.#write(events)
   }
+
+  /**
+   * mkdir-based mutual exclusion covering a whole check-then-act section
+   * (claim_task, review_task). mkdir is atomic on POSIX and NTFS local
+   * filesystems; EEXIST means another process/thread holds the lock.
+   * Stale locks are reclaimed after 15s by mtime. NOT re-entrant.
+   */
+  async withLock<T>(fn: () => Promise<T> | T): Promise<T> {
+    const lockDir = `${this.path}.lock`
+    const deadline = Date.now() + 30_000
+    const staleMs = 15_000
+    for (;;) {
+      try {
+        mkdirSync(lockDir)
+        break
+      } catch (e) {
+        if ((e as NodeJS.ErrnoException).code !== 'EEXIST') throw e
+        try {
+          if (Date.now() - statSync(lockDir).mtimeMs > staleMs) {
+            rmSync(lockDir, { recursive: true, force: true })
+            continue
+          }
+        } catch {
+          // raced cleanup — fall through to retry
+        }
+        if (Date.now() > deadline) {
+          throw new GoalAcceptanceError(`store lock timeout: ${lockDir}`, 'GOAL_ACCEPTANCE_INVALID_ARGS')
+        }
+        await new Promise(r => setTimeout(r, 5))
+      }
+    }
+    try {
+      return await fn()
+    } finally {
+      rmSync(lockDir, { recursive: true, force: true })
+    }
+  }
 }
 
 interface GoalMeta {
@@ -67,6 +104,8 @@ interface GoalMeta {
   readonly title: string
   readonly description?: string
   readonly createdAt: number
+  /** Root that artifact paths resolve against. Set-once (create_goal or first set_criteria workspace arg). */
+  readonly workspaceRoot?: string
 }
 
 export interface GoalListItem extends GoalMeta {
@@ -113,10 +152,26 @@ export class GoalManager {
   private getOrCreateEngine(goalId: string): GoalAcceptanceEngine {
     let engine = this.engineCache.get(goalId)
     if (engine === undefined) {
-      engine = new GoalAcceptanceEngine(this.storeForGoal(goalId))
+      engine = new GoalAcceptanceEngine(this.storeForGoal(goalId), this.loadGoalMeta(goalId)?.workspaceRoot)
       this.engineCache.set(goalId, engine)
     }
     return engine
+  }
+
+  /** Bind the workspace root on the active goal. Set-once; persists to meta. */
+  setWorkspaceRoot(root: string): void {
+    const engine = this.getEngine()
+    engine.setWorkspaceRoot(root)
+    const id = this.currentGoalId
+    if (id === null) return
+    const meta = this.metaCache.get(id)
+    if (meta === undefined || meta.workspaceRoot === root) return
+    const updated: GoalMeta = { ...meta, workspaceRoot: root }
+    this.metaCache.set(id, updated)
+    const dir = this.goalsDir
+    if (dir) {
+      writeFileSync(join(dir, `${id}.meta.json`), JSON.stringify(updated, null, 2) + '\n')
+    }
   }
 
   /** Get the engine for the active goal. Throws if no active goal. */
@@ -139,12 +194,13 @@ export class GoalManager {
   }
 
   /** Start a new goal. Generates a UUID, persists metadata, sets it as current. */
-  startGoal(title?: string, description?: string): GoalMeta {
+  startGoal(title?: string, description?: string, workspaceRoot?: string): GoalMeta {
     const id = randomUUID()
     const meta: GoalMeta = {
       id,
       title: title ?? '',
       ...description !== undefined ? { description } : {},
+      ...workspaceRoot !== undefined ? { workspaceRoot } : {},
       createdAt: Date.now(),
     }
     const dir = this.goalsDir
@@ -157,7 +213,7 @@ export class GoalManager {
     this.currentGoalId = id
     this.persistCurrentGoal()
     // Pre-create engine so the goal is immediately usable
-    this.engineCache.set(id, new GoalAcceptanceEngine(this.storeForGoal(id)))
+    this.engineCache.set(id, new GoalAcceptanceEngine(this.storeForGoal(id), workspaceRoot))
     return meta
   }
 

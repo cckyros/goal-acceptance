@@ -7,7 +7,7 @@ allowed-tools: Bash Read
 
 # {{brand}} — goal acceptance skill
 
-This plugin ships 18 MCP/agent tools that drive acceptance-criteria-based
+This plugin ships 19 MCP/agent tools that drive acceptance-criteria-based
 goal completion: you lock criteria before implementing, track task progress,
 validate each criterion with real evidence, and block completion until an
 independent reviewer confirms the work.

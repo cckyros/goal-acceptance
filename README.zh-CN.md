@@ -41,7 +41,7 @@
 `.mcp.json` / `skills/` / `openclaw.plugin.json` / `openclaw-dist/`）
 写入客户端原生配置。
 
-### 3. MCP server 提供 18 个工具
+### 3. MCP server 提供 19 个工具
 
 MCP server 覆盖完整的目标验收生命周期：
 
@@ -98,7 +98,7 @@ src/
 ├── plugin/
 │   ├── engine/             # 事件源状态机（core）
 │   ├── goal-manager.ts     # 多目标管理器（所有通路共享）
-│   ├── tools.ts            # 18 个 ToolDef（manifest.tools 数据源）
+│   ├── tools.ts            # 19 个 ToolDef（manifest.tools 数据源）
 │   ├── manifest.ts         # 身份唯一来源
 │   ├── dsh-plugin.ts       # DeepSeek Harness Cordis 插件
 │   ├── openclaw-plugin.ts  # OpenClaw 原生插件（typebox、进程内）
@@ -192,7 +192,7 @@ PLUGIN_DATA=/path/to/data node dist/cli.js mcp
 ### OpenClaw 原生插件
 
 `openclaw-dist/` 携带进程内插件（bundle + 带 `openclaw.extensions` 契约的最小
-package.json），`openclaw.plugin.json` 声明 18 个工具契约：
+package.json），`openclaw.plugin.json` 声明 19 个工具契约：
 
 ```sh
 openclaw plugins install @cckyros/goal-acceptance
@@ -202,7 +202,7 @@ openclaw gateway restart
 openclaw plugins list            # goal-acceptance: loaded
 ```
 
-18 个工具可在 OpenClaw 会话中使用。`Shape: non-capability` 对工具插件是正常的
+19 个工具可在 OpenClaw 会话中使用。`Shape: non-capability` 对工具插件是正常的
 ——工具经 `defineToolPlugin` 注册，不经过 capability 系统。
 
 每次会改变目标状态的工具调用后（`start_goal`、`set_acceptance_criteria`、
@@ -228,7 +228,7 @@ openclaw plugins list            # goal-acceptance: loaded
 
 该插件：
 
-- 注册与 MCP 适配器相同的 18 个模型工具
+- 注册与 MCP 适配器相同的 19 个模型工具
 - 注入 `policy:goal-acceptance` 系统提示段落，给出任务进度与 next-actionable 排序
 - 拦截 `agent/turn-stopping`，按依赖感知优先级把 Agent 拉回待办工作，
   以及等待 reviewer 确认的自评标准
@@ -318,6 +318,7 @@ hooks:
 | `claim_task` | 任务分配节点：为 worker 认领下一个依赖就绪的任务（或指定 `task_id`）——标记 `in_progress` 并返回任务 + 关联 criteria，即任务粒度的验收契约。 |
 | `review_task` | 任务验收节点：独立 reviewer 对该任务关联 criteria 记录正式判定（单层验收，不产生 self-claimed）。全部 required 正式通过 → 任务完成并解锁依赖任务（返回 `nextTask`）；否则 `blockingCriteria` 为下一轮的打回反馈。 |
 | `amend_acceptance_criteria` | 初次锁定后追加新标准。必须提供 reason。已有标准不会被修改。 |
+| `update_criterion` | 修补已有标准的声明（`description`/`required`/`method`/`verify_command`/`artifacts`），必须提供审计 reason。对已 passed 的标准改 `artifacts` 或 `verify_command` 会重置为 pending（强制复验）。`verify_command: null` 清除钉死。 |
 | `can_complete_goal` | 检查所有必需标准是否已正式通过（自评不计）。返回 `{ allowed: boolean, reason?: string }`。 |
 | `start_goal` | 以全新状态开始新的独立目标（可选 `title`）。新目标成为活动目标。当前目标已锁定且需要新任务时使用。 |
 | `create_goal` | 创建命名目标（`name` 必填，`description` 可选）并设为活动目标。始终开启新目标；元数据会显示在 `list_goals` 中。 |
@@ -409,7 +410,7 @@ class MyDbStore implements GoalAcceptanceStore {
 
 | 能力 | dsh Cordis 插件 | CLI MCP server | Agent Plugin | OpenClaw 原生 |
 |------------|:---:|:---:|:---:|:---:|
-| 模型工具 | 18 个（见 [MCP 工具](#mcp-工具)） | 18 个（见 [MCP 工具](#mcp-工具)） | 与 MCP 相同 | 与 MCP 相同（进程内） |
+| 模型工具 | 19 个（见 [MCP 工具](#mcp-工具)） | 19 个（见 [MCP 工具](#mcp-工具)） | 与 MCP 相同 | 与 MCP 相同（进程内） |
 | 系统提示 / 技能 | `policy:goal-acceptance` | `skills/` | `skills/` | `skills/` |
 | 停止时强制 | 是（`agent.steer()`，依赖感知） | 否 | 否 | 否 |
 | 跨客户端便携 | 否（仅 Harness） | 是（任意 MCP 客户端） | 是（任意 Agent Plugins 客户端） | 否（仅 OpenClaw） |
@@ -435,7 +436,7 @@ src/
 │   ├── manifest.ts         # 身份唯一来源（name、tools、markers、config）
 │   ├── engine/             # 事件源状态机（零依赖）
 │   ├── goal-manager.ts     # 多目标管理器 + store（所有通路共享）
-│   ├── tools.ts            # 18 个 ToolDef
+│   ├── tools.ts            # 19 个 ToolDef
 │   ├── dsh-plugin.ts       # Cordis 插件（service、tools、steer、prompt）
 │   ├── openclaw-plugin.ts  # OpenClaw 原生插件
 │   ├── openclaw-session-sync.ts  # 将活动目标同步到 OpenClaw SessionEntry.goal

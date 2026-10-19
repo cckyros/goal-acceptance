@@ -34,6 +34,15 @@ const CRITERION_ITEM_SCHEMA = {
       items: { type: 'string' },
       description: 'IDs of criteria that must be passed before this one.',
     },
+    artifacts: {
+      type: 'array',
+      items: { type: 'string' },
+      description: 'Workspace-relative file paths this verdict binds to. Their sha256 is recorded at validation; any later change makes the gate report drift and block completion.',
+    },
+    verify_command: {
+      type: 'string',
+      description: 'The single shell command authorized to prove this criterion. When set, run_and_validate executes exactly this command (and refuses any other).',
+    },
   },
 }
 
@@ -111,6 +120,8 @@ interface CriterionInput {
   method?: string
   task_ids?: string[]
   depends_on?: string[]
+  artifacts?: string[]
+  verify_command?: string
 }
 
 function mapCriterion(c: CriterionInput) {
@@ -121,6 +132,8 @@ function mapCriterion(c: CriterionInput) {
     ...c.method !== undefined ? { method: c.method } : {},
     ...c.task_ids !== undefined ? { taskIds: c.task_ids } : {},
     ...c.depends_on !== undefined ? { dependsOn: c.depends_on } : {},
+    ...c.artifacts !== undefined ? { artifacts: c.artifacts } : {},
+    ...c.verify_command !== undefined ? { verifyCommand: c.verify_command } : {},
   }
 }
 
@@ -196,14 +209,20 @@ export const tools: ToolDef[] = [
           enum: ['agent', 'reviewer', 'dual'],
           description: 'Role locking the criteria. agent (default): passed marks self-claimed, requiring confirm_criterion by an independent reviewer. reviewer/dual: formal passed immediately (use only when the user explicitly waives independent review).',
         },
+        workspace: {
+          type: 'string',
+          description: 'Absolute path of the workspace that criterion artifacts resolve against. Required when any criterion declares artifacts. Set-once per goal.',
+        },
       },
     },
     handler: async (args, ctx: ToolContext) => {
       const mgr = getManager(ctx.config as { pluginData?: string })
       const criteria = args.criteria as CriterionInput[]
       const role = (args.role as GoalRole | undefined) ?? 'agent'
+      const workspace = typeof args.workspace === 'string' && args.workspace.trim().length > 0 ? args.workspace.trim() : undefined
       let engine = mgr.ensureGoal()
       try {
+        if (workspace !== undefined) mgr.setWorkspaceRoot(workspace)
         const list = await engine.setCriteria(criteria.map(mapCriterion), role)
         const summary = engine.summarize()
         return { goalId: mgr.getCurrentGoalId(), criteria: list, summary }
@@ -219,6 +238,7 @@ export const tools: ToolDef[] = [
           const previousGoalSummary = slimSummary(engine.summarize())
           mgr.startGoal()
           engine = mgr.getEngine()
+          if (workspace !== undefined) mgr.setWorkspaceRoot(workspace)
           const list = await engine.setCriteria(criteria.map(mapCriterion), role)
           return {
             goalId: mgr.getCurrentGoalId(),
@@ -257,7 +277,13 @@ export const tools: ToolDef[] = [
           return { goalId: mgr.getCurrentGoalId(), summary: slimSummary(summary) }
         }
         const criteria = engine.getCriteria()
-        return { goalId: mgr.getCurrentGoalId(), criteria, summary }
+        const drift = engine.checkArtifactDrift()
+        return {
+          goalId: mgr.getCurrentGoalId(),
+          criteria,
+          summary,
+          ...drift.drifted.length > 0 ? { drift: drift.drifted } : {},
+        }
       } catch (e) {
         return fail(e)
       }
@@ -298,6 +324,10 @@ export const tools: ToolDef[] = [
           enum: ['command', 'file', 'url', 'text'],
           description: 'Type of evidence. text = low confidence. Default: text.',
         },
+        command: {
+          type: 'string',
+          description: 'The shell command actually executed for this verdict. REQUIRED for status=passed when the criterion pins verify_command, and must equal it.',
+        },
         verbose: {
           type: 'boolean',
           description: 'Default false: returns criterion + slim summary. true: returns criterion + full summary.',
@@ -313,6 +343,7 @@ export const tools: ToolDef[] = [
           status: args.status as GoalCriterionStatus,
           evidence: args.evidence as string | undefined,
           ...args.evidence_type !== undefined ? { evidenceType: args.evidence_type as EvidenceType } : {},
+          ...typeof args.command === 'string' ? { command: args.command } : {},
         })
         const verbose = args.verbose === true
         const summary = engine.summarize()
@@ -430,6 +461,8 @@ export const tools: ToolDef[] = [
       '',
       'Without task_id, claims the first pending task whose dependencies are all completed. With task_id, claims that specific task (its dependencies must be completed).',
       '',
+      'REWORK CLAIMS: a completed task whose linked required criteria drifted (their bound artifact bytes changed) becomes claimable again — claimKind="rework" in the response. Rework claims take priority over the ready frontier.',
+      '',
       'The worker executes the returned task against the returned criteria. The worker should NOT validate — validation belongs to review_task, called by an independent reviewer subagent.',
     ].join('\n'),
     inputSchema: {
@@ -461,6 +494,8 @@ export const tools: ToolDef[] = [
       'CALLER: a reviewer agent that is NOT the worker — it re-verifies each criterion with fresh evidence. Verdicts are formal (never self-claimed): this is the single validation layer.',
       '',
       'Semantics: verdicts may only cover criteria linked to the task. All linked required criteria formally passed → task completes and the next dependency-ready task is returned for claiming. Any required criterion not formally passed → task stays in_progress and blockingCriteria is the rework feedback the worker should fix before the next review round.',
+      '',
+      'ARTIFACT BINDING: when a criterion declares artifacts, their sha256 is recorded with the verdict and the goal gate will fail (drift) if those bytes change afterwards — rework happens via a rework claim_task. When a criterion pins verify_command, re-run that exact command and use its real output as evidence.',
     ].join('\n'),
     inputSchema: {
       type: 'object',
@@ -488,6 +523,10 @@ export const tools: ToolDef[] = [
                 enum: ['command', 'file', 'url', 'text'],
                 description: 'Evidence type. command/file/url are high-confidence.',
               },
+              command: {
+                type: 'string',
+                description: 'The shell command the reviewer executed for this verdict. REQUIRED for status=passed when the criterion pins verify_command, and must equal it.',
+              },
             },
           },
         },
@@ -502,6 +541,7 @@ export const tools: ToolDef[] = [
           status: v.status as GoalCriterionStatus,
           evidence: v.evidence as string,
           evidenceType: v.evidence_type as EvidenceType | undefined,
+          command: v.command as string | undefined,
         }))
         const result = await engine.reviewTask(args.task_id as string, verdicts)
         return { goalId: mgr.getCurrentGoalId(), ...result }
@@ -524,11 +564,16 @@ export const tools: ToolDef[] = [
           items: CRITERION_ITEM_SCHEMA,
         },
         reason: { type: 'string', description: 'Human-readable reason for the amendment.' },
+        workspace: {
+          type: 'string',
+          description: 'Absolute path of the workspace that criterion artifacts resolve against. Required when any new criterion declares artifacts. Set-once per goal.',
+        },
       },
     },
     handler: async (args, ctx: ToolContext) => {
       const mgr = getManager(ctx.config as { pluginData?: string })
       try {
+        if (typeof args.workspace === 'string' && args.workspace.trim().length > 0) mgr.setWorkspaceRoot(args.workspace.trim())
         const engine = mgr.getEngine()
         const criteria = args.criteria as CriterionInput[]
         const added = await engine.amendCriteria({
@@ -537,6 +582,53 @@ export const tools: ToolDef[] = [
         })
         const summary = engine.summarize()
         return { goalId: mgr.getCurrentGoalId(), addedCriteria: added, summary }
+      } catch (e) {
+        return fail(e)
+      }
+    },
+  },
+  {
+    name: 'update_criterion',
+    description: [
+      'Patch an existing criterion\'s declaration after lock (fix a wrong verify_command, extend artifact bindings, correct description/method/required). Requires a reason — recorded in the event log for audit.',
+      '',
+      'SAFETY: patching artifacts or verify_command on a PASSED criterion resets it to pending — integrity-bearing changes force re-validation rather than silently re-baselining. verify_command: null clears the pin; artifacts: [] clears bindings.',
+    ].join('\n'),
+    inputSchema: {
+      type: 'object',
+      additionalProperties: false,
+      required: ['criterion_id', 'reason'],
+      properties: {
+        criterion_id: { type: 'string', description: 'Existing criterion id to patch.' },
+        reason: { type: 'string', description: 'Human-readable reason for the patch (audit trail).' },
+        description: { type: 'string', description: 'New criterion description.' },
+        required: { type: 'boolean', description: 'New required flag.' },
+        method: { type: 'string', enum: ['command', 'file', 'url', 'manual'], description: 'New verification method.' },
+        verify_command: { type: ['string', 'null'], description: 'New pinned command, or null to clear the pin.' },
+        artifacts: {
+          type: 'array',
+          items: { type: 'string' },
+          description: 'New artifact binding list (replaces the old one). Empty array clears bindings.',
+        },
+      },
+    },
+    handler: async (args, ctx: ToolContext) => {
+      const mgr = getManager(ctx.config as { pluginData?: string })
+      try {
+        const engine = mgr.getEngine()
+        const patch: Record<string, unknown> = {}
+        if (args.description !== undefined) patch.description = args.description
+        if (args.required !== undefined) patch.required = args.required
+        if (args.method !== undefined) patch.method = args.method
+        if (args.verify_command !== undefined) patch.verifyCommand = args.verify_command
+        if (args.artifacts !== undefined) patch.artifacts = args.artifacts
+        const updated = await engine.updateCriterion({
+          criterionId: args.criterion_id as string,
+          patch,
+          reason: args.reason as string,
+        })
+        const summary = engine.summarize()
+        return { goalId: mgr.getCurrentGoalId(), criterion: updated, summary: slimSummary(summary) }
       } catch (e) {
         return fail(e)
       }
@@ -553,6 +645,8 @@ export const tools: ToolDef[] = [
       '- failed/blocked/pending/in_progress: BLOCKED',
       '- not_run (required only): BLOCKED',
       '',
+      '- required criterion with artifact binding whose files changed since validation: BLOCKED (drift) — rework then re-validate',
+      '',
       'Do NOT declare the task complete until this returns allowed=true. If allowed=false, read the reason field and address each blocking criterion.',
     ].join('\n'),
     inputSchema: {
@@ -563,8 +657,14 @@ export const tools: ToolDef[] = [
     handler: async (_args, ctx: ToolContext) => {
       const mgr = getManager(ctx.config as { pluginData?: string })
       try {
-        const result = mgr.getEngine().canComplete()
-        return { goalId: mgr.getCurrentGoalId(), ...result }
+        const engine = mgr.getEngine()
+        const result = engine.canComplete()
+        const drift = engine.checkArtifactDrift()
+        return {
+          goalId: mgr.getCurrentGoalId(),
+          ...result,
+          ...drift.drifted.length > 0 ? { drift: drift.drifted } : {},
+        }
       } catch (e) {
         return fail(e)
       }
@@ -650,6 +750,7 @@ export const tools: ToolDef[] = [
       properties: {
         name: { type: 'string', description: 'Short goal name (stored as the goal title, shown by list_goals).' },
         description: { type: 'string', description: 'Optional longer description of what the goal achieves.' },
+        workspace: { type: 'string', description: 'Optional absolute workspace path that criterion artifacts resolve against.' },
       },
     },
     handler: async (args, ctx: ToolContext) => {
@@ -664,7 +765,8 @@ export const tools: ToolDef[] = [
           ))
         }
         const description = typeof args.description === 'string' ? args.description : undefined
-        const meta = mgr.startGoal(name.trim(), description)
+        const workspace = typeof args.workspace === 'string' && args.workspace.trim().length > 0 ? args.workspace.trim() : undefined
+        const meta = mgr.startGoal(name.trim(), description, workspace)
         return { goalId: meta.id, goal: meta, message: 'New goal created and set as active.' }
       } catch (e) {
         return fail(e)
@@ -724,11 +826,11 @@ export const tools: ToolDef[] = [
     inputSchema: {
       type: 'object',
       additionalProperties: false,
-      required: ['criterion_id', 'command'],
+      required: ['criterion_id'],
       properties: {
         criterion_id: { type: 'string', description: 'Criterion ID to validate.' },
-        command: { type: 'string', description: 'Shell command to execute (e.g. "pnpm test", "git status").' },
-        cwd: { type: 'string', description: 'Optional working directory for the command execution.' },
+        command: { type: 'string', description: 'Shell command to execute (e.g. "pnpm test", "git status"). Optional when the criterion pins a verify_command — then the pinned command runs.' },
+        cwd: { type: 'string', description: 'Optional working directory for the command execution. Rejected when the criterion pins a verify_command (pinned commands run in the goal workspace).' },
         timeout_ms: { type: 'number', description: 'Optional timeout in milliseconds (default 60000).' },
         verbose: { type: 'boolean', description: 'Default false: slim summary. true: full summary.' },
       },
@@ -737,9 +839,35 @@ export const tools: ToolDef[] = [
       const mgr = getManager(ctx.config as { pluginData?: string })
       const engine = mgr.getEngine()
       const criterionId = args.criterion_id as string
-      const command = args.command as string
-      const cwd = typeof args.cwd === 'string' && args.cwd.trim().length > 0 ? args.cwd.trim() : undefined
       const timeout = typeof args.timeout_ms === 'number' && args.timeout_ms > 0 ? args.timeout_ms : 60000
+
+      const criterion = engine.getCriteria().find(c => c.id === criterionId)
+      if (criterion === undefined) {
+        const allIds = engine.getCriteria().map(c => c.id)
+        const suggestion = suggestClosest(criterionId, allIds)
+        return fail(new GoalAcceptanceError(
+          `criterion_id "${criterionId}" not found. Available IDs: [${allIds.join(', ')}].${suggestion ? ` Did you mean "${suggestion}"?` : ''} Call get_acceptance_criteria to see the full list.`,
+          'GOAL_ACCEPTANCE_CRITERION_NOT_FOUND',
+        ))
+      }
+      const pinned = criterion.verifyCommand
+      const requested = typeof args.command === 'string' && args.command.trim().length > 0 ? args.command.trim() : undefined
+      const requestedCwd = typeof args.cwd === 'string' && args.cwd.trim().length > 0 ? args.cwd.trim() : undefined
+      if (pinned !== undefined) {
+        if ((requested !== undefined && requested !== pinned) || requestedCwd !== undefined) {
+          return fail(new GoalAcceptanceError(
+            `criterion "${criterionId}" pins verify_command "${pinned}" — run_and_validate must execute exactly that command in the goal workspace`,
+            'GOAL_ACCEPTANCE_VERIFY_COMMAND_MISMATCH',
+          ))
+        }
+      } else if (requested === undefined) {
+        return fail(new GoalAcceptanceError(
+          'command is required when the criterion does not pin a verify_command',
+          'GOAL_ACCEPTANCE_INVALID_ARGS',
+        ))
+      }
+      const command = pinned ?? requested!
+      const cwd = pinned !== undefined ? engine.getWorkspaceRoot() : requestedCwd
 
       let stdout = ''
       let stderr = ''
@@ -773,6 +901,7 @@ export const tools: ToolDef[] = [
           status,
           evidence: rawEvidence,
           evidenceType: 'command',
+          verifiedCommand: command,
         })
         const verbose = args.verbose === true
         const summary = engine.summarize()
@@ -826,6 +955,10 @@ export const tools: ToolDef[] = [
           items: TASK_PLAN_ITEM_SCHEMA,
           description: 'Optional task plan to lock simultaneously.',
         },
+        workspace: {
+          type: 'string',
+          description: 'Absolute path of the workspace that criterion artifacts resolve against. Required when any criterion declares artifacts.',
+        },
       },
     },
     handler: async (args, ctx: ToolContext) => {
@@ -835,10 +968,12 @@ export const tools: ToolDef[] = [
         const rawCriteria = (args.criteria ?? []) as CriterionInput[]
         const rawTasks = args.tasks as TaskInput[] | undefined
         const role = (args.role as GoalRole | undefined) ?? 'agent'
+        const workspace = typeof args.workspace === 'string' && args.workspace.trim().length > 0 ? args.workspace.trim() : undefined
         const mappedCriteria = rawCriteria.map(mapCriterion)
 
-        if (title !== undefined) mgr.startGoal(title)
+        if (title !== undefined) mgr.startGoal(title, undefined, workspace)
         let engine = mgr.ensureGoal()
+        if (workspace !== undefined) mgr.setWorkspaceRoot(workspace)
         let list: GoalCriterion[]
         let previousGoalId: string | undefined
         let previousGoalIncomplete = false
@@ -853,7 +988,7 @@ export const tools: ToolDef[] = [
             previousGoalSummary = slimSummary(engine.summarize())
             previousGoalIncomplete = !completion.allowed
             previousGoalReason = completion.reason
-            mgr.startGoal(title)
+            mgr.startGoal(title, undefined, workspace)
             engine = mgr.getEngine()
             list = await engine.setCriteria(mappedCriteria, role)
           } else {

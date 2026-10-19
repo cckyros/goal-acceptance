@@ -2,7 +2,7 @@
   "id": "goal-acceptance",
   "name": "goal-acceptance",
   "description": "Acceptance-criteria-driven goal completion for autonomous agents.",
-  "version": "0.2.9",
+  "version": "0.3.0",
   "configSchema": {
     "type": "object",
     "properties": {},
@@ -21,6 +21,7 @@
       "claim_task",
       "review_task",
       "amend_acceptance_criteria",
+      "update_criterion",
       "can_complete_goal",
       "set_task_plan",
       "get_task_plan",

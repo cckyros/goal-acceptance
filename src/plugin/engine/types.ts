@@ -79,6 +79,25 @@ export interface GoalCriterion {
   readonly evidenceType?: EvidenceType
   /** True when evidenceType=text (low confidence). Convenience flag for summary consumers. */
   readonly lowConfidence?: boolean
+  /** Workspace-relative (or absolute) file paths whose bytes this criterion's verdict binds to.
+   *  sha256 recorded at validation time; drift detection rechecks at gate time. */
+  readonly artifacts?: readonly string[]
+  /** The single shell command authorized to prove this criterion. Pinned at lock time. */
+  readonly verifyCommand?: string
+  /** sha256 (hex) of each declared artifact at the latest validation, keyed by normalized workspace-relative path. */
+  readonly artifactDigests?: Record<string, string>
+  /** Digest delta recorded by the latest re-validation, when the previous digests existed. */
+  readonly digestDelta?: ArtifactDigestDelta
+}
+
+/** Byte-level change between two artifact digest snapshots. */
+export interface ArtifactDigestDelta {
+  /** Artifacts whose sha256 changed between validations. */
+  readonly changed: readonly string[]
+  /** Artifacts present in the new snapshot but not the old. */
+  readonly added: readonly string[]
+  /** Artifacts present in the old snapshot but not the new. */
+  readonly removed: readonly string[]
 }
 
 /** Input item for creating/setting acceptance criteria. */
@@ -95,6 +114,10 @@ export interface CriterionSpec {
   readonly taskIds?: readonly string[]
   /** IDs of criteria that should be passed before this criterion is validated. */
   readonly dependsOn?: readonly string[]
+  /** Workspace-relative (or absolute) file paths whose bytes this criterion's verdict binds to. */
+  readonly artifacts?: readonly string[]
+  /** The single shell command authorized to prove this criterion. Pinned at lock time. */
+  readonly verifyCommand?: string
 }
 
 /** Input for validating one criterion. */
@@ -111,6 +134,11 @@ export interface ValidateCriterionSpec {
    * subagent in the orchestrated task loop). The verdict is formal — never
    * self-claimed — regardless of the goal's locking role. */
   readonly byReviewer?: boolean
+  /** The command actually executed to produce this verdict (set by run_and_validate). Recorded on the event for audit. */
+  readonly verifiedCommand?: string
+  /** The command the caller declares it executed for this verdict. When the criterion pins
+   *  verifyCommand, a 'passed' verdict REQUIRES this to equal the pin. */
+  readonly command?: string
 }
 
 /** Input for reviewer confirmation of a self-claimed passed criterion. */
@@ -129,6 +157,27 @@ export interface TaskUpdateSpec {
   readonly taskId: string
   /** New task status. */
   readonly status: TaskStatus
+  /** 'rework' when this update is a rework claim on a drifted completed task. Audit-only. */
+  readonly claimKind?: 'work' | 'rework'
+}
+
+/** Mutable declaration fields of an existing criterion (integrity-bearing). */
+export interface CriterionPatch {
+  readonly description?: string
+  readonly required?: boolean
+  readonly method?: string
+  readonly artifacts?: readonly string[]
+  readonly verifyCommand?: string | null
+}
+
+/** Input for patching an existing criterion after lock. */
+export interface UpdateCriterionSpec {
+  /** Criterion id to patch. */
+  readonly criterionId: string
+  /** Fields to update. verifyCommand: null clears the pin. artifacts: [] clears bindings. */
+  readonly patch: CriterionPatch
+  /** Human-readable reason for the patch (audit trail). Required. */
+  readonly reason: string
 }
 
 /** Input for amending criteria after the initial lock. */
@@ -145,6 +194,8 @@ export interface ClaimTaskResult {
   readonly task: GoalTask | null
   /** Criteria linked to the claimed task — the task-granularity acceptance contract. */
   readonly criteria: readonly GoalCriterion[]
+  /** 'rework' when claiming a completed task whose linked criteria drifted; 'work' for ready-frontier claims. */
+  readonly claimKind?: 'work' | 'rework'
   /** Why no task was claimable, when task is null. */
   readonly reason?: string
 }
@@ -161,6 +212,21 @@ export interface ReviewTaskResult {
   readonly nextTask?: GoalTask | null
   /** Criteria linked to nextTask — the next work contract. */
   readonly nextTaskCriteria?: readonly GoalCriterion[]
+}
+
+/** A passed criterion whose current artifact bytes no longer match the validated digests. */
+export interface DriftedCriterion {
+  readonly criterion: GoalCriterion
+  /** Which artifact paths drifted. */
+  readonly reasons: readonly { readonly path: string; readonly kind: 'changed' | 'missing' | 'unreadable' }[]
+}
+
+/** Gate-time drift report over all passed criteria that recorded artifact digests. */
+export interface ArtifactDriftReport {
+  /** Criteria whose current artifact bytes differ from validated digests. */
+  readonly drifted: readonly DriftedCriterion[]
+  /** Criteria checked and consistent. */
+  readonly intact: readonly GoalCriterion[]
 }
 
 /** Per-criterion task progress computed by the engine. */
@@ -253,6 +319,10 @@ export type GoalAcceptanceErrorCode =
   | 'GOAL_ACCEPTANCE_TASK_NOT_IN_PROGRESS'
   | 'GOAL_ACCEPTANCE_TASK_NO_LINKED_CRITERIA'
   | 'GOAL_ACCEPTANCE_CRITERION_NOT_IN_TASK'
+  | 'GOAL_ACCEPTANCE_ARTIFACT_MISSING'
+  | 'GOAL_ACCEPTANCE_VERIFY_COMMAND_MISMATCH'
+  | 'GOAL_ACCEPTANCE_WORKSPACE_REQUIRED'
+  | 'GOAL_ACCEPTANCE_UPDATE_REASON_REQUIRED'
 
 /** Event payload when initial criteria are locked. */
 export interface GoalAcceptanceSetEvent {
@@ -274,6 +344,12 @@ export interface GoalAcceptanceValidateEvent {
   readonly evidenceType?: EvidenceType
   /** True when an agent self-claimed passed (role=agent). */
   readonly selfClaimed?: boolean
+  /** sha256 of each declared artifact at validation time (normalized workspace-relative keys). */
+  readonly artifactDigests?: Record<string, string>
+  /** Byte-level delta vs the previously recorded digests, when they existed. */
+  readonly digestDelta?: ArtifactDigestDelta
+  /** The command actually executed to produce this verdict, when one ran. */
+  readonly verifiedCommand?: string
 }
 
 /** Event payload when a linked task's status is updated. */
@@ -282,6 +358,28 @@ export interface GoalAcceptanceTaskUpdateEvent {
   readonly taskId: string
   readonly taskStatus: TaskStatus
   readonly updatedAt: number
+  /** 'rework' when this update is a rework claim on a drifted completed task. */
+  readonly claimKind?: 'work' | 'rework'
+}
+
+/** Event payload when an existing criterion's declaration is patched. */
+export interface GoalAcceptanceUpdateEvent {
+  readonly type: 'goal-acceptance/update'
+  readonly criterionId: string
+  /** Applied patch fields (resolved values; verifyCommand null means pin cleared). */
+  readonly patch: CriterionPatch
+  readonly reason: string
+  readonly updatedAt: number
+  /** True when the patch invalidated a prior 'passed' verdict and reset status to pending. */
+  readonly resetToPending?: boolean
+}
+
+/** Audit event appended when a rework claim is made against drifted artifacts. */
+export interface GoalAcceptanceDriftEvent {
+  readonly type: 'goal-acceptance/drift'
+  /** Criteria detected as drifted at claim time, with per-artifact reasons. */
+  readonly drifted: readonly { readonly criterionId: string; readonly reasons: readonly { readonly path: string; readonly kind: 'changed' | 'missing' | 'unreadable' }[] }[]
+  readonly detectedAt: number
 }
 
 /** Event payload when criteria are appended after the initial lock. */
@@ -306,3 +404,5 @@ export type GoalAcceptanceEvent =
   | GoalAcceptanceTaskUpdateEvent
   | GoalAcceptanceAmendEvent
   | GoalAcceptanceTaskPlanEvent
+  | GoalAcceptanceUpdateEvent
+  | GoalAcceptanceDriftEvent

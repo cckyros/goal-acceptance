@@ -8,7 +8,7 @@ import { defineTool } from "@deepseek-ai/dsh-tools";
 
 // src/plugin/goal-manager.ts
 import { randomUUID } from "node:crypto";
-import { existsSync, mkdirSync, readdirSync, readFileSync, unlinkSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readdirSync, readFileSync as readFileSync2, rmSync, statSync, unlinkSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 
 // src/plugin/engine/errors.ts
@@ -27,13 +27,68 @@ var GoalAcceptanceError = class extends Error {
 // src/plugin/engine/store.ts
 var InMemoryAcceptanceStore = class {
   _events = [];
+  _tail = Promise.resolve();
   get events() {
     return this._events;
   }
   append(event) {
     this._events.push(event);
   }
+  /** In-process mutex: serializes check-then-act sections on this store. */
+  withLock(fn) {
+    const next = this._tail.then(() => fn());
+    this._tail = next.then(() => void 0, () => void 0);
+    return next;
+  }
 };
+
+// src/plugin/engine/digest.ts
+import { createHash } from "node:crypto";
+import { readFileSync } from "node:fs";
+import { isAbsolute, resolve, sep } from "node:path";
+function resolveArtifactPath(workspaceRoot, artifactPath) {
+  if (isAbsolute(artifactPath)) {
+    return artifactPath;
+  }
+  const root = resolve(workspaceRoot);
+  const abs = resolve(root, artifactPath);
+  if (abs !== root && !abs.startsWith(root + sep)) {
+    throw new Error(`artifact path "${artifactPath}" escapes workspace root`);
+  }
+  return abs;
+}
+function artifactKey(workspaceRoot, absolutePath) {
+  const root = resolve(workspaceRoot);
+  const abs = resolve(absolutePath);
+  if (abs.startsWith(root + sep)) {
+    return abs.slice(root.length + 1).split(sep).join("/");
+  }
+  return absolutePath;
+}
+function hashArtifact(absolutePath) {
+  try {
+    const content = readFileSync(absolutePath);
+    return { kind: "ok", digest: createHash("sha256").update(content).digest("hex") };
+  } catch (err) {
+    const code = err.code;
+    return { kind: code === "ENOENT" ? "missing" : "unreadable" };
+  }
+}
+function hashArtifacts(workspaceRoot, artifactPaths) {
+  const digests = {};
+  const problems = [];
+  for (const p of artifactPaths) {
+    const abs = resolveArtifactPath(workspaceRoot, p);
+    const result = hashArtifact(abs);
+    const key = artifactKey(workspaceRoot, abs);
+    if (result.kind === "ok") {
+      digests[key] = result.digest;
+    } else {
+      problems.push({ path: key, kind: result.kind });
+    }
+  }
+  return { digests, problems };
+}
 
 // src/plugin/engine/engine.ts
 function initialState() {
@@ -50,6 +105,7 @@ function initialState() {
   };
 }
 function toCriterion(spec, now, defaults) {
+  const artifacts = Array.isArray(spec.artifacts) ? spec.artifacts.map((a) => a.trim()).filter((a) => a.length > 0) : [];
   return {
     id: spec.id.trim(),
     description: spec.description.trim(),
@@ -59,6 +115,8 @@ function toCriterion(spec, now, defaults) {
     updatedAt: now,
     taskIds: Array.isArray(spec.taskIds) ? spec.taskIds.map((t) => t.trim()).filter((t) => t.length > 0) : [],
     dependsOn: Array.isArray(spec.dependsOn) ? spec.dependsOn.map((d) => d.trim()).filter((d) => d.length > 0) : [],
+    ...artifacts.length > 0 ? { artifacts } : {},
+    ...typeof spec.verifyCommand === "string" && spec.verifyCommand.trim().length > 0 ? { verifyCommand: spec.verifyCommand.trim() } : {},
     ...defaults.addedAfterLock === true ? { addedAfterLock: true, addedAt: defaults.addedAt ?? now } : {}
   };
 }
@@ -154,6 +212,21 @@ function validateTaskPlan(specs) {
     }
   }
 }
+function computeDigestDelta(prev, next) {
+  if (prev === void 0 || next === void 0) return void 0;
+  const changed = [];
+  const added = [];
+  const removed = [];
+  for (const [key, digest] of Object.entries(next)) {
+    if (!(key in prev)) added.push(key);
+    else if (prev[key] !== digest) changed.push(key);
+  }
+  for (const key of Object.keys(prev)) {
+    if (!(key in next)) removed.push(key);
+  }
+  if (changed.length === 0 && added.length === 0 && removed.length === 0) return void 0;
+  return { changed, added, removed };
+}
 function dependenciesMet(criterion, criteria) {
   if (criterion.dependsOn.length === 0) return true;
   return criterion.dependsOn.every((depId) => {
@@ -197,8 +270,46 @@ function computeTaskProgress(criterion, taskStatuses) {
 var GoalAcceptanceEngine = class {
   state = initialState();
   store;
-  constructor(store) {
+  workspaceRoot;
+  constructor(store, workspaceRoot) {
     this.store = store;
+    this.workspaceRoot = workspaceRoot;
+  }
+  /** Lazily bind the workspace root. Set-once: a different value is rejected (anchors must not silently rebase). */
+  setWorkspaceRoot(root) {
+    if (this.workspaceRoot !== void 0 && this.workspaceRoot !== root) {
+      throw new GoalAcceptanceError(
+        `workspace root is already set to "${this.workspaceRoot}" \u2014 cannot rebase to "${root}"`,
+        "GOAL_ACCEPTANCE_INVALID_ARGS"
+      );
+    }
+    this.workspaceRoot = root;
+  }
+  getWorkspaceRoot() {
+    return this.workspaceRoot;
+  }
+  /** Fail fast when specs declare artifacts without a workspace root, or with escaping relative paths. */
+  assertArtifactsDeclarable(specs) {
+    const declaring = specs.filter((s) => Array.isArray(s.artifacts) && s.artifacts.some((a) => a.trim().length > 0));
+    if (declaring.length === 0) return;
+    if (this.workspaceRoot === void 0) {
+      throw new GoalAcceptanceError(
+        `criteria declare artifacts but no workspace root is set \u2014 pass workspace to create_goal/set_acceptance_criteria first`,
+        "GOAL_ACCEPTANCE_WORKSPACE_REQUIRED"
+      );
+    }
+    for (const spec of declaring) {
+      for (const p of spec.artifacts ?? []) {
+        try {
+          resolveArtifactPath(this.workspaceRoot, p);
+        } catch {
+          throw new GoalAcceptanceError(
+            `criterion "${spec.id}" artifact path "${p}" escapes workspace root`,
+            "GOAL_ACCEPTANCE_INVALID_CRITERIA"
+          );
+        }
+      }
+    }
   }
   /** Set and lock the acceptance criteria. Returns the resolved criteria list. */
   async setCriteria(specs, role = "agent") {
@@ -210,6 +321,7 @@ var GoalAcceptanceEngine = class {
       throw new GoalAcceptanceError("acceptance criteria are already locked", "GOAL_ACCEPTANCE_ALREADY_LOCKED");
     }
     validateSpecs(specs, /* @__PURE__ */ new Set());
+    this.assertArtifactsDeclarable(specs);
     const now = Date.now();
     const criteria = specs.map((spec) => toCriterion(spec, now, {}));
     const event = {
@@ -236,6 +348,7 @@ var GoalAcceptanceEngine = class {
     }
     const existingIds = new Set(this.state.order);
     validateSpecs(spec.criteria, existingIds);
+    this.assertArtifactsDeclarable(spec.criteria);
     const now = Date.now();
     const addedCriteria = spec.criteria.map((s) => toCriterion(s, now, { addedAfterLock: true, addedAt: now }));
     const event = {
@@ -247,6 +360,51 @@ var GoalAcceptanceEngine = class {
     await this.store.append(event);
     this.applyEvent(event);
     return addedCriteria;
+  }
+  /**
+   * Patch an existing criterion's declaration (e.g. correct a bad verify_command pin
+   * or extend the artifact bindings). Requires a reason for audit. Patching
+   * artifacts or verifyCommand on a passed criterion resets it to pending —
+   * integrity-bearing changes force re-validation rather than silently re-baselining.
+   */
+  async updateCriterion(spec) {
+    this.sync();
+    if (!this.state.locked) {
+      throw new GoalAcceptanceError("cannot update criteria before they are locked", "GOAL_ACCEPTANCE_NOT_LOCKED");
+    }
+    const existing = this.state.criteria.get(spec.criterionId);
+    if (existing === void 0) {
+      throw new GoalAcceptanceError(`criterion "${spec.criterionId}" not found`, "GOAL_ACCEPTANCE_CRITERION_NOT_FOUND");
+    }
+    if (typeof spec.reason !== "string" || spec.reason.trim().length === 0) {
+      throw new GoalAcceptanceError("update reason is required", "GOAL_ACCEPTANCE_UPDATE_REASON_REQUIRED");
+    }
+    const patch = spec.patch;
+    if (patch === void 0 || Object.values(patch).every((v) => v === void 0)) {
+      throw new GoalAcceptanceError("update patch must contain at least one field", "GOAL_ACCEPTANCE_INVALID_ARGS");
+    }
+    if (patch.description !== void 0 && patch.description.trim().length === 0) {
+      throw new GoalAcceptanceError(`criterion "${spec.criterionId}" must have a non-empty description`, "GOAL_ACCEPTANCE_INVALID_CRITERIA");
+    }
+    if (patch.artifacts !== void 0) {
+      this.assertArtifactsDeclarable([{ id: existing.id, description: existing.description, artifacts: patch.artifacts }]);
+    }
+    const integrityChange = patch.artifacts !== void 0 || patch.verifyCommand !== void 0;
+    const resetToPending = integrityChange && existing.status === "passed";
+    const now = Date.now();
+    const event = {
+      type: "goal-acceptance/update",
+      criterionId: spec.criterionId,
+      patch,
+      reason: spec.reason.trim(),
+      updatedAt: now,
+      ...resetToPending ? { resetToPending: true } : {}
+    };
+    await this.store.append(event);
+    this.applyEvent(event);
+    const updated = this.state.criteria.get(spec.criterionId);
+    if (updated === void 0) throw new Error("sync failed");
+    return updated;
   }
   /** Record verification status and evidence for one criterion. */
   async validateCriterion(spec) {
@@ -267,6 +425,39 @@ var GoalAcceptanceEngine = class {
     }
     const evidenceType = spec.evidenceType ?? "text";
     const selfClaimed = spec.status === "passed" && this.state.role === "agent" && spec.byReviewer !== true;
+    const declaredCommand = spec.verifiedCommand ?? spec.command;
+    if (existing.verifyCommand !== void 0) {
+      if (declaredCommand === void 0 && spec.status === "passed") {
+        throw new GoalAcceptanceError(
+          `criterion "${spec.criterionId}" pins verify_command \u2014 a passed verdict must declare the executed command via the "command" parameter`,
+          "GOAL_ACCEPTANCE_VERIFY_COMMAND_MISMATCH"
+        );
+      }
+      if (declaredCommand !== void 0 && declaredCommand !== existing.verifyCommand) {
+        throw new GoalAcceptanceError(
+          `pinned verify_command is "${existing.verifyCommand}" but declared command is "${declaredCommand}"`,
+          "GOAL_ACCEPTANCE_VERIFY_COMMAND_MISMATCH"
+        );
+      }
+    }
+    let artifactDigests;
+    if (existing.artifacts !== void 0 && existing.artifacts.length > 0) {
+      if (this.workspaceRoot === void 0) {
+        throw new GoalAcceptanceError(
+          `criterion "${spec.criterionId}" declares artifacts but no workspace root is set`,
+          "GOAL_ACCEPTANCE_WORKSPACE_REQUIRED"
+        );
+      }
+      const { digests, problems } = hashArtifacts(this.workspaceRoot, existing.artifacts);
+      if (spec.status === "passed" && problems.length > 0) {
+        throw new GoalAcceptanceError(
+          `cannot pass criterion "${spec.criterionId}": ${problems.map((p) => `artifact "${p.path}" is ${p.kind}`).join("; ")}`,
+          "GOAL_ACCEPTANCE_ARTIFACT_MISSING"
+        );
+      }
+      artifactDigests = digests;
+    }
+    const digestDelta = computeDigestDelta(existing.artifactDigests, artifactDigests);
     const now = Date.now();
     const event = {
       type: "goal-acceptance/validate",
@@ -275,7 +466,10 @@ var GoalAcceptanceEngine = class {
       evidence: spec.evidence !== void 0 && spec.evidence.trim().length > 0 ? spec.evidence.trim() : void 0,
       validatedAt: now,
       evidenceType,
-      ...selfClaimed ? { selfClaimed: true } : {}
+      ...selfClaimed ? { selfClaimed: true } : {},
+      ...artifactDigests !== void 0 && Object.keys(artifactDigests).length > 0 ? { artifactDigests } : {},
+      ...digestDelta !== void 0 ? { digestDelta } : {},
+      ...typeof declaredCommand === "string" && declaredCommand.length > 0 ? { verifiedCommand: declaredCommand } : {}
     };
     await this.store.append(event);
     this.applyEvent(event);
@@ -332,7 +526,8 @@ var GoalAcceptanceEngine = class {
       type: "goal-acceptance/task-update",
       taskId: spec.taskId,
       taskStatus: spec.status,
-      updatedAt: now
+      updatedAt: now,
+      ...spec.claimKind !== void 0 ? { claimKind: spec.claimKind } : {}
     };
     await this.store.append(event);
     this.applyEvent(event);
@@ -389,43 +584,70 @@ var GoalAcceptanceEngine = class {
    * Without taskId, claims the first dependency-ready task in plan order.
    */
   async claimTask(taskId) {
-    this.sync();
-    if (this.state.taskPlan.size === 0) {
-      throw new GoalAcceptanceError("no task plan set \u2014 call set_task_plan first", "GOAL_ACCEPTANCE_INVALID_TASK_PLAN");
-    }
-    let task;
-    if (taskId !== void 0) {
-      task = this.getTaskPlan().find((t) => t.id === taskId);
-      if (task === void 0) {
-        throw new GoalAcceptanceError(`task "${taskId}" not found`, "GOAL_ACCEPTANCE_TASK_NOT_FOUND");
+    const run = async () => {
+      this.sync();
+      if (this.state.taskPlan.size === 0) {
+        throw new GoalAcceptanceError("no task plan set \u2014 call set_task_plan first", "GOAL_ACCEPTANCE_INVALID_TASK_PLAN");
       }
-      if (task.status !== "pending") {
-        throw new GoalAcceptanceError(
-          `task "${taskId}" is not claimable (status: ${task.status})`,
-          "GOAL_ACCEPTANCE_TASK_NOT_CLAIMABLE"
-        );
+      const drift = this.checkArtifactDrift();
+      const driftedCriterionIds = new Set(drift.drifted.filter((d) => d.criterion.required).map((d) => d.criterion.id));
+      const isReworkTarget = (t) => t.status === "completed" && this.linkedCriteria(t.id).some((c) => c.required && driftedCriterionIds.has(c.id));
+      let task;
+      let claimKind = "work";
+      if (taskId !== void 0) {
+        task = this.getTaskPlan().find((t) => t.id === taskId);
+        if (task === void 0) {
+          throw new GoalAcceptanceError(`task "${taskId}" not found`, "GOAL_ACCEPTANCE_TASK_NOT_FOUND");
+        }
+        if (isReworkTarget(task)) {
+          claimKind = "rework";
+        } else if (task.status !== "pending") {
+          throw new GoalAcceptanceError(
+            `task "${taskId}" is not claimable (status: ${task.status})`,
+            "GOAL_ACCEPTANCE_TASK_NOT_CLAIMABLE"
+          );
+        } else {
+          const unmet = task.dependsOn.filter(
+            (dep) => (this.state.taskStatuses.get(dep) ?? "pending") !== "completed"
+          );
+          if (unmet.length > 0) {
+            throw new GoalAcceptanceError(
+              `task "${taskId}" has unmet dependencies: [${unmet.join(", ")}]`,
+              "GOAL_ACCEPTANCE_TASK_NOT_CLAIMABLE"
+            );
+          }
+        }
+      } else {
+        task = this.getTaskPlan().find(isReworkTarget);
+        if (task !== void 0) {
+          claimKind = "rework";
+        } else {
+          task = this.readyTasks()[0];
+        }
+        if (task === void 0) {
+          const plan = this.getTaskPlan();
+          const pending = plan.filter((t) => t.status === "pending");
+          const reason = pending.length === 0 ? "no pending tasks \u2014 all tasks are claimed or done" : `no claimable tasks \u2014 ${pending.length} pending task(s) are blocked by unmet dependencies: [${pending.map((t) => t.id).join(", ")}]`;
+          return { task: null, criteria: [], reason };
+        }
       }
-      const unmet = task.dependsOn.filter(
-        (dep) => (this.state.taskStatuses.get(dep) ?? "pending") !== "completed"
-      );
-      if (unmet.length > 0) {
-        throw new GoalAcceptanceError(
-          `task "${taskId}" has unmet dependencies: [${unmet.join(", ")}]`,
-          "GOAL_ACCEPTANCE_TASK_NOT_CLAIMABLE"
-        );
+      if (claimKind === "rework") {
+        const driftEvent = {
+          type: "goal-acceptance/drift",
+          drifted: drift.drifted.map((d) => ({
+            criterionId: d.criterion.id,
+            reasons: d.reasons
+          })),
+          detectedAt: Date.now()
+        };
+        await this.store.append(driftEvent);
+        this.applyEvent(driftEvent);
       }
-    } else {
-      task = this.readyTasks()[0];
-      if (task === void 0) {
-        const plan = this.getTaskPlan();
-        const pending = plan.filter((t) => t.status === "pending");
-        const reason = pending.length === 0 ? "no pending tasks \u2014 all tasks are claimed or done" : `no claimable tasks \u2014 ${pending.length} pending task(s) are blocked by unmet dependencies: [${pending.map((t) => t.id).join(", ")}]`;
-        return { task: null, criteria: [], reason };
-      }
-    }
-    await this.updateTaskStatus({ taskId: task.id, status: "in_progress" });
-    const claimed = this.getTaskPlan().find((t) => t.id === task.id);
-    return { task: claimed, criteria: this.linkedCriteria(task.id) };
+      await this.updateTaskStatus({ taskId: task.id, status: "in_progress", claimKind });
+      const claimed = this.getTaskPlan().find((t) => t.id === task.id);
+      return { task: claimed, criteria: this.linkedCriteria(task.id), claimKind };
+    };
+    return this.store.withLock !== void 0 ? this.store.withLock(run) : run();
   }
   /**
    * Task acceptance node: reviewer verdicts on the task's linked criteria.
@@ -435,58 +657,61 @@ var GoalAcceptanceEngine = class {
    * blocking criteria are returned as rework feedback for the next round.
    */
   async reviewTask(taskId, verdicts) {
-    this.sync();
-    if (!Array.isArray(verdicts) || verdicts.length === 0) {
-      throw new GoalAcceptanceError("verdicts must be a non-empty array", "GOAL_ACCEPTANCE_INVALID_ARGS");
-    }
-    const task = this.getTaskPlan().find((t) => t.id === taskId);
-    if (task === void 0) {
-      throw new GoalAcceptanceError(`task "${taskId}" not found`, "GOAL_ACCEPTANCE_TASK_NOT_FOUND");
-    }
-    if (task.status !== "in_progress") {
-      throw new GoalAcceptanceError(
-        `task "${taskId}" is not in_progress (status: ${task.status}) \u2014 claim it first`,
-        "GOAL_ACCEPTANCE_TASK_NOT_IN_PROGRESS"
-      );
-    }
-    const linked = this.linkedCriteria(taskId);
-    if (linked.length === 0) {
-      throw new GoalAcceptanceError(
-        `task "${taskId}" has no linked criteria \u2014 nothing to review against`,
-        "GOAL_ACCEPTANCE_TASK_NO_LINKED_CRITERIA"
-      );
-    }
-    const linkedIds = new Set(linked.map((c) => c.id));
-    for (const v of verdicts) {
-      if (!linkedIds.has(v.criterionId)) {
+    const run = async () => {
+      this.sync();
+      if (!Array.isArray(verdicts) || verdicts.length === 0) {
+        throw new GoalAcceptanceError("verdicts must be a non-empty array", "GOAL_ACCEPTANCE_INVALID_ARGS");
+      }
+      const task = this.getTaskPlan().find((t) => t.id === taskId);
+      if (task === void 0) {
+        throw new GoalAcceptanceError(`task "${taskId}" not found`, "GOAL_ACCEPTANCE_TASK_NOT_FOUND");
+      }
+      if (task.status !== "in_progress") {
         throw new GoalAcceptanceError(
-          `criterion "${v.criterionId}" is not linked to task "${taskId}". Linked: [${linked.map((c) => c.id).join(", ")}]`,
-          "GOAL_ACCEPTANCE_CRITERION_NOT_IN_TASK"
+          `task "${taskId}" is not in_progress (status: ${task.status}) \u2014 claim it first`,
+          "GOAL_ACCEPTANCE_TASK_NOT_IN_PROGRESS"
         );
       }
-    }
-    for (const v of verdicts) {
-      await this.validateCriterion({ ...v, byReviewer: true });
-    }
-    const blocking = this.linkedCriteria(taskId).filter(
-      (c) => c.required && !(c.status === "passed" && c.selfClaimed !== true)
-    );
-    if (blocking.length > 0) {
+      const linked = this.linkedCriteria(taskId);
+      if (linked.length === 0) {
+        throw new GoalAcceptanceError(
+          `task "${taskId}" has no linked criteria \u2014 nothing to review against`,
+          "GOAL_ACCEPTANCE_TASK_NO_LINKED_CRITERIA"
+        );
+      }
+      const linkedIds = new Set(linked.map((c) => c.id));
+      for (const v of verdicts) {
+        if (!linkedIds.has(v.criterionId)) {
+          throw new GoalAcceptanceError(
+            `criterion "${v.criterionId}" is not linked to task "${taskId}". Linked: [${linked.map((c) => c.id).join(", ")}]`,
+            "GOAL_ACCEPTANCE_CRITERION_NOT_IN_TASK"
+          );
+        }
+      }
+      for (const v of verdicts) {
+        await this.validateCriterion({ ...v, byReviewer: true });
+      }
+      const blocking = this.linkedCriteria(taskId).filter(
+        (c) => c.required && !(c.status === "passed" && c.selfClaimed !== true)
+      );
+      if (blocking.length > 0) {
+        return {
+          taskCompleted: false,
+          task: this.getTaskPlan().find((t) => t.id === taskId),
+          blockingCriteria: blocking
+        };
+      }
+      await this.updateTaskStatus({ taskId, status: "completed" });
+      const next = this.readyTasks()[0];
       return {
-        taskCompleted: false,
+        taskCompleted: true,
         task: this.getTaskPlan().find((t) => t.id === taskId),
-        blockingCriteria: blocking
+        blockingCriteria: [],
+        nextTask: next ?? null,
+        nextTaskCriteria: next ? this.linkedCriteria(next.id) : []
       };
-    }
-    await this.updateTaskStatus({ taskId, status: "completed" });
-    const next = this.readyTasks()[0];
-    return {
-      taskCompleted: true,
-      task: this.getTaskPlan().find((t) => t.id === taskId),
-      blockingCriteria: [],
-      nextTask: next ?? null,
-      nextTaskCriteria: next ? this.linkedCriteria(next.id) : []
     };
+    return this.store.withLock !== void 0 ? this.store.withLock(run) : run();
   }
   /** Get all criteria in declaration order. */
   getCriteria() {
@@ -613,10 +838,53 @@ var GoalAcceptanceEngine = class {
     };
   }
   /** Check whether this Goal is allowed to conclude with 'complete'. */
+  /**
+   * Re-hash artifacts for every passed criterion that recorded digests.
+   * Drift is a gate-time computed view — stored state is never mutated.
+   */
+  checkArtifactDrift() {
+    this.sync();
+    const drifted = [];
+    const intact = [];
+    if (this.workspaceRoot === void 0) {
+      return { drifted, intact };
+    }
+    for (const criterion of this.state.criteria.values()) {
+      if (criterion.status !== "passed" || criterion.artifactDigests === void 0) continue;
+      const reasons = [];
+      const { digests, problems } = hashArtifacts(this.workspaceRoot, criterion.artifacts ?? []);
+      for (const problem of problems) {
+        reasons.push({ path: problem.path, kind: problem.kind });
+      }
+      for (const [key, recorded] of Object.entries(criterion.artifactDigests)) {
+        const current = digests[key];
+        if (current !== void 0 && current !== recorded) {
+          reasons.push({ path: key, kind: "changed" });
+        }
+      }
+      if (reasons.length > 0) {
+        drifted.push({ criterion, reasons });
+      } else {
+        intact.push(criterion);
+      }
+    }
+    return { drifted, intact };
+  }
   canComplete() {
     this.sync();
     if (!this.state.locked || this.state.criteria.size === 0) {
       return { allowed: true };
+    }
+    const drift = this.checkArtifactDrift();
+    const requiredDrifted = drift.drifted.filter((d) => d.criterion.required);
+    if (requiredDrifted.length > 0) {
+      const details = requiredDrifted.map((d) => {
+        const paths = d.reasons.map((r) => `${r.path}(${r.kind})`).join(", ");
+        const reworkTask = this.getTaskPlan().find((t) => t.status !== "failed" && d.criterion.taskIds.includes(t.id));
+        const hint = reworkTask !== void 0 ? ` \u2192 claim task "${reworkTask.id}" for rework` : " \u2192 re-validate this criterion";
+        return `"${d.criterion.id}" artifacts drifted [${paths}]${hint}`;
+      }).join("; ");
+      return { allowed: false, reason: `Cannot complete goal: ${requiredDrifted.length} required criterion drifted \u2014 ${details}` };
     }
     const summary = this.summarize();
     if (summary.allRequiredPassed) {
@@ -666,9 +934,30 @@ var GoalAcceptanceEngine = class {
           evidenceType,
           lowConfidence: evidenceType === "text",
           ...data.selfClaimed === true ? { selfClaimed: true } : {},
-          ...data.selfClaimed !== true ? { selfClaimed: false } : {}
+          ...data.selfClaimed !== true ? { selfClaimed: false } : {},
+          ...data.artifactDigests !== void 0 ? { artifactDigests: data.artifactDigests } : {},
+          ...data.digestDelta !== void 0 ? { digestDelta: data.digestDelta } : {}
         });
       }
+    } else if (event.type === "goal-acceptance/update") {
+      const data = event;
+      const existing = this.state.criteria.get(data.criterionId);
+      if (existing !== void 0) {
+        const patch = data.patch;
+        const artifacts = patch.artifacts === void 0 ? existing.artifacts : patch.artifacts.map((a) => a.trim()).filter((a) => a.length > 0);
+        const verifyCommand = patch.verifyCommand === void 0 ? existing.verifyCommand : patch.verifyCommand === null || patch.verifyCommand.trim().length === 0 ? void 0 : patch.verifyCommand.trim();
+        this.state.criteria.set(data.criterionId, {
+          ...existing,
+          ...patch.description !== void 0 ? { description: patch.description.trim() } : {},
+          ...patch.required !== void 0 ? { required: patch.required } : {},
+          ...patch.method !== void 0 && patch.method.trim().length > 0 ? { method: patch.method.trim() } : {},
+          ...artifacts !== void 0 ? { artifacts: artifacts.length > 0 ? artifacts : void 0 } : {},
+          ...verifyCommand !== void 0 || patch.verifyCommand !== void 0 ? { verifyCommand } : {},
+          ...data.resetToPending === true ? { status: "pending", selfClaimed: false, artifactDigests: void 0, digestDelta: void 0 } : {},
+          updatedAt: data.updatedAt
+        });
+      }
+    } else if (event.type === "goal-acceptance/drift") {
     } else if (event.type === "goal-acceptance/task-update") {
       const data = event;
       this.state.taskStatuses.set(data.taskId, data.taskStatus);
@@ -721,7 +1010,7 @@ var FileAcceptanceStore = class {
   }
   async #read() {
     if (!existsSync(this.path)) return [];
-    const raw = await readFileSync(this.path, "utf-8");
+    const raw = await readFileSync2(this.path, "utf-8");
     if (raw.trim().length === 0) return [];
     return JSON.parse(raw);
   }
@@ -730,7 +1019,7 @@ var FileAcceptanceStore = class {
   }
   get events() {
     if (!existsSync(this.path)) return [];
-    const raw = readFileSync(this.path, "utf-8");
+    const raw = readFileSync2(this.path, "utf-8");
     if (raw.trim().length === 0) return [];
     return JSON.parse(raw);
   }
@@ -738,6 +1027,41 @@ var FileAcceptanceStore = class {
     const events = await this.#read();
     events.push(event);
     await this.#write(events);
+  }
+  /**
+   * mkdir-based mutual exclusion covering a whole check-then-act section
+   * (claim_task, review_task). mkdir is atomic on POSIX and NTFS local
+   * filesystems; EEXIST means another process/thread holds the lock.
+   * Stale locks are reclaimed after 15s by mtime. NOT re-entrant.
+   */
+  async withLock(fn) {
+    const lockDir = `${this.path}.lock`;
+    const deadline = Date.now() + 3e4;
+    const staleMs = 15e3;
+    for (; ; ) {
+      try {
+        mkdirSync(lockDir);
+        break;
+      } catch (e) {
+        if (e.code !== "EEXIST") throw e;
+        try {
+          if (Date.now() - statSync(lockDir).mtimeMs > staleMs) {
+            rmSync(lockDir, { recursive: true, force: true });
+            continue;
+          }
+        } catch {
+        }
+        if (Date.now() > deadline) {
+          throw new GoalAcceptanceError(`store lock timeout: ${lockDir}`, "GOAL_ACCEPTANCE_INVALID_ARGS");
+        }
+        await new Promise((r) => setTimeout(r, 5));
+      }
+    }
+    try {
+      return await fn();
+    } finally {
+      rmSync(lockDir, { recursive: true, force: true });
+    }
   }
 };
 var GoalManager = class {
@@ -769,10 +1093,25 @@ var GoalManager = class {
   getOrCreateEngine(goalId) {
     let engine = this.engineCache.get(goalId);
     if (engine === void 0) {
-      engine = new GoalAcceptanceEngine(this.storeForGoal(goalId));
+      engine = new GoalAcceptanceEngine(this.storeForGoal(goalId), this.loadGoalMeta(goalId)?.workspaceRoot);
       this.engineCache.set(goalId, engine);
     }
     return engine;
+  }
+  /** Bind the workspace root on the active goal. Set-once; persists to meta. */
+  setWorkspaceRoot(root) {
+    const engine = this.getEngine();
+    engine.setWorkspaceRoot(root);
+    const id = this.currentGoalId;
+    if (id === null) return;
+    const meta = this.metaCache.get(id);
+    if (meta === void 0 || meta.workspaceRoot === root) return;
+    const updated = { ...meta, workspaceRoot: root };
+    this.metaCache.set(id, updated);
+    const dir = this.goalsDir;
+    if (dir) {
+      writeFileSync(join(dir, `${id}.meta.json`), JSON.stringify(updated, null, 2) + "\n");
+    }
   }
   /** Get the engine for the active goal. Throws if no active goal. */
   getEngine() {
@@ -792,12 +1131,13 @@ var GoalManager = class {
     return this.getEngine();
   }
   /** Start a new goal. Generates a UUID, persists metadata, sets it as current. */
-  startGoal(title, description2) {
+  startGoal(title, description2, workspaceRoot) {
     const id = randomUUID();
     const meta = {
       id,
       title: title ?? "",
       ...description2 !== void 0 ? { description: description2 } : {},
+      ...workspaceRoot !== void 0 ? { workspaceRoot } : {},
       createdAt: Date.now()
     };
     const dir = this.goalsDir;
@@ -809,7 +1149,7 @@ var GoalManager = class {
     this.metaCache.set(id, meta);
     this.currentGoalId = id;
     this.persistCurrentGoal();
-    this.engineCache.set(id, new GoalAcceptanceEngine(this.storeForGoal(id)));
+    this.engineCache.set(id, new GoalAcceptanceEngine(this.storeForGoal(id), workspaceRoot));
     return meta;
   }
   /** Persist the current goal ID to disk for restart recovery. */
@@ -825,7 +1165,7 @@ var GoalManager = class {
     if (!dir) return;
     const f = join(this.dataDir, "current-goal.txt");
     if (existsSync(f)) {
-      const id = readFileSync(f, "utf-8").trim();
+      const id = readFileSync2(f, "utf-8").trim();
       if (id.length > 0 && existsSync(join(dir, `${id}.meta.json`))) {
         this.currentGoalId = id;
         this.loadGoalMeta(id);
@@ -840,7 +1180,7 @@ var GoalManager = class {
     if (!dir) return void 0;
     const metaPath = join(dir, `${id}.meta.json`);
     if (!existsSync(metaPath)) return void 0;
-    const meta = JSON.parse(readFileSync(metaPath, "utf-8"));
+    const meta = JSON.parse(readFileSync2(metaPath, "utf-8"));
     this.metaCache.set(id, meta);
     return meta;
   }
@@ -867,7 +1207,7 @@ var GoalManager = class {
     }
     const files = readdirSync(dir).filter((f) => f.endsWith(".meta.json"));
     return files.map((f) => {
-      const meta = JSON.parse(readFileSync(join(dir, f), "utf-8"));
+      const meta = JSON.parse(readFileSync2(join(dir, f), "utf-8"));
       this.metaCache.set(meta.id, meta);
       const engine = this.getOrCreateEngine(meta.id);
       const summary = engine.summarize();
@@ -984,18 +1324,22 @@ async function checkCli(_argv, ctx) {
   const mgr = managerFor(ctx.config);
   const goalId = mgr.getCurrentGoalId();
   if (goalId === null) ctx.fail("check: no active goal");
-  const result = mgr.getEngine().canComplete();
+  const engine = mgr.getEngine();
+  const result = engine.canComplete();
   if (result.allowed) {
     ctx.log(`check: allowed (goal ${goalId})`);
     return;
   }
+  const drifted = engine.checkArtifactDrift().drifted.filter((d) => d.criterion.required).map((d) => `  - ${d.criterion.id}: drifted artifacts [${d.reasons.map((r) => `${r.path}(${r.kind})`).join(", ")}]`).join("\n");
   const blocking = mgr.getEngine().getCriteria().filter((c) => c.required && (c.status !== "passed" || c.selfClaimed === true)).map((c) => {
     const flags = [c.status];
     if (c.selfClaimed === true) flags.push("self-claimed, needs confirm_criterion");
     return `  - ${c.id}: ${c.description} [${flags.join(", ")}]`;
   }).join("\n");
   ctx.fail(`check: blocked (goal ${goalId})
-${result.reason ?? ""}${blocking ? `
+${result.reason ?? ""}${drifted ? `
+drifted artifacts:
+${drifted}` : ""}${blocking ? `
 blocking criteria:
 ${blocking}` : ""}`);
 }
@@ -1009,6 +1353,7 @@ async function statusCli(_argv, ctx) {
   const engine = mgr.getEngine();
   const result = engine.canComplete();
   const summary = engine.summarize();
+  const drift = engine.checkArtifactDrift();
   const meta = mgr.getCurrentGoalMeta();
   ctx.log(
     JSON.stringify({
@@ -1016,6 +1361,7 @@ async function statusCli(_argv, ctx) {
       goal: meta ? { id: meta.id, title: meta.title, description: meta.description } : void 0,
       allowed: result.allowed,
       reason: result.reason,
+      ...drift.drifted.length > 0 ? { drift: drift.drifted } : {},
       criteria: engine.getCriteria().map((c) => ({
         id: c.id,
         description: c.description,
@@ -1052,6 +1398,15 @@ var CRITERION_ITEM_SCHEMA = {
       type: "array",
       items: { type: "string" },
       description: "IDs of criteria that must be passed before this one."
+    },
+    artifacts: {
+      type: "array",
+      items: { type: "string" },
+      description: "Workspace-relative file paths this verdict binds to. Their sha256 is recorded at validation; any later change makes the gate report drift and block completion."
+    },
+    verify_command: {
+      type: "string",
+      description: "The single shell command authorized to prove this criterion. When set, run_and_validate executes exactly this command (and refuses any other)."
     }
   }
 };
@@ -1120,7 +1475,9 @@ function mapCriterion(c) {
     ...c.required !== void 0 ? { required: c.required } : {},
     ...c.method !== void 0 ? { method: c.method } : {},
     ...c.task_ids !== void 0 ? { taskIds: c.task_ids } : {},
-    ...c.depends_on !== void 0 ? { dependsOn: c.depends_on } : {}
+    ...c.depends_on !== void 0 ? { dependsOn: c.depends_on } : {},
+    ...c.artifacts !== void 0 ? { artifacts: c.artifacts } : {},
+    ...c.verify_command !== void 0 ? { verifyCommand: c.verify_command } : {}
   };
 }
 function mapTask(t) {
@@ -1180,6 +1537,10 @@ var tools = [
           type: "string",
           enum: ["agent", "reviewer", "dual"],
           description: "Role locking the criteria. agent (default): passed marks self-claimed, requiring confirm_criterion by an independent reviewer. reviewer/dual: formal passed immediately (use only when the user explicitly waives independent review)."
+        },
+        workspace: {
+          type: "string",
+          description: "Absolute path of the workspace that criterion artifacts resolve against. Required when any criterion declares artifacts. Set-once per goal."
         }
       }
     },
@@ -1187,8 +1548,10 @@ var tools = [
       const mgr = getManager(ctx.config);
       const criteria = args.criteria;
       const role = args.role ?? "agent";
+      const workspace = typeof args.workspace === "string" && args.workspace.trim().length > 0 ? args.workspace.trim() : void 0;
       let engine = mgr.ensureGoal();
       try {
+        if (workspace !== void 0) mgr.setWorkspaceRoot(workspace);
         const list = await engine.setCriteria(criteria.map(mapCriterion), role);
         const summary = engine.summarize();
         return { goalId: mgr.getCurrentGoalId(), criteria: list, summary };
@@ -1199,6 +1562,7 @@ var tools = [
           const previousGoalSummary = slimSummary(engine.summarize());
           mgr.startGoal();
           engine = mgr.getEngine();
+          if (workspace !== void 0) mgr.setWorkspaceRoot(workspace);
           const list = await engine.setCriteria(criteria.map(mapCriterion), role);
           return {
             goalId: mgr.getCurrentGoalId(),
@@ -1237,7 +1601,13 @@ var tools = [
           return { goalId: mgr.getCurrentGoalId(), summary: slimSummary(summary) };
         }
         const criteria = engine.getCriteria();
-        return { goalId: mgr.getCurrentGoalId(), criteria, summary };
+        const drift = engine.checkArtifactDrift();
+        return {
+          goalId: mgr.getCurrentGoalId(),
+          criteria,
+          summary,
+          ...drift.drifted.length > 0 ? { drift: drift.drifted } : {}
+        };
       } catch (e) {
         return fail(e);
       }
@@ -1278,6 +1648,10 @@ var tools = [
           enum: ["command", "file", "url", "text"],
           description: "Type of evidence. text = low confidence. Default: text."
         },
+        command: {
+          type: "string",
+          description: "The shell command actually executed for this verdict. REQUIRED for status=passed when the criterion pins verify_command, and must equal it."
+        },
         verbose: {
           type: "boolean",
           description: "Default false: returns criterion + slim summary. true: returns criterion + full summary."
@@ -1292,7 +1666,8 @@ var tools = [
           criterionId: args.criterion_id,
           status: args.status,
           evidence: args.evidence,
-          ...args.evidence_type !== void 0 ? { evidenceType: args.evidence_type } : {}
+          ...args.evidence_type !== void 0 ? { evidenceType: args.evidence_type } : {},
+          ...typeof args.command === "string" ? { command: args.command } : {}
         });
         const verbose = args.verbose === true;
         const summary = engine.summarize();
@@ -1410,6 +1785,8 @@ var tools = [
       "",
       "Without task_id, claims the first pending task whose dependencies are all completed. With task_id, claims that specific task (its dependencies must be completed).",
       "",
+      'REWORK CLAIMS: a completed task whose linked required criteria drifted (their bound artifact bytes changed) becomes claimable again \u2014 claimKind="rework" in the response. Rework claims take priority over the ready frontier.',
+      "",
       "The worker executes the returned task against the returned criteria. The worker should NOT validate \u2014 validation belongs to review_task, called by an independent reviewer subagent."
     ].join("\n"),
     inputSchema: {
@@ -1440,7 +1817,9 @@ var tools = [
       "",
       "CALLER: a reviewer agent that is NOT the worker \u2014 it re-verifies each criterion with fresh evidence. Verdicts are formal (never self-claimed): this is the single validation layer.",
       "",
-      "Semantics: verdicts may only cover criteria linked to the task. All linked required criteria formally passed \u2192 task completes and the next dependency-ready task is returned for claiming. Any required criterion not formally passed \u2192 task stays in_progress and blockingCriteria is the rework feedback the worker should fix before the next review round."
+      "Semantics: verdicts may only cover criteria linked to the task. All linked required criteria formally passed \u2192 task completes and the next dependency-ready task is returned for claiming. Any required criterion not formally passed \u2192 task stays in_progress and blockingCriteria is the rework feedback the worker should fix before the next review round.",
+      "",
+      "ARTIFACT BINDING: when a criterion declares artifacts, their sha256 is recorded with the verdict and the goal gate will fail (drift) if those bytes change afterwards \u2014 rework happens via a rework claim_task. When a criterion pins verify_command, re-run that exact command and use its real output as evidence."
     ].join("\n"),
     inputSchema: {
       type: "object",
@@ -1467,6 +1846,10 @@ var tools = [
                 type: "string",
                 enum: ["command", "file", "url", "text"],
                 description: "Evidence type. command/file/url are high-confidence."
+              },
+              command: {
+                type: "string",
+                description: "The shell command the reviewer executed for this verdict. REQUIRED for status=passed when the criterion pins verify_command, and must equal it."
               }
             }
           }
@@ -1481,7 +1864,8 @@ var tools = [
           criterionId: v.criterion_id,
           status: v.status,
           evidence: v.evidence,
-          evidenceType: v.evidence_type
+          evidenceType: v.evidence_type,
+          command: v.command
         }));
         const result = await engine.reviewTask(args.task_id, verdicts);
         return { goalId: mgr.getCurrentGoalId(), ...result };
@@ -1503,12 +1887,17 @@ var tools = [
           description: "New criteria to append.",
           items: CRITERION_ITEM_SCHEMA
         },
-        reason: { type: "string", description: "Human-readable reason for the amendment." }
+        reason: { type: "string", description: "Human-readable reason for the amendment." },
+        workspace: {
+          type: "string",
+          description: "Absolute path of the workspace that criterion artifacts resolve against. Required when any new criterion declares artifacts. Set-once per goal."
+        }
       }
     },
     handler: async (args, ctx) => {
       const mgr = getManager(ctx.config);
       try {
+        if (typeof args.workspace === "string" && args.workspace.trim().length > 0) mgr.setWorkspaceRoot(args.workspace.trim());
         const engine = mgr.getEngine();
         const criteria = args.criteria;
         const added = await engine.amendCriteria({
@@ -1517,6 +1906,53 @@ var tools = [
         });
         const summary = engine.summarize();
         return { goalId: mgr.getCurrentGoalId(), addedCriteria: added, summary };
+      } catch (e) {
+        return fail(e);
+      }
+    }
+  },
+  {
+    name: "update_criterion",
+    description: [
+      "Patch an existing criterion's declaration after lock (fix a wrong verify_command, extend artifact bindings, correct description/method/required). Requires a reason \u2014 recorded in the event log for audit.",
+      "",
+      "SAFETY: patching artifacts or verify_command on a PASSED criterion resets it to pending \u2014 integrity-bearing changes force re-validation rather than silently re-baselining. verify_command: null clears the pin; artifacts: [] clears bindings."
+    ].join("\n"),
+    inputSchema: {
+      type: "object",
+      additionalProperties: false,
+      required: ["criterion_id", "reason"],
+      properties: {
+        criterion_id: { type: "string", description: "Existing criterion id to patch." },
+        reason: { type: "string", description: "Human-readable reason for the patch (audit trail)." },
+        description: { type: "string", description: "New criterion description." },
+        required: { type: "boolean", description: "New required flag." },
+        method: { type: "string", enum: ["command", "file", "url", "manual"], description: "New verification method." },
+        verify_command: { type: ["string", "null"], description: "New pinned command, or null to clear the pin." },
+        artifacts: {
+          type: "array",
+          items: { type: "string" },
+          description: "New artifact binding list (replaces the old one). Empty array clears bindings."
+        }
+      }
+    },
+    handler: async (args, ctx) => {
+      const mgr = getManager(ctx.config);
+      try {
+        const engine = mgr.getEngine();
+        const patch = {};
+        if (args.description !== void 0) patch.description = args.description;
+        if (args.required !== void 0) patch.required = args.required;
+        if (args.method !== void 0) patch.method = args.method;
+        if (args.verify_command !== void 0) patch.verifyCommand = args.verify_command;
+        if (args.artifacts !== void 0) patch.artifacts = args.artifacts;
+        const updated = await engine.updateCriterion({
+          criterionId: args.criterion_id,
+          patch,
+          reason: args.reason
+        });
+        const summary = engine.summarize();
+        return { goalId: mgr.getCurrentGoalId(), criterion: updated, summary: slimSummary(summary) };
       } catch (e) {
         return fail(e);
       }
@@ -1533,6 +1969,8 @@ var tools = [
       "- failed/blocked/pending/in_progress: BLOCKED",
       "- not_run (required only): BLOCKED",
       "",
+      "- required criterion with artifact binding whose files changed since validation: BLOCKED (drift) \u2014 rework then re-validate",
+      "",
       "Do NOT declare the task complete until this returns allowed=true. If allowed=false, read the reason field and address each blocking criterion."
     ].join("\n"),
     inputSchema: {
@@ -1543,8 +1981,14 @@ var tools = [
     handler: async (_args, ctx) => {
       const mgr = getManager(ctx.config);
       try {
-        const result = mgr.getEngine().canComplete();
-        return { goalId: mgr.getCurrentGoalId(), ...result };
+        const engine = mgr.getEngine();
+        const result = engine.canComplete();
+        const drift = engine.checkArtifactDrift();
+        return {
+          goalId: mgr.getCurrentGoalId(),
+          ...result,
+          ...drift.drifted.length > 0 ? { drift: drift.drifted } : {}
+        };
       } catch (e) {
         return fail(e);
       }
@@ -1629,7 +2073,8 @@ var tools = [
       required: ["name"],
       properties: {
         name: { type: "string", description: "Short goal name (stored as the goal title, shown by list_goals)." },
-        description: { type: "string", description: "Optional longer description of what the goal achieves." }
+        description: { type: "string", description: "Optional longer description of what the goal achieves." },
+        workspace: { type: "string", description: "Optional absolute workspace path that criterion artifacts resolve against." }
       }
     },
     handler: async (args, ctx) => {
@@ -1644,7 +2089,8 @@ var tools = [
           ));
         }
         const description2 = typeof args.description === "string" ? args.description : void 0;
-        const meta = mgr.startGoal(name3.trim(), description2);
+        const workspace = typeof args.workspace === "string" && args.workspace.trim().length > 0 ? args.workspace.trim() : void 0;
+        const meta = mgr.startGoal(name3.trim(), description2, workspace);
         return { goalId: meta.id, goal: meta, message: "New goal created and set as active." };
       } catch (e) {
         return fail(e);
@@ -1704,11 +2150,11 @@ var tools = [
     inputSchema: {
       type: "object",
       additionalProperties: false,
-      required: ["criterion_id", "command"],
+      required: ["criterion_id"],
       properties: {
         criterion_id: { type: "string", description: "Criterion ID to validate." },
-        command: { type: "string", description: 'Shell command to execute (e.g. "pnpm test", "git status").' },
-        cwd: { type: "string", description: "Optional working directory for the command execution." },
+        command: { type: "string", description: 'Shell command to execute (e.g. "pnpm test", "git status"). Optional when the criterion pins a verify_command \u2014 then the pinned command runs.' },
+        cwd: { type: "string", description: "Optional working directory for the command execution. Rejected when the criterion pins a verify_command (pinned commands run in the goal workspace)." },
         timeout_ms: { type: "number", description: "Optional timeout in milliseconds (default 60000)." },
         verbose: { type: "boolean", description: "Default false: slim summary. true: full summary." }
       }
@@ -1717,9 +2163,34 @@ var tools = [
       const mgr = getManager(ctx.config);
       const engine = mgr.getEngine();
       const criterionId = args.criterion_id;
-      const command = args.command;
-      const cwd = typeof args.cwd === "string" && args.cwd.trim().length > 0 ? args.cwd.trim() : void 0;
       const timeout = typeof args.timeout_ms === "number" && args.timeout_ms > 0 ? args.timeout_ms : 6e4;
+      const criterion = engine.getCriteria().find((c) => c.id === criterionId);
+      if (criterion === void 0) {
+        const allIds = engine.getCriteria().map((c) => c.id);
+        const suggestion = suggestClosest(criterionId, allIds);
+        return fail(new GoalAcceptanceError(
+          `criterion_id "${criterionId}" not found. Available IDs: [${allIds.join(", ")}].${suggestion ? ` Did you mean "${suggestion}"?` : ""} Call get_acceptance_criteria to see the full list.`,
+          "GOAL_ACCEPTANCE_CRITERION_NOT_FOUND"
+        ));
+      }
+      const pinned = criterion.verifyCommand;
+      const requested = typeof args.command === "string" && args.command.trim().length > 0 ? args.command.trim() : void 0;
+      const requestedCwd = typeof args.cwd === "string" && args.cwd.trim().length > 0 ? args.cwd.trim() : void 0;
+      if (pinned !== void 0) {
+        if (requested !== void 0 && requested !== pinned || requestedCwd !== void 0) {
+          return fail(new GoalAcceptanceError(
+            `criterion "${criterionId}" pins verify_command "${pinned}" \u2014 run_and_validate must execute exactly that command in the goal workspace`,
+            "GOAL_ACCEPTANCE_VERIFY_COMMAND_MISMATCH"
+          ));
+        }
+      } else if (requested === void 0) {
+        return fail(new GoalAcceptanceError(
+          "command is required when the criterion does not pin a verify_command",
+          "GOAL_ACCEPTANCE_INVALID_ARGS"
+        ));
+      }
+      const command = pinned ?? requested;
+      const cwd = pinned !== void 0 ? engine.getWorkspaceRoot() : requestedCwd;
       let stdout = "";
       let stderr = "";
       let exitCode = 0;
@@ -1751,7 +2222,8 @@ ${stderr.trim()}` : "",
           criterionId,
           status,
           evidence: rawEvidence,
-          evidenceType: "command"
+          evidenceType: "command",
+          verifiedCommand: command
         });
         const verbose = args.verbose === true;
         const summary = engine.summarize();
@@ -1804,6 +2276,10 @@ ${stderr.trim()}` : "",
           type: "array",
           items: TASK_PLAN_ITEM_SCHEMA,
           description: "Optional task plan to lock simultaneously."
+        },
+        workspace: {
+          type: "string",
+          description: "Absolute path of the workspace that criterion artifacts resolve against. Required when any criterion declares artifacts."
         }
       }
     },
@@ -1814,9 +2290,11 @@ ${stderr.trim()}` : "",
         const rawCriteria = args.criteria ?? [];
         const rawTasks = args.tasks;
         const role = args.role ?? "agent";
+        const workspace = typeof args.workspace === "string" && args.workspace.trim().length > 0 ? args.workspace.trim() : void 0;
         const mappedCriteria = rawCriteria.map(mapCriterion);
-        if (title !== void 0) mgr.startGoal(title);
+        if (title !== void 0) mgr.startGoal(title, void 0, workspace);
         let engine = mgr.ensureGoal();
+        if (workspace !== void 0) mgr.setWorkspaceRoot(workspace);
         let list;
         let previousGoalId;
         let previousGoalIncomplete = false;
@@ -1831,7 +2309,7 @@ ${stderr.trim()}` : "",
             previousGoalSummary = slimSummary(engine.summarize());
             previousGoalIncomplete = !completion.allowed;
             previousGoalReason = completion.reason;
-            mgr.startGoal(title);
+            mgr.startGoal(title, void 0, workspace);
             engine = mgr.getEngine();
             list = await engine.setCriteria(mappedCriteria, role);
           } else {
@@ -1879,7 +2357,7 @@ ${stderr.trim()}` : "",
 // src/plugin/manifest.ts
 var manifest = {
   name: "@cckyros/goal-acceptance",
-  version: "0.2.9",
+  version: "0.3.0",
   // 0.1.x monorepo → 0.2.0 single-package scaffold
   brand: "goal-acceptance",
   description: "Acceptance-criteria-driven goal completion for autonomous agents.",
@@ -2036,14 +2514,25 @@ var GoalAcceptanceService = class extends Service {
     this.getEngine(agent);
     return this.goals.get(agent);
   }
-  startGoal(agent, title, description2) {
+  startGoal(agent, title, description2, workspaceRoot) {
     const goals = this.goalMap(agent);
     const id = randomUUID2();
     const meta = { id, title: title ?? "", ...description2 !== void 0 ? { description: description2 } : {}, createdAt: Date.now() };
-    goals.set(id, { ...meta, engine: new GoalAcceptanceEngine(new InMemoryAcceptanceStore()) });
+    goals.set(id, { ...meta, engine: new GoalAcceptanceEngine(new InMemoryAcceptanceStore(), workspaceRoot) });
     this.activeGoals.set(agent, id);
     this.engines.set(agent, goals.get(id).engine);
     return meta;
+  }
+  /** Lazily bind the workspace root on the active goal's engine (set-once). */
+  setWorkspaceRoot(agent, root) {
+    this.getEngine(agent).setWorkspaceRoot(root);
+  }
+  getWorkspaceRoot(agent) {
+    return this.getEngine(agent).getWorkspaceRoot();
+  }
+  /** Gate-time drift report for the active goal. */
+  checkArtifactDrift(agent) {
+    return this.getEngine(agent).checkArtifactDrift();
   }
   listGoals(agent) {
     const active = this.activeGoals.get(agent);
@@ -2078,6 +2567,10 @@ var GoalAcceptanceService = class extends Service {
   /** Append new criteria after the initial lock. */
   amendCriteria(agent, spec) {
     return this.getEngine(agent).amendCriteria(spec);
+  }
+  /** Patch an existing criterion's declaration (fix pins, extend bindings). */
+  updateCriterion(agent, spec) {
+    return this.getEngine(agent).updateCriterion(spec);
   }
   /** Record verification status and evidence for one criterion. */
   validateCriterion(agent, spec) {
@@ -2159,8 +2652,33 @@ var CRITERION_ITEM_SCHEMA2 = {
       type: "array",
       items: { type: "string" },
       description: "IDs of criteria that must be passed before this criterion should be validated. Affects steering priority."
+    },
+    artifacts: {
+      type: "array",
+      items: { type: "string" },
+      description: "Workspace-relative file paths this verdict binds to. Their sha256 is recorded at validation; any later change makes the gate report drift and block completion."
+    },
+    verify_command: {
+      type: "string",
+      description: "The single shell command authorized to prove this criterion. When set, run_and_validate executes exactly this command."
     }
   }
+};
+function mapCriterion2(c) {
+  return {
+    id: c.id,
+    description: c.description,
+    ...c.required !== void 0 ? { required: c.required } : {},
+    ...c.method !== void 0 ? { method: c.method } : {},
+    ...c.task_ids !== void 0 ? { taskIds: c.task_ids } : {},
+    ...c.depends_on !== void 0 ? { dependsOn: c.depends_on } : {},
+    ...c.artifacts !== void 0 ? { artifacts: c.artifacts } : {},
+    ...c.verify_command !== void 0 ? { verifyCommand: c.verify_command } : {}
+  };
+}
+var WORKSPACE_SCHEMA = {
+  type: "string",
+  description: "Absolute path of the workspace that criterion artifacts resolve against. Required when any criterion declares artifacts. Set-once per goal."
 };
 var TASK_PLAN_ITEM_SCHEMA2 = {
   type: "object",
@@ -2196,9 +2714,11 @@ function createAcceptanceTools(ctx) {
       if (service === void 0) throw new Error("goalAcceptance service is not mounted");
       const criteria = service.getCriteria(agent);
       const summary = service.summarize(agent);
+      const drift = service.checkArtifactDrift(agent);
       return Promise.resolve({
         criteria,
-        summary
+        summary,
+        ...drift.drifted.length > 0 ? { drift: drift.drifted } : {}
       });
     },
     presentCall: () => present("Read acceptance criteria", "read")
@@ -2221,7 +2741,8 @@ function createAcceptanceTools(ctx) {
         description: "Array of criteria definitions with id, description, required flag, verification method, optional task IDs, and optional dependencies.",
         items: CRITERION_ITEM_SCHEMA2
       },
-      role: { ...ROLE_SCHEMA, description: "Role locking criteria; defaults to agent." }
+      role: { ...ROLE_SCHEMA, description: "Role locking criteria; defaults to agent." },
+      workspace: WORKSPACE_SCHEMA
     },
     output: {
       schema: OUTPUT_OBJECT_SCHEMA,
@@ -2233,16 +2754,11 @@ function createAcceptanceTools(ctx) {
       const service = ctx.get("goalAcceptance");
       if (service === void 0) throw new Error("goalAcceptance service is not mounted");
       const rawCriteria = args.criteria;
-      const mapped = rawCriteria.map((c) => ({
-        id: c.id,
-        description: c.description,
-        ...c.required !== void 0 ? { required: c.required } : {},
-        ...c.method !== void 0 ? { method: c.method } : {},
-        ...c.task_ids !== void 0 ? { taskIds: c.task_ids } : {},
-        ...c.depends_on !== void 0 ? { dependsOn: c.depends_on } : {}
-      }));
+      const mapped = rawCriteria.map(mapCriterion2);
+      const workspace = typeof args.workspace === "string" && args.workspace.trim().length > 0 ? args.workspace.trim() : void 0;
       const role = args.role ?? "agent";
       try {
+        if (workspace !== void 0) service.setWorkspaceRoot(agent, workspace);
         const criteria = await service.setCriteria(agent, mapped, role);
         return {
           criteria,
@@ -2255,6 +2771,7 @@ function createAcceptanceTools(ctx) {
           const completion = service.canComplete(agent);
           const previousGoalSummary = slimSummary2(service.summarize(agent));
           await service.startGoal(agent);
+          if (workspace !== void 0) service.setWorkspaceRoot(agent, workspace);
           const criteria = await service.setCriteria(agent, mapped, role);
           return {
             goalId: service.getActiveGoalId(agent),
@@ -2290,7 +2807,11 @@ function createAcceptanceTools(ctx) {
         type: "string",
         description: "Verification evidence (e.g. test output, command result, error log). Required for passed/failed."
       },
-      evidence_type: { type: "string", enum: ["command", "file", "url", "text"] }
+      evidence_type: { type: "string", enum: ["command", "file", "url", "text"] },
+      command: {
+        type: "string",
+        description: "The shell command executed for this verdict. Required for passed when the criterion pins verify_command; must equal it."
+      }
     },
     output: {
       schema: OUTPUT_OBJECT_SCHEMA,
@@ -2305,7 +2826,8 @@ function createAcceptanceTools(ctx) {
         criterionId: args.criterion_id,
         status: args.status,
         evidence: args.evidence,
-        ...args.evidence_type !== void 0 ? { evidenceType: args.evidence_type } : {}
+        ...args.evidence_type !== void 0 ? { evidenceType: args.evidence_type } : {},
+        ...args.command !== void 0 ? { command: args.command } : {}
       }).then((updated) => ({
         criterion: updated,
         goalId: service.getActiveGoalId(agent),
@@ -2396,7 +2918,8 @@ function createAcceptanceTools(ctx) {
             criterion_id: { type: "string", required: true, description: "A criterion linked to this task." },
             status: { type: "string", required: true, enum: STATUSES, description: "Reviewed outcome." },
             evidence: { type: "string", required: true, description: "Fresh verification evidence gathered by the reviewer." },
-            evidence_type: { type: "string", enum: ["command", "file", "url", "text"], description: "Evidence type." }
+            evidence_type: { type: "string", enum: ["command", "file", "url", "text"], description: "Evidence type." },
+            command: { type: "string", description: "Executed command; required for passed when the criterion pins verify_command." }
           }
         }
       }
@@ -2414,7 +2937,8 @@ function createAcceptanceTools(ctx) {
         criterionId: v.criterion_id,
         status: v.status,
         evidence: v.evidence,
-        ...v.evidence_type !== void 0 ? { evidenceType: v.evidence_type } : {}
+        ...v.evidence_type !== void 0 ? { evidenceType: v.evidence_type } : {},
+        ...v.command !== void 0 ? { command: v.command } : {}
       }));
       return service.reviewTask(agent, args.task_id, verdicts).then((result) => ({
         goalId: service.getActiveGoalId(agent),
@@ -2437,7 +2961,8 @@ function createAcceptanceTools(ctx) {
         type: "string",
         required: true,
         description: "Human-readable reason for the amendment (recorded in audit trail)."
-      }
+      },
+      workspace: WORKSPACE_SCHEMA
     },
     output: {
       schema: OUTPUT_OBJECT_SCHEMA,
@@ -2449,15 +2974,9 @@ function createAcceptanceTools(ctx) {
       const service = ctx.get("goalAcceptance");
       if (service === void 0) throw new Error("goalAcceptance service is not mounted");
       const rawCriteria = args.criteria;
+      if (typeof args.workspace === "string" && args.workspace.trim().length > 0) service.setWorkspaceRoot(agent, args.workspace.trim());
       return service.amendCriteria(agent, {
-        criteria: rawCriteria.map((c) => ({
-          id: c.id,
-          description: c.description,
-          ...c.required !== void 0 ? { required: c.required } : {},
-          ...c.method !== void 0 ? { method: c.method } : {},
-          ...c.task_ids !== void 0 ? { taskIds: c.task_ids } : {},
-          ...c.depends_on !== void 0 ? { dependsOn: c.depends_on } : {}
-        })),
+        criteria: rawCriteria.map(mapCriterion2),
         reason: args.reason
       }).then((added) => ({
         addedCriteria: added,
@@ -2466,6 +2985,45 @@ function createAcceptanceTools(ctx) {
       }));
     },
     presentCall: (args) => present("Amend acceptance criteria", "other", args)
+  });
+  const updateCriterionTool = defineTool({
+    name: "update_criterion",
+    description: "Patch an existing criterion after lock (fix a wrong verify_command, extend artifact bindings, correct description/method/required). Requires a reason for audit. Patching artifacts or verify_command on a PASSED criterion resets it to pending (forces re-validation). verify_command: null clears the pin; artifacts: [] clears bindings.",
+    parameters: {
+      criterion_id: { type: "string", required: true, description: "Existing criterion id to patch." },
+      reason: { type: "string", required: true, description: "Reason for the patch (audit trail)." },
+      description: { type: "string" },
+      required: { type: "boolean" },
+      method: { type: "string", enum: ["command", "file", "url", "manual"] },
+      verify_command: { type: "string", description: "New pinned command; pass null to clear." },
+      artifacts: { type: "array", items: { type: "string" }, description: "New artifact list (replaces old). [] clears." }
+    },
+    output: {
+      schema: OUTPUT_OBJECT_SCHEMA,
+      render: (_args, value) => [{ type: "text", text: JSON.stringify(value, null, 2) }]
+    },
+    execute(args, exec) {
+      const agent = exec.agent;
+      if (agent === void 0) throw new Error("acceptance tools require a calling agent");
+      const service = ctx.get("goalAcceptance");
+      if (service === void 0) throw new Error("goalAcceptance service is not mounted");
+      const patch = {};
+      if (args.description !== void 0) patch.description = args.description;
+      if (args.required !== void 0) patch.required = args.required;
+      if (args.method !== void 0) patch.method = args.method;
+      if (args.verify_command !== void 0) patch.verifyCommand = args.verify_command;
+      if (args.artifacts !== void 0) patch.artifacts = args.artifacts;
+      return service.updateCriterion(agent, {
+        criterionId: args.criterion_id,
+        patch,
+        reason: args.reason
+      }).then((criterion) => ({
+        criterion,
+        goalId: service.getActiveGoalId(agent),
+        summary: service.summarize(agent)
+      }));
+    },
+    presentCall: (args) => present(`Update criterion "${String(args.criterion_id)}"`, "other", args)
   });
   const requireService = (exec) => {
     if (exec.agent === void 0) throw new Error("acceptance tools require a calling agent");
@@ -2491,7 +3049,8 @@ function createAcceptanceTools(ctx) {
     output: { schema: OUTPUT_OBJECT_SCHEMA, render: (_a, v) => [{ type: "text", text: JSON.stringify(v, null, 2) }] },
     execute(_args, exec) {
       const { agent, service } = requireService(exec);
-      return Promise.resolve(service.canComplete(agent));
+      const drift = service.checkArtifactDrift(agent);
+      return Promise.resolve({ ...service.canComplete(agent), ...drift.drifted.length > 0 ? { drift: drift.drifted } : {} });
     },
     presentCall: () => present("Check goal completion", "read")
   });
@@ -2521,11 +3080,12 @@ function createAcceptanceTools(ctx) {
   const startTool = defineTool({
     name: "start_goal",
     description: description("start_goal"),
-    parameters: { title: { type: "string" } },
+    parameters: { title: { type: "string" }, workspace: WORKSPACE_SCHEMA },
     output: { schema: OUTPUT_OBJECT_SCHEMA, render: (_a, v) => [{ type: "text", text: JSON.stringify(v, null, 2) }] },
     execute(args, exec) {
       const { agent, service } = requireService(exec);
-      return Promise.resolve({ goal: service.startGoal(agent, args.title), message: "New goal started and set as active." });
+      const workspace = typeof args.workspace === "string" && args.workspace.trim().length > 0 ? args.workspace.trim() : void 0;
+      return Promise.resolve({ goal: service.startGoal(agent, args.title, void 0, workspace), message: "New goal started and set as active." });
     },
     presentCall: (args) => present("Start goal", "other", args)
   });
@@ -2534,7 +3094,8 @@ function createAcceptanceTools(ctx) {
     description: description("create_goal"),
     parameters: {
       name: { type: "string", required: true, description: "Short goal name (stored as the goal title)." },
-      description: { type: "string", description: "Optional longer description of what the goal achieves." }
+      description: { type: "string", description: "Optional longer description of what the goal achieves." },
+      workspace: WORKSPACE_SCHEMA
     },
     output: { schema: OUTPUT_OBJECT_SCHEMA, render: (_a, v) => [{ type: "text", text: JSON.stringify(v, null, 2) }] },
     execute(args, exec) {
@@ -2544,7 +3105,8 @@ function createAcceptanceTools(ctx) {
         throw new GoalAcceptanceError('create_goal requires a non-empty "name" string.', "GOAL_ACCEPTANCE_INVALID_ARGS", 'Call create_goal with {name: "...", description?: "..."}.');
       }
       const description2 = typeof args.description === "string" ? args.description : void 0;
-      const meta = service.startGoal(agent, name3.trim(), description2);
+      const workspace = typeof args.workspace === "string" && args.workspace.trim().length > 0 ? args.workspace.trim() : void 0;
+      const meta = service.startGoal(agent, name3.trim(), description2, workspace);
       return Promise.resolve({ goalId: meta.id, goal: meta, message: "New goal created and set as active." });
     },
     presentCall: (args) => present("Create goal", "other", args)
@@ -2576,8 +3138,8 @@ function createAcceptanceTools(ctx) {
     description: description("run_and_validate"),
     parameters: {
       criterion_id: { type: "string", required: true, description: "Criterion ID to validate." },
-      command: { type: "string", required: true, description: "Shell command to execute." },
-      cwd: { type: "string", description: "Optional working directory." },
+      command: { type: "string", description: "Shell command to execute. Optional when the criterion pins a verify_command \u2014 then the pinned command runs." },
+      cwd: { type: "string", description: "Optional working directory. Rejected when the criterion pins a verify_command (pinned commands run in the goal workspace)." },
       timeout_ms: { type: "number", description: "Optional timeout in milliseconds." },
       verbose: { type: "boolean", description: "Default false: slim summary. true: full summary." }
     },
@@ -2585,8 +3147,25 @@ function createAcceptanceTools(ctx) {
     execute(args, exec) {
       const { agent, service } = requireService(exec);
       const criterionId = args.criterion_id;
-      const command = args.command;
-      const cwd = typeof args.cwd === "string" && args.cwd.trim().length > 0 ? args.cwd.trim() : void 0;
+      const criterion = service.getCriterion(agent, criterionId);
+      if (criterion === void 0) {
+        throw new GoalAcceptanceError(`criterion_id "${criterionId}" not found`, "GOAL_ACCEPTANCE_CRITERION_NOT_FOUND");
+      }
+      const pinned = criterion.verifyCommand;
+      const requested = typeof args.command === "string" && args.command.trim().length > 0 ? args.command.trim() : void 0;
+      const requestedCwd = typeof args.cwd === "string" && args.cwd.trim().length > 0 ? args.cwd.trim() : void 0;
+      if (pinned !== void 0) {
+        if (requested !== void 0 && requested !== pinned || requestedCwd !== void 0) {
+          throw new GoalAcceptanceError(
+            `criterion "${criterionId}" pins verify_command "${pinned}" \u2014 run_and_validate must execute exactly that command in the goal workspace`,
+            "GOAL_ACCEPTANCE_VERIFY_COMMAND_MISMATCH"
+          );
+        }
+      } else if (requested === void 0) {
+        throw new GoalAcceptanceError("command is required when the criterion does not pin a verify_command", "GOAL_ACCEPTANCE_INVALID_ARGS");
+      }
+      const command = pinned ?? requested;
+      const cwd = pinned !== void 0 ? service.getWorkspaceRoot(agent) : requestedCwd;
       const timeout = typeof args.timeout_ms === "number" && args.timeout_ms > 0 ? args.timeout_ms : 6e4;
       let stdout = "";
       let stderr = "";
@@ -2618,7 +3197,8 @@ ${stderr.trim()}` : "",
         criterionId,
         status,
         evidence: rawEvidence,
-        evidenceType: "command"
+        evidenceType: "command",
+        verifiedCommand: command
       }).then((updated) => ({
         criterion: updated,
         goalId: service.getActiveGoalId(agent),
@@ -2635,25 +3215,21 @@ ${stderr.trim()}` : "",
       title: { type: "string", description: "Optional short goal title." },
       role: { type: "string", enum: ["agent", "reviewer", "dual"], description: "Role locking criteria." },
       criteria: { type: "array", required: true, items: CRITERION_ITEM_SCHEMA2 },
-      tasks: { type: "array", items: TASK_PLAN_ITEM_SCHEMA2 }
+      tasks: { type: "array", items: TASK_PLAN_ITEM_SCHEMA2 },
+      workspace: WORKSPACE_SCHEMA
     },
     output: { schema: OUTPUT_OBJECT_SCHEMA, render: (_a, v) => [{ type: "text", text: JSON.stringify(v, null, 2) }] },
     async execute(args, exec) {
       const { agent, service } = requireService(exec);
       const rawCriteria = args.criteria;
       const rawTasks = args.tasks;
-      const mappedCriteria = rawCriteria.map((c) => ({
-        id: c.id,
-        description: c.description,
-        ...c.required !== void 0 ? { required: c.required } : {},
-        ...c.method !== void 0 ? { method: c.method } : {},
-        ...c.task_ids !== void 0 ? { taskIds: c.task_ids } : {},
-        ...c.depends_on !== void 0 ? { dependsOn: c.depends_on } : {}
-      }));
+      const mappedCriteria = rawCriteria.map(mapCriterion2);
       const role = args.role ?? "agent";
       const title = args.title;
+      const workspace = typeof args.workspace === "string" && args.workspace.trim().length > 0 ? args.workspace.trim() : void 0;
       try {
-        if (title !== void 0) await service.startGoal(agent, title);
+        if (title !== void 0) await service.startGoal(agent, title, void 0, workspace);
+        if (workspace !== void 0) service.setWorkspaceRoot(agent, workspace);
         const criteria = await service.setCriteria(agent, mappedCriteria, role);
         let taskPlan;
         if (Array.isArray(rawTasks) && rawTasks.length > 0) {
@@ -2676,7 +3252,8 @@ ${stderr.trim()}` : "",
           const previousGoalId = service.getActiveGoalId(agent);
           const completion = service.canComplete(agent);
           const previousGoalSummary = slimSummary2(service.summarize(agent));
-          await service.startGoal(agent, title);
+          await service.startGoal(agent, title, void 0, workspace);
+          if (workspace !== void 0) service.setWorkspaceRoot(agent, workspace);
           const criteria = await service.setCriteria(agent, mappedCriteria, role);
           let taskPlan;
           if (Array.isArray(rawTasks) && rawTasks.length > 0) {
@@ -2716,7 +3293,7 @@ ${stderr.trim()}` : "",
     },
     presentCall: () => present("Reset goal", "other")
   });
-  return [setTool, getTool, validateTool, confirmTool, updateTaskTool, claimTaskTool, reviewTaskTool, amendTool, canCompleteTool, setPlanTool, getPlanTool, startTool, createTool, listTool, switchTool, runAndValidateTool, quickStartTool, resetTool];
+  return [setTool, getTool, validateTool, confirmTool, updateTaskTool, claimTaskTool, reviewTaskTool, amendTool, updateCriterionTool, canCompleteTool, setPlanTool, getPlanTool, startTool, createTool, listTool, switchTool, runAndValidateTool, quickStartTool, resetTool];
 }
 async function apply2(ctx, config = {}) {
   const autoSteer = config.autoSteerUncompleted !== false;

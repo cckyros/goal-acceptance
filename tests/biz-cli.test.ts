@@ -3,7 +3,7 @@
 // `status` prints a JSON summary. Both resolve the shared PLUGIN_DATA dir,
 // which is the same dir an agent-side MCP server would use.
 import { spawnSync } from "node:child_process";
-import { mkdtempSync, rmSync } from "node:fs";
+import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
@@ -110,4 +110,87 @@ test("status: JSON summary reflects the shared store", (t) => {
   assert.equal(data.allowed, false);
   assert.equal(data.criteria.length, 2);
   assert.deepEqual(data.criteria.map((c) => c.id), ["c1", "c2"]);
+});
+
+test("integrity: check exits 1 on artifact drift, 0 after re-validation", (t) => {
+  const dir = mkdtempSync(join(tmpdir(), "ga-biz-"));
+  const ws = mkdtempSync(join(tmpdir(), "ga-ws-"));
+  t.after(() => {
+    rmSync(dir, { recursive: true, force: true });
+    rmSync(ws, { recursive: true, force: true });
+  });
+  const artifact = join(ws, "out.txt");
+  writeFileSync(artifact, "v1");
+
+  mcp(
+    [
+      toolCall(1, "set_acceptance_criteria", {
+        workspace: ws,
+        criteria: [
+          { id: "c1", description: "out.txt verified", required: true, artifacts: ["out.txt"], task_ids: ["t1"] },
+        ],
+      }),
+      toolCall(2, "set_task_plan", {
+        tasks: [{ id: "t1", description: "produce out.txt", deliverable: "out.txt" }],
+      }),
+      toolCall(3, "claim_task", { task_id: "t1" }),
+      toolCall(4, "review_task", {
+        task_id: "t1",
+        verdicts: [{ criterion_id: "c1", status: "passed", evidence: "content verified", evidence_type: "file" }],
+      }),
+    ],
+    dir,
+  );
+
+  const clean = cli(["check"], dir);
+  assert.equal(clean.status, 0, clean.stderr);
+
+  // Post-review tamper → drift blocks the gate.
+  writeFileSync(artifact, "tampered");
+  const drifted = cli(["check"], dir);
+  assert.equal(drifted.status, 1);
+  assert.ok(drifted.stderr.includes("drifted"), drifted.stderr);
+
+  const status = cli(["status"], dir);
+  const data = JSON.parse(status.stdout) as { allowed: boolean; drift?: Array<{ criterion: { id: string } }> };
+  assert.equal(data.allowed, false);
+  assert.equal(data.drift?.[0]?.criterion.id, "c1");
+
+  // Rework path: claim_task reclaims the completed task, re-review clears.
+  writeFileSync(artifact, "v1-fixed");
+  mcp(
+    [
+      toolCall(5, "claim_task", {}),
+      toolCall(6, "review_task", {
+        task_id: "t1",
+        verdicts: [{ criterion_id: "c1", status: "passed", evidence: "re-verified", evidence_type: "file" }],
+      }),
+    ],
+    dir,
+  );
+  const done = cli(["check"], dir);
+  assert.equal(done.status, 0, done.stderr);
+});
+
+test("verify_command pinning: run_and_validate runs only the pinned command", (t) => {
+  const dir = mkdtempSync(join(tmpdir(), "ga-biz-"));
+  t.after(() => rmSync(dir, { recursive: true, force: true }));
+
+  const res = mcp(
+    [
+      toolCall(1, "set_acceptance_criteria", {
+        criteria: [{ id: "c1", description: "pinned", required: true, verify_command: "node -e \"console.log('pinned')\"" }],
+      }),
+      // wrong command → tool-level error
+      toolCall(2, "run_and_validate", { criterion_id: "c1", command: "node -e \"process.exit(1)\"" }),
+      // no command arg → runs the pinned one
+      toolCall(3, "run_and_validate", { criterion_id: "c1" }),
+    ],
+    dir,
+  );
+
+  const mismatch = res[1]?.result?.content?.[0]?.text ?? "";
+  assert.ok(mismatch.includes("VERIFY_COMMAND_MISMATCH") || mismatch.includes("pins verify_command"), mismatch);
+  const pinned = res[2]?.result?.content?.[0]?.text ?? "";
+  assert.ok(pinned.includes("passed") && !pinned.includes("MISMATCH"), pinned);
 });

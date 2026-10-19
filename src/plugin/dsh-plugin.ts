@@ -28,7 +28,7 @@ import type { Agent } from '@deepseek-ai/dsh-agent'
 import { defineTool, type GenericCallView, type ToolDefinition } from '@deepseek-ai/dsh-tools'
 import { manifest } from './manifest.ts'
 import { SessionAcceptanceStore } from './goal-manager.ts'
-import { GoalAcceptanceEngine, GoalAcceptanceError, InMemoryAcceptanceStore, type AcceptanceSummary, type AmendSpec, type ClaimTaskResult, type ConfirmCriterionSpec, type CriterionSpec, type EvidenceType, type GoalCriterion, type GoalCriterionStatus, type GoalRole, type GoalTask, type ReviewTaskResult, type TaskPlanSpec, type TaskStatus, type TaskUpdateSpec, type ValidateCriterionSpec } from './engine/index.ts'
+import { GoalAcceptanceEngine, GoalAcceptanceError, InMemoryAcceptanceStore, type AcceptanceSummary, type AmendSpec, type ClaimTaskResult, type ConfirmCriterionSpec, type CriterionSpec, type EvidenceType, type GoalCriterion, type GoalCriterionStatus, type GoalRole, type GoalTask, type ReviewTaskResult, type TaskPlanSpec, type TaskStatus, type TaskUpdateSpec, type UpdateCriterionSpec, type ValidateCriterionSpec } from './engine/index.ts'
 import { renderAcceptanceGuidance } from './prompt.ts'
 import * as invariant from './invariant.ts'
 
@@ -100,14 +100,28 @@ export class GoalAcceptanceService extends Service {
 
   private goalMap(agent: Agent) { this.getEngine(agent); return this.goals.get(agent)! }
 
-  startGoal(agent: Agent, title?: string, description?: string) {
+  startGoal(agent: Agent, title?: string, description?: string, workspaceRoot?: string) {
     const goals = this.goalMap(agent)
     const id = randomUUID()
     const meta = { id, title: title ?? '', ...description !== undefined ? { description } : {}, createdAt: Date.now() }
-    goals.set(id, { ...meta, engine: new GoalAcceptanceEngine(new InMemoryAcceptanceStore()) })
+    goals.set(id, { ...meta, engine: new GoalAcceptanceEngine(new InMemoryAcceptanceStore(), workspaceRoot) })
     this.activeGoals.set(agent, id)
     this.engines.set(agent, goals.get(id)!.engine)
     return meta
+  }
+
+  /** Lazily bind the workspace root on the active goal's engine (set-once). */
+  setWorkspaceRoot(agent: Agent, root: string): void {
+    this.getEngine(agent).setWorkspaceRoot(root)
+  }
+
+  getWorkspaceRoot(agent: Agent): string | undefined {
+    return this.getEngine(agent).getWorkspaceRoot()
+  }
+
+  /** Gate-time drift report for the active goal. */
+  checkArtifactDrift(agent: Agent) {
+    return this.getEngine(agent).checkArtifactDrift()
   }
 
   listGoals(agent: Agent) {
@@ -145,6 +159,11 @@ export class GoalAcceptanceService extends Service {
   /** Append new criteria after the initial lock. */
   amendCriteria(agent: Agent, spec: AmendSpec): Promise<GoalCriterion[]> {
     return this.getEngine(agent).amendCriteria(spec)
+  }
+
+  /** Patch an existing criterion's declaration (fix pins, extend bindings). */
+  updateCriterion(agent: Agent, spec: UpdateCriterionSpec): Promise<GoalCriterion> {
+    return this.getEngine(agent).updateCriterion(spec)
   }
 
   /** Record verification status and evidence for one criterion. */
@@ -242,7 +261,45 @@ const CRITERION_ITEM_SCHEMA = {
       items: { type: 'string' },
       description: 'IDs of criteria that must be passed before this criterion should be validated. Affects steering priority.',
     },
+    artifacts: {
+      type: 'array',
+      items: { type: 'string' },
+      description: 'Workspace-relative file paths this verdict binds to. Their sha256 is recorded at validation; any later change makes the gate report drift and block completion.',
+    },
+    verify_command: {
+      type: 'string',
+      description: 'The single shell command authorized to prove this criterion. When set, run_and_validate executes exactly this command.',
+    },
   },
+} as const
+
+interface RawCriterion {
+  id: string
+  description: string
+  required?: boolean
+  method?: string
+  task_ids?: string[]
+  depends_on?: string[]
+  artifacts?: string[]
+  verify_command?: string
+}
+
+function mapCriterion(c: RawCriterion): CriterionSpec {
+  return {
+    id: c.id,
+    description: c.description,
+    ...c.required !== undefined ? { required: c.required } : {},
+    ...c.method !== undefined ? { method: c.method } : {},
+    ...c.task_ids !== undefined ? { taskIds: c.task_ids } : {},
+    ...c.depends_on !== undefined ? { dependsOn: c.depends_on } : {},
+    ...c.artifacts !== undefined ? { artifacts: c.artifacts } : {},
+    ...c.verify_command !== undefined ? { verifyCommand: c.verify_command } : {},
+  }
+}
+
+const WORKSPACE_SCHEMA = {
+  type: 'string',
+  description: 'Absolute path of the workspace that criterion artifacts resolve against. Required when any criterion declares artifacts. Set-once per goal.',
 } as const
 
 const TASK_PLAN_ITEM_SCHEMA = {
@@ -285,9 +342,11 @@ export function createAcceptanceTools(ctx: Context): ToolDefinition[] {
       if (service === undefined) throw new Error('goalAcceptance service is not mounted')
       const criteria = service.getCriteria(agent)
       const summary = service.summarize(agent)
+      const drift = service.checkArtifactDrift(agent)
       return Promise.resolve({
         criteria,
         summary,
+        ...drift.drifted.length > 0 ? { drift: drift.drifted } : {},
       } as never)
     },
     presentCall: () => present('Read acceptance criteria', 'read'),
@@ -313,6 +372,7 @@ export function createAcceptanceTools(ctx: Context): ToolDefinition[] {
         items: CRITERION_ITEM_SCHEMA,
       },
       role: { ...ROLE_SCHEMA, description: 'Role locking criteria; defaults to agent.' },
+      workspace: WORKSPACE_SCHEMA,
     },
     output: {
       schema: OUTPUT_OBJECT_SCHEMA,
@@ -323,17 +383,12 @@ export function createAcceptanceTools(ctx: Context): ToolDefinition[] {
       if (agent === undefined) throw new Error('acceptance tools require a calling agent')
       const service = ctx.get('goalAcceptance')
       if (service === undefined) throw new Error('goalAcceptance service is not mounted')
-      const rawCriteria = args.criteria as Array<{ id: string; description: string; required?: boolean; method?: string; task_ids?: string[]; depends_on?: string[] }>
-      const mapped = rawCriteria.map(c => ({
-        id: c.id,
-        description: c.description,
-        ...c.required !== undefined ? { required: c.required } : {},
-        ...c.method !== undefined ? { method: c.method } : {},
-        ...c.task_ids !== undefined ? { taskIds: c.task_ids } : {},
-        ...c.depends_on !== undefined ? { dependsOn: c.depends_on } : {},
-      }))
+      const rawCriteria = args.criteria as RawCriterion[]
+      const mapped = rawCriteria.map(mapCriterion)
+      const workspace = typeof args.workspace === 'string' && args.workspace.trim().length > 0 ? args.workspace.trim() : undefined
       const role = (args.role as GoalRole | undefined) ?? 'agent'
       try {
+        if (workspace !== undefined) service.setWorkspaceRoot(agent, workspace)
         const criteria = await service.setCriteria(agent, mapped, role)
         return {
           criteria,
@@ -351,6 +406,7 @@ export function createAcceptanceTools(ctx: Context): ToolDefinition[] {
           const completion = service.canComplete(agent)
           const previousGoalSummary = slimSummary(service.summarize(agent))
           await service.startGoal(agent)
+          if (workspace !== undefined) service.setWorkspaceRoot(agent, workspace)
           const criteria = await service.setCriteria(agent, mapped, role)
           return {
             goalId: service.getActiveGoalId(agent),
@@ -388,6 +444,10 @@ export function createAcceptanceTools(ctx: Context): ToolDefinition[] {
         description: 'Verification evidence (e.g. test output, command result, error log). Required for passed/failed.',
       },
       evidence_type: { type: 'string', enum: ['command', 'file', 'url', 'text'] },
+      command: {
+        type: 'string',
+        description: 'The shell command executed for this verdict. Required for passed when the criterion pins verify_command; must equal it.',
+      },
     },
     output: {
       schema: OUTPUT_OBJECT_SCHEMA,
@@ -403,6 +463,7 @@ export function createAcceptanceTools(ctx: Context): ToolDefinition[] {
         status: args.status as GoalCriterionStatus,
         evidence: args.evidence as string | undefined,
         ...args.evidence_type !== undefined ? { evidenceType: args.evidence_type as EvidenceType } : {},
+        ...args.command !== undefined ? { command: args.command as string } : {},
       }).then(updated => ({
         criterion: updated,
         goalId: service.getActiveGoalId(agent),
@@ -497,6 +558,7 @@ export function createAcceptanceTools(ctx: Context): ToolDefinition[] {
             status: { type: 'string', required: true, enum: STATUSES, description: 'Reviewed outcome.' },
             evidence: { type: 'string', required: true, description: 'Fresh verification evidence gathered by the reviewer.' },
             evidence_type: { type: 'string', enum: ['command', 'file', 'url', 'text'], description: 'Evidence type.' },
+            command: { type: 'string', description: 'Executed command; required for passed when the criterion pins verify_command.' },
           },
         },
       },
@@ -515,6 +577,7 @@ export function createAcceptanceTools(ctx: Context): ToolDefinition[] {
         status: v.status as GoalCriterionStatus,
         evidence: v.evidence as string,
         ...v.evidence_type !== undefined ? { evidenceType: v.evidence_type as EvidenceType } : {},
+        ...v.command !== undefined ? { command: v.command as string } : {},
       }))
       return service.reviewTask(agent, args.task_id as string, verdicts).then(result => ({
         goalId: service.getActiveGoalId(agent),
@@ -539,6 +602,7 @@ export function createAcceptanceTools(ctx: Context): ToolDefinition[] {
         required: true,
         description: 'Human-readable reason for the amendment (recorded in audit trail).',
       },
+      workspace: WORKSPACE_SCHEMA,
     },
     output: {
       schema: OUTPUT_OBJECT_SCHEMA,
@@ -549,16 +613,10 @@ export function createAcceptanceTools(ctx: Context): ToolDefinition[] {
       if (agent === undefined) throw new Error('acceptance tools require a calling agent')
       const service = ctx.get('goalAcceptance')
       if (service === undefined) throw new Error('goalAcceptance service is not mounted')
-      const rawCriteria = args.criteria as Array<{ id: string; description: string; required?: boolean; method?: string; task_ids?: string[]; depends_on?: string[] }>
+      const rawCriteria = args.criteria as RawCriterion[]
+      if (typeof args.workspace === 'string' && args.workspace.trim().length > 0) service.setWorkspaceRoot(agent, args.workspace.trim())
       return service.amendCriteria(agent, {
-        criteria: rawCriteria.map(c => ({
-          id: c.id,
-          description: c.description,
-          ...c.required !== undefined ? { required: c.required } : {},
-          ...c.method !== undefined ? { method: c.method } : {},
-          ...c.task_ids !== undefined ? { taskIds: c.task_ids } : {},
-          ...c.depends_on !== undefined ? { dependsOn: c.depends_on } : {},
-        })),
+        criteria: rawCriteria.map(mapCriterion),
         reason: args.reason as string,
       }).then(added => ({
         addedCriteria: added,
@@ -567,6 +625,46 @@ export function createAcceptanceTools(ctx: Context): ToolDefinition[] {
       })) as never
     },
     presentCall: args => present('Amend acceptance criteria', 'other', args),
+  })
+
+  const updateCriterionTool = defineTool({
+    name: 'update_criterion',
+    description: 'Patch an existing criterion after lock (fix a wrong verify_command, extend artifact bindings, correct description/method/required). Requires a reason for audit. Patching artifacts or verify_command on a PASSED criterion resets it to pending (forces re-validation). verify_command: null clears the pin; artifacts: [] clears bindings.',
+    parameters: {
+      criterion_id: { type: 'string', required: true, description: 'Existing criterion id to patch.' },
+      reason: { type: 'string', required: true, description: 'Reason for the patch (audit trail).' },
+      description: { type: 'string' },
+      required: { type: 'boolean' },
+      method: { type: 'string', enum: ['command', 'file', 'url', 'manual'] },
+      verify_command: { type: 'string', description: 'New pinned command; pass null to clear.' },
+      artifacts: { type: 'array', items: { type: 'string' }, description: 'New artifact list (replaces old). [] clears.' },
+    },
+    output: {
+      schema: OUTPUT_OBJECT_SCHEMA,
+      render: (_args: unknown, value: unknown) => [{ type: 'text' as const, text: JSON.stringify(value, null, 2) }],
+    },
+    execute(args, exec) {
+      const agent = exec.agent
+      if (agent === undefined) throw new Error('acceptance tools require a calling agent')
+      const service = ctx.get('goalAcceptance')
+      if (service === undefined) throw new Error('goalAcceptance service is not mounted')
+      const patch: Record<string, unknown> = {}
+      if (args.description !== undefined) patch.description = args.description
+      if (args.required !== undefined) patch.required = args.required
+      if (args.method !== undefined) patch.method = args.method
+      if (args.verify_command !== undefined) patch.verifyCommand = args.verify_command
+      if (args.artifacts !== undefined) patch.artifacts = args.artifacts
+      return service.updateCriterion(agent, {
+        criterionId: args.criterion_id as string,
+        patch,
+        reason: args.reason as string,
+      }).then(criterion => ({
+        criterion,
+        goalId: service.getActiveGoalId(agent),
+        summary: service.summarize(agent),
+      })) as never
+    },
+    presentCall: args => present(`Update criterion "${String(args.criterion_id)}"`, 'other', args),
   })
 
   const requireService = (exec: { agent?: Agent }) => {
@@ -591,7 +689,11 @@ export function createAcceptanceTools(ctx: Context): ToolDefinition[] {
   const canCompleteTool = defineTool({
     name: 'can_complete_goal', description: description('can_complete_goal'), parameters: {},
     output: { schema: OUTPUT_OBJECT_SCHEMA, render: (_a: unknown, v: unknown) => [{ type: 'text' as const, text: JSON.stringify(v, null, 2) }] },
-    execute(_args, exec) { const { agent, service } = requireService(exec); return Promise.resolve(service.canComplete(agent)) as never },
+    execute(_args, exec) {
+      const { agent, service } = requireService(exec)
+      const drift = service.checkArtifactDrift(agent)
+      return Promise.resolve({ ...service.canComplete(agent), ...drift.drifted.length > 0 ? { drift: drift.drifted } : {} }) as never
+    },
     presentCall: () => present('Check goal completion', 'read'),
   })
 
@@ -615,9 +717,13 @@ export function createAcceptanceTools(ctx: Context): ToolDefinition[] {
   })
 
   const startTool = defineTool({
-    name: 'start_goal', description: description('start_goal'), parameters: { title: { type: 'string' } },
+    name: 'start_goal', description: description('start_goal'), parameters: { title: { type: 'string' }, workspace: WORKSPACE_SCHEMA },
     output: { schema: OUTPUT_OBJECT_SCHEMA, render: (_a: unknown, v: unknown) => [{ type: 'text' as const, text: JSON.stringify(v, null, 2) }] },
-    execute(args, exec) { const { agent, service } = requireService(exec); return Promise.resolve({ goal: service.startGoal(agent, args.title as string | undefined), message: 'New goal started and set as active.' }) as never },
+    execute(args, exec) {
+      const { agent, service } = requireService(exec)
+      const workspace = typeof args.workspace === 'string' && args.workspace.trim().length > 0 ? args.workspace.trim() : undefined
+      return Promise.resolve({ goal: service.startGoal(agent, args.title as string | undefined, undefined, workspace), message: 'New goal started and set as active.' }) as never
+    },
     presentCall: args => present('Start goal', 'other', args),
   })
 
@@ -626,6 +732,7 @@ export function createAcceptanceTools(ctx: Context): ToolDefinition[] {
     parameters: {
       name: { type: 'string', required: true, description: 'Short goal name (stored as the goal title).' },
       description: { type: 'string', description: 'Optional longer description of what the goal achieves.' },
+      workspace: WORKSPACE_SCHEMA,
     },
     output: { schema: OUTPUT_OBJECT_SCHEMA, render: (_a: unknown, v: unknown) => [{ type: 'text' as const, text: JSON.stringify(v, null, 2) }] },
     execute(args, exec) {
@@ -635,7 +742,8 @@ export function createAcceptanceTools(ctx: Context): ToolDefinition[] {
         throw new GoalAcceptanceError('create_goal requires a non-empty "name" string.', 'GOAL_ACCEPTANCE_INVALID_ARGS', 'Call create_goal with {name: "...", description?: "..."}.')
       }
       const description = typeof args.description === 'string' ? args.description : undefined
-      const meta = service.startGoal(agent, name.trim(), description)
+      const workspace = typeof args.workspace === 'string' && args.workspace.trim().length > 0 ? args.workspace.trim() : undefined
+      const meta = service.startGoal(agent, name.trim(), description, workspace)
       return Promise.resolve({ goalId: meta.id, goal: meta, message: 'New goal created and set as active.' }) as never
     },
     presentCall: args => present('Create goal', 'other', args),
@@ -660,8 +768,8 @@ export function createAcceptanceTools(ctx: Context): ToolDefinition[] {
     description: description('run_and_validate'),
     parameters: {
       criterion_id: { type: 'string', required: true, description: 'Criterion ID to validate.' },
-      command: { type: 'string', required: true, description: 'Shell command to execute.' },
-      cwd: { type: 'string', description: 'Optional working directory.' },
+      command: { type: 'string', description: 'Shell command to execute. Optional when the criterion pins a verify_command — then the pinned command runs.' },
+      cwd: { type: 'string', description: 'Optional working directory. Rejected when the criterion pins a verify_command (pinned commands run in the goal workspace).' },
       timeout_ms: { type: 'number', description: 'Optional timeout in milliseconds.' },
       verbose: { type: 'boolean', description: 'Default false: slim summary. true: full summary.' },
     },
@@ -669,8 +777,25 @@ export function createAcceptanceTools(ctx: Context): ToolDefinition[] {
     execute(args, exec) {
       const { agent, service } = requireService(exec)
       const criterionId = args.criterion_id as string
-      const command = args.command as string
-      const cwd = typeof args.cwd === 'string' && args.cwd.trim().length > 0 ? args.cwd.trim() : undefined
+      const criterion = service.getCriterion(agent, criterionId)
+      if (criterion === undefined) {
+        throw new GoalAcceptanceError(`criterion_id "${criterionId}" not found`, 'GOAL_ACCEPTANCE_CRITERION_NOT_FOUND')
+      }
+      const pinned = criterion.verifyCommand
+      const requested = typeof args.command === 'string' && args.command.trim().length > 0 ? args.command.trim() : undefined
+      const requestedCwd = typeof args.cwd === 'string' && args.cwd.trim().length > 0 ? args.cwd.trim() : undefined
+      if (pinned !== undefined) {
+        if ((requested !== undefined && requested !== pinned) || requestedCwd !== undefined) {
+          throw new GoalAcceptanceError(
+            `criterion "${criterionId}" pins verify_command "${pinned}" — run_and_validate must execute exactly that command in the goal workspace`,
+            'GOAL_ACCEPTANCE_VERIFY_COMMAND_MISMATCH',
+          )
+        }
+      } else if (requested === undefined) {
+        throw new GoalAcceptanceError('command is required when the criterion does not pin a verify_command', 'GOAL_ACCEPTANCE_INVALID_ARGS')
+      }
+      const command = pinned ?? requested!
+      const cwd = pinned !== undefined ? service.getWorkspaceRoot(agent) : requestedCwd
       const timeout = typeof args.timeout_ms === 'number' && args.timeout_ms > 0 ? args.timeout_ms : 60000
 
       let stdout = ''
@@ -704,6 +829,7 @@ export function createAcceptanceTools(ctx: Context): ToolDefinition[] {
         status,
         evidence: rawEvidence,
         evidenceType: 'command',
+        verifiedCommand: command,
       }).then(updated => ({
         criterion: updated,
         goalId: service.getActiveGoalId(agent),
@@ -722,25 +848,21 @@ export function createAcceptanceTools(ctx: Context): ToolDefinition[] {
       role: { type: 'string', enum: ['agent', 'reviewer', 'dual'], description: 'Role locking criteria.' },
       criteria: { type: 'array', required: true, items: CRITERION_ITEM_SCHEMA },
       tasks: { type: 'array', items: TASK_PLAN_ITEM_SCHEMA },
+      workspace: WORKSPACE_SCHEMA,
     },
     output: { schema: OUTPUT_OBJECT_SCHEMA, render: (_a: unknown, v: unknown) => [{ type: 'text' as const, text: JSON.stringify(v, null, 2) }] },
     async execute(args, exec) {
       const { agent, service } = requireService(exec)
-      const rawCriteria = args.criteria as Array<{ id: string; description: string; required?: boolean; method?: string; task_ids?: string[]; depends_on?: string[] }>
+      const rawCriteria = args.criteria as RawCriterion[]
       const rawTasks = args.tasks as Array<{ id: string; description: string; deliverable: string; depends_on?: string[] }> | undefined
-      const mappedCriteria = rawCriteria.map(c => ({
-        id: c.id,
-        description: c.description,
-        ...c.required !== undefined ? { required: c.required } : {},
-        ...c.method !== undefined ? { method: c.method } : {},
-        ...c.task_ids !== undefined ? { taskIds: c.task_ids } : {},
-        ...c.depends_on !== undefined ? { dependsOn: c.depends_on } : {},
-      }))
+      const mappedCriteria = rawCriteria.map(mapCriterion)
       const role = (args.role as GoalRole | undefined) ?? 'agent'
       const title = args.title as string | undefined
+      const workspace = typeof args.workspace === 'string' && args.workspace.trim().length > 0 ? args.workspace.trim() : undefined
 
       try {
-        if (title !== undefined) await service.startGoal(agent, title)
+        if (title !== undefined) await service.startGoal(agent, title, undefined, workspace)
+        if (workspace !== undefined) service.setWorkspaceRoot(agent, workspace)
         const criteria = await service.setCriteria(agent, mappedCriteria, role)
         let taskPlan
         if (Array.isArray(rawTasks) && rawTasks.length > 0) {
@@ -763,7 +885,8 @@ export function createAcceptanceTools(ctx: Context): ToolDefinition[] {
           const previousGoalId = service.getActiveGoalId(agent)
           const completion = service.canComplete(agent)
           const previousGoalSummary = slimSummary(service.summarize(agent))
-          await service.startGoal(agent, title)
+          await service.startGoal(agent, title, undefined, workspace)
+          if (workspace !== undefined) service.setWorkspaceRoot(agent, workspace)
           const criteria = await service.setCriteria(agent, mappedCriteria, role)
           let taskPlan
           if (Array.isArray(rawTasks) && rawTasks.length > 0) {
@@ -799,7 +922,7 @@ export function createAcceptanceTools(ctx: Context): ToolDefinition[] {
     presentCall: () => present('Reset goal', 'other'),
   })
 
-  return [setTool, getTool, validateTool, confirmTool, updateTaskTool, claimTaskTool, reviewTaskTool, amendTool, canCompleteTool, setPlanTool, getPlanTool, startTool, createTool, listTool, switchTool, runAndValidateTool, quickStartTool, resetTool]
+  return [setTool, getTool, validateTool, confirmTool, updateTaskTool, claimTaskTool, reviewTaskTool, amendTool, updateCriterionTool, canCompleteTool, setPlanTool, getPlanTool, startTool, createTool, listTool, switchTool, runAndValidateTool, quickStartTool, resetTool]
 }
 
 // ------------------------------------------------------------------ apply

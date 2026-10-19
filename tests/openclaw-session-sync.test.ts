@@ -128,7 +128,6 @@ test('syncSessionGoal does nothing when no session context is available', async 
 })
 
 test('clearSessionGoal removes the SessionEntry.goal', async () => {
-  const manager = new GoalManager('')
 
   const store: Record<string, Record<string, { goal?: unknown }>> = {
     main: { 'agent:main:run-5': { goal: { id: 'old-goal', status: 'active' } } },

@@ -41,7 +41,11 @@ const CriterionItem = Type.Object({
   ], { description: 'Verification method: command, file, url, or manual.' })),
   task_ids: Type.Optional(Type.Array(Type.String(), { description: 'Task IDs linked to this criterion.' })),
   depends_on: Type.Optional(Type.Array(Type.String(), { description: 'IDs of criteria that must be passed before this one.' })),
+  artifacts: Type.Optional(Type.Array(Type.String(), { description: 'Workspace-relative file paths this verdict binds to. sha256 recorded at validation; later changes drift-block the gate.' })),
+  verify_command: Type.Optional(Type.String({ description: 'The single shell command authorized to prove this criterion.' })),
 })
+
+const WorkspaceParam = Type.Optional(Type.String({ description: 'Absolute workspace path that criterion artifacts resolve against. Required when any criterion declares artifacts. Set-once per goal.' }))
 
 const TaskPlanItem = Type.Object({
   id: Type.String({ description: 'Unique task id (e.g. "t1", "api-endpoint").' }),
@@ -68,7 +72,7 @@ function slimSummary(s: { allRequiredPassed: boolean; passedCount: number; selfC
   }
 }
 
-function mapCriterion(c: { id: string; description: string; required?: boolean; method?: string; task_ids?: string[]; depends_on?: string[] }) {
+function mapCriterion(c: { id: string; description: string; required?: boolean; method?: string; task_ids?: string[]; depends_on?: string[]; artifacts?: string[]; verify_command?: string }) {
   return {
     id: c.id,
     description: c.description,
@@ -76,6 +80,8 @@ function mapCriterion(c: { id: string; description: string; required?: boolean; 
     ...c.method !== undefined ? { method: c.method } : {},
     ...c.task_ids !== undefined ? { taskIds: c.task_ids } : {},
     ...c.depends_on !== undefined ? { dependsOn: c.depends_on } : {},
+    ...c.artifacts !== undefined ? { artifacts: c.artifacts } : {},
+    ...c.verify_command !== undefined ? { verifyCommand: c.verify_command } : {},
   }
 }
 
@@ -155,12 +161,14 @@ export default defineToolPlugin({
           Type.Literal('reviewer'),
           Type.Literal('dual'),
         ], { description: 'Role locking the criteria. agent (default): passed marks self-claimed, requiring confirm_criterion by an independent reviewer. reviewer/dual: formal passed immediately (use only when the user explicitly waives independent review).' })),
+        workspace: WorkspaceParam,
       }),
       { mutates: true },
       async (params, config) => {
         let mgr = getManager(config)
         const role = params.role || 'agent'
         try {
+          if (params.workspace !== undefined) mgr.setWorkspaceRoot(params.workspace)
           const list = await mgr.ensureGoal().setCriteria(params.criteria.map(mapCriterion), role)
           const summary = mgr.getEngine().summarize()
           return { goalId: mgr.getCurrentGoalId(), criteria: list, summary }
@@ -175,6 +183,7 @@ export default defineToolPlugin({
             const completion = mgr.getEngine().canComplete()
             const previousGoalSummary = slimSummary(mgr.getEngine().summarize())
             mgr.startGoal()
+            if (params.workspace !== undefined) mgr.setWorkspaceRoot(params.workspace)
             const list = await mgr.getEngine().setCriteria(params.criteria.map(mapCriterion), role)
             return {
               goalId: mgr.getCurrentGoalId(),
@@ -205,7 +214,8 @@ export default defineToolPlugin({
         const summary = eng.summarize()
         if (!verbose) return { summary: slimSummary(summary) }
         const criteria = eng.getCriteria()
-        return { criteria, summary }
+        const drift = eng.checkArtifactDrift()
+        return { criteria, summary, ...drift.drifted.length > 0 ? { drift: drift.drifted } : {} }
       },
     )()),
 
@@ -230,6 +240,7 @@ export default defineToolPlugin({
           Type.Literal('url'),
           Type.Literal('text'),
         ], { description: 'Type of evidence. text = low confidence. Default: text.' })),
+        command: Type.Optional(Type.String({ description: 'Executed shell command. Required for passed when the criterion pins verify_command; must equal it.' })),
         verbose: Type.Optional(Type.Boolean({ description: 'Default false: returns criterion + slim summary. true: returns criterion + full summary.' })),
       }),
       { mutates: true },
@@ -240,6 +251,7 @@ export default defineToolPlugin({
           status: params.status,
           evidence: params.evidence,
           ...params.evidence_type !== undefined ? { evidenceType: params.evidence_type } : {},
+          ...params.command !== undefined ? { command: params.command } : {},
         })
         const verbose = params.verbose === true
         const summary = eng.summarize()
@@ -342,16 +354,18 @@ export default defineToolPlugin({
             Type.Literal('url'),
             Type.Literal('text'),
           ], { description: 'Evidence type.' })),
+          command: Type.Optional(Type.String({ description: 'Executed command; required for passed when the criterion pins verify_command.' })),
         }), { description: 'Reviewer verdicts, one per linked criterion being judged this round.' }),
       }),
       { mutates: true },
       async (params, config) => {
         const mgr = getManager(config)
-        const verdicts = params.verdicts.map((v: { criterion_id: string; status: 'pending' | 'in_progress' | 'passed' | 'failed' | 'blocked' | 'not_run'; evidence: string; evidence_type?: 'command' | 'file' | 'url' | 'text' }) => ({
+        const verdicts = params.verdicts.map((v: { criterion_id: string; status: 'pending' | 'in_progress' | 'passed' | 'failed' | 'blocked' | 'not_run'; evidence: string; evidence_type?: 'command' | 'file' | 'url' | 'text'; command?: string }) => ({
           criterionId: v.criterion_id,
           status: v.status,
           evidence: v.evidence,
           ...v.evidence_type !== undefined ? { evidenceType: v.evidence_type } : {},
+          ...v.command !== undefined ? { command: v.command } : {},
         }))
         const result = await mgr.getEngine().reviewTask(params.task_id, verdicts)
         return { goalId: mgr.getCurrentGoalId(), ...result }
@@ -365,10 +379,12 @@ export default defineToolPlugin({
       Type.Object({
         criteria: Type.Array(CriterionItem, { description: 'New criteria to append.' }),
         reason: Type.String({ description: 'Human-readable reason for the amendment.' }),
+        workspace: WorkspaceParam,
       }),
       { mutates: true },
       async (params, config) => {
         const mgr = getManager(config)
+        if (params.workspace !== undefined) mgr.setWorkspaceRoot(params.workspace)
         const added = await mgr.getEngine().amendCriteria({
           criteria: params.criteria.map(mapCriterion),
           reason: params.reason,
@@ -379,13 +395,47 @@ export default defineToolPlugin({
     )()),
 
     tool(makeTool(
+      'update_criterion',
+      'Update Criterion',
+      'Patch an existing criterion after lock (fix a wrong verify_command, extend artifact bindings, correct description/method/required). Requires a reason for audit. Patching artifacts or verify_command on a PASSED criterion resets it to pending. verify_command: null clears the pin; artifacts: [] clears bindings.',
+      Type.Object({
+        criterion_id: Type.String({ description: 'Existing criterion id to patch.' }),
+        reason: Type.String({ description: 'Reason for the patch (audit trail).' }),
+        description: Type.Optional(Type.String()),
+        required: Type.Optional(Type.Boolean()),
+        method: Type.Optional(Type.Union([Type.Literal('command'), Type.Literal('file'), Type.Literal('url'), Type.Literal('manual')])),
+        verify_command: Type.Optional(Type.Union([Type.String(), Type.Null()], { description: 'New pinned command, or null to clear.' })),
+        artifacts: Type.Optional(Type.Array(Type.String(), { description: 'New artifact list (replaces old). [] clears.' })),
+      }),
+      { mutates: true },
+      async (params, config) => {
+        const mgr = getManager(config)
+        const patch: Record<string, unknown> = {}
+        if (params.description !== undefined) patch.description = params.description
+        if (params.required !== undefined) patch.required = params.required
+        if (params.method !== undefined) patch.method = params.method
+        if (params.verify_command !== undefined) patch.verifyCommand = params.verify_command
+        if (params.artifacts !== undefined) patch.artifacts = params.artifacts
+        const updated = await mgr.getEngine().updateCriterion({
+          criterionId: params.criterion_id,
+          patch,
+          reason: params.reason,
+        })
+        const summary = mgr.getEngine().summarize()
+        return { goalId: mgr.getCurrentGoalId(), criterion: updated, summary: slimSummary(summary) }
+      },
+    )()),
+
+    tool(makeTool(
       'can_complete_goal',
       'Can Complete Goal',
       'Check whether the goal can be completed based on current acceptance criteria.',
       Type.Object({}),
       { mutates: false },
       async (_params, config) => {
-        return getManager(config).getEngine().canComplete()
+        const eng = getManager(config).getEngine()
+        const drift = eng.checkArtifactDrift()
+        return { ...eng.canComplete(), ...drift.drifted.length > 0 ? { drift: drift.drifted } : {} }
       },
     )()),
 
@@ -424,10 +474,11 @@ export default defineToolPlugin({
       'Start a new goal with a fresh state. Use this when the current goal is locked and you need to begin a new independent task. Each goal has its own acceptance criteria and task plan. The new goal becomes the active goal.',
       Type.Object({
         title: Type.Optional(Type.String({ description: 'Optional human-readable title for the goal.' })),
+        workspace: WorkspaceParam,
       }),
       { mutates: true },
       async (params, config) => {
-        const meta = getManager(config).startGoal(params.title)
+        const meta = getManager(config).startGoal(params.title, undefined, params.workspace)
         return { goal: meta, message: 'New goal started and set as active.' }
       },
     )()),
@@ -439,10 +490,11 @@ export default defineToolPlugin({
       Type.Object({
         name: Type.String({ description: 'Short goal name (stored as the goal title, shown by list_goals).' }),
         description: Type.Optional(Type.String({ description: 'Optional longer description of what the goal achieves.' })),
+        workspace: WorkspaceParam,
       }),
       { mutates: true },
       async (params, config) => {
-        const meta = getManager(config).startGoal(params.name, params.description)
+        const meta = getManager(config).startGoal(params.name, params.description, params.workspace)
         return { goalId: meta.id, goal: meta, message: 'New goal created and set as active.' }
       },
     )()),
@@ -478,8 +530,8 @@ export default defineToolPlugin({
       'Execute a shell command, capture its real stdout/stderr/exitCode, and validate the criterion in one call. Guarantees high-confidence command evidence.',
       Type.Object({
         criterion_id: Type.String({ description: 'Criterion ID to validate.' }),
-        command: Type.String({ description: 'Shell command to execute.' }),
-        cwd: Type.Optional(Type.String({ description: 'Optional working directory.' })),
+        command: Type.Optional(Type.String({ description: 'Shell command to execute. Optional when the criterion pins a verify_command — then the pinned command runs.' })),
+        cwd: Type.Optional(Type.String({ description: 'Optional working directory. Rejected when the criterion pins a verify_command.' })),
         timeout_ms: Type.Optional(Type.Number({ description: 'Optional timeout in milliseconds.' })),
         verbose: Type.Optional(Type.Boolean({ description: 'Default false: slim summary. true: full summary.' })),
       }),
@@ -487,12 +539,30 @@ export default defineToolPlugin({
       async (params, config) => {
         const mgr = getManager(config)
         const eng = mgr.getEngine()
+        const criterion = eng.getCriterion(params.criterion_id)
+        if (criterion === undefined) {
+          throw new GoalAcceptanceError(`criterion_id "${params.criterion_id}" not found`, 'GOAL_ACCEPTANCE_CRITERION_NOT_FOUND')
+        }
+        const pinned = criterion.verifyCommand
+        const requested = typeof params.command === 'string' && params.command.trim().length > 0 ? params.command.trim() : undefined
+        if (pinned !== undefined) {
+          if ((requested !== undefined && requested !== pinned) || params.cwd !== undefined) {
+            throw new GoalAcceptanceError(
+              `criterion "${params.criterion_id}" pins verify_command "${pinned}" — run_and_validate must execute exactly that command in the goal workspace`,
+              'GOAL_ACCEPTANCE_VERIFY_COMMAND_MISMATCH',
+            )
+          }
+        } else if (requested === undefined) {
+          throw new GoalAcceptanceError('command is required when the criterion does not pin a verify_command', 'GOAL_ACCEPTANCE_INVALID_ARGS')
+        }
+        const command = pinned ?? requested!
+        const cwd = pinned !== undefined ? eng.getWorkspaceRoot() : params.cwd
         let stdout = ''
         let stderr = ''
         let exitCode = 0
         try {
-          stdout = execSync(params.command, {
-            cwd: params.cwd,
+          stdout = execSync(command, {
+            cwd,
             timeout: params.timeout_ms || 60000,
             encoding: 'utf8',
             stdio: ['pipe', 'pipe', 'pipe'],
@@ -506,7 +576,7 @@ export default defineToolPlugin({
         }
         const status = exitCode === 0 ? 'passed' : 'failed'
         const rawEvidence = [
-          `$ ${params.command}`,
+          `$ ${command}`,
           stdout.trim() ? `[stdout]\n${stdout.trim()}` : '',
           stderr.trim() ? `[stderr]\n${stderr.trim()}` : '',
           `[exit code] ${exitCode}`,
@@ -517,6 +587,7 @@ export default defineToolPlugin({
           status,
           evidence: rawEvidence,
           evidenceType: 'command',
+          verifiedCommand: command,
         })
         const verbose = params.verbose === true
         const summary = eng.summarize()
@@ -538,13 +609,15 @@ export default defineToolPlugin({
         role: Type.Optional(Type.Union([Type.Literal('agent'), Type.Literal('reviewer'), Type.Literal('dual')], { description: 'Role locking criteria.' })),
         criteria: Type.Array(CriterionItem, { description: 'Initial criteria to lock.' }),
         tasks: Type.Optional(Type.Array(TaskPlanItem, { description: 'Optional task plan.' })),
+        workspace: WorkspaceParam,
       }),
       { mutates: true },
       async (params, config) => {
         const mgr = getManager(config)
         const role = params.role || 'agent'
-        if (params.title !== undefined) mgr.startGoal(params.title)
+        if (params.title !== undefined) mgr.startGoal(params.title, undefined, params.workspace)
         let engine = mgr.ensureGoal()
+        if (params.workspace !== undefined) mgr.setWorkspaceRoot(params.workspace)
         let list: GoalCriterion[]
         let previousGoalId: string | undefined
         let previousGoalIncomplete = false
@@ -559,7 +632,7 @@ export default defineToolPlugin({
             previousGoalSummary = slimSummary(engine.summarize())
             previousGoalIncomplete = !completion.allowed
             previousGoalReason = completion.reason
-            mgr.startGoal(params.title)
+            mgr.startGoal(params.title, undefined, params.workspace)
             engine = mgr.getEngine()
             list = await engine.setCriteria(params.criteria.map(mapCriterion), role)
           } else {

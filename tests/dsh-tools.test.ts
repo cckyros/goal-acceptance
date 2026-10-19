@@ -47,12 +47,12 @@ async function createHarness() {
 }
 
 describe('Goal Acceptance Tools', () => {
-  it('registers the complete 18-tool protocol', async () => {
+  it('registers the complete 19-tool protocol', async () => {
     const { tools } = await createHarness()
     assert.deepEqual(tools.map(tool => tool.name), [
       'set_acceptance_criteria', 'get_acceptance_criteria', 'validate_criterion',
       'confirm_criterion', 'update_task_status', 'claim_task', 'review_task',
-      'amend_acceptance_criteria',
+      'amend_acceptance_criteria', 'update_criterion',
       'can_complete_goal', 'set_task_plan', 'get_task_plan', 'start_goal',
       'create_goal', 'list_goals', 'switch_goal', 'run_and_validate', 'quick_start_goal', 'reset_goal',
     ])

@@ -7,12 +7,12 @@
     "url": "https://github.com/cckyros/goal-acceptance",
     "source": "github"
   },
-  "version": "0.2.9",
+  "version": "0.3.0",
   "packages": [
     {
       "registryType": "npm",
       "identifier": "@cckyros/goal-acceptance",
-      "version": "0.2.9",
+      "version": "0.3.0",
       "runtimeHint": "npx",
       "transport": {
         "type": "stdio"

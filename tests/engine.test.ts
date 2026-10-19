@@ -1,5 +1,8 @@
 import { describe, it } from 'node:test'
 import assert from 'node:assert/strict'
+import { mkdtempSync, rmSync, writeFileSync } from 'node:fs'
+import { join } from 'node:path'
+import * as os from 'node:os'
 import { GoalAcceptanceEngine, InMemoryAcceptanceStore } from '../src/plugin/engine/index.ts'
 
 describe('GoalAcceptanceEngine', () => {
@@ -787,5 +790,332 @@ describe('GoalAcceptanceEngine — orchestrated task loop', () => {
       assert.equal(result.taskCompleted, true)
     }
     assert.equal(engine.canComplete().allowed, true)
+  })
+})
+
+describe('Verification integrity layer', () => {
+  const tmp = { dir: '' }
+  function makeWorkspace(): string {
+    tmp.dir = mkdtempSync(join(os.tmpdir(), 'ga-integrity-'))
+    return tmp.dir
+  }
+  function engineIn(ws: string) {
+    return new GoalAcceptanceEngine(new InMemoryAcceptanceStore(), ws)
+  }
+
+  it('records artifact digests on passed verdict and blocks completion on drift', async () => {
+    const ws = makeWorkspace()
+    writeFileSync(join(ws, 'a.txt'), 'content-a')
+    const engine = engineIn(ws)
+    await engine.setCriteria([{ id: 'c1', description: 'a.txt ok', artifacts: ['a.txt'] }])
+
+    const updated = await engine.validateCriterion({ criterionId: 'c1', status: 'passed', evidence: 'checked', evidenceType: 'file', byReviewer: true })
+    assert.ok(updated.artifactDigests && updated.artifactDigests['a.txt'])
+    assert.equal(engine.canComplete().allowed, true)
+
+    writeFileSync(join(ws, 'a.txt'), 'tampered')
+    const result = engine.canComplete()
+    assert.equal(result.allowed, false)
+    assert.match(result.reason!, /drifted/)
+    const drift = engine.checkArtifactDrift()
+    assert.equal(drift.drifted.length, 1)
+    assert.equal(drift.drifted[0]!.criterion.id, 'c1')
+    assert.equal(drift.drifted[0]!.reasons[0]!.kind, 'changed')
+  })
+
+  it('reports missing artifacts as drift', async () => {
+    const ws = makeWorkspace()
+    writeFileSync(join(ws, 'a.txt'), 'x')
+    const engine = engineIn(ws)
+    await engine.setCriteria([{ id: 'c1', description: 'a', artifacts: ['a.txt'] }])
+    await engine.validateCriterion({ criterionId: 'c1', status: 'passed', evidence: 'e', evidenceType: 'file', byReviewer: true })
+    rmSync(join(ws, 'a.txt'))
+    const drift = engine.checkArtifactDrift()
+    assert.equal(drift.drifted[0]!.reasons[0]!.kind, 'missing')
+    assert.equal(engine.canComplete().allowed, false)
+  })
+
+  it('rejects passed verdict when a declared artifact is absent', async () => {
+    const ws = makeWorkspace()
+    const engine = engineIn(ws)
+    await engine.setCriteria([{ id: 'c1', description: 'a', artifacts: ['nope.txt'] }])
+    await assert.rejects(
+      engine.validateCriterion({ criterionId: 'c1', status: 'passed', evidence: 'e' }),
+      (e: { code?: string }) => e.code === 'GOAL_ACCEPTANCE_ARTIFACT_MISSING',
+    )
+    // A failed verdict must NOT be rejected — absence is a legitimate fail reason.
+    const failed = await engine.validateCriterion({ criterionId: 'c1', status: 'failed', evidence: 'file missing' })
+    assert.equal(failed.status, 'failed')
+  })
+
+  it('rejects artifact declaration without a workspace root', async () => {
+    const engine = new GoalAcceptanceEngine(new InMemoryAcceptanceStore())
+    await assert.rejects(
+      engine.setCriteria([{ id: 'c1', description: 'a', artifacts: ['a.txt'] }]),
+      (e: { code?: string }) => e.code === 'GOAL_ACCEPTANCE_WORKSPACE_REQUIRED',
+    )
+  })
+
+  it('rejects relative artifact paths that escape the workspace', async () => {
+    const ws = makeWorkspace()
+    const engine = engineIn(ws)
+    await assert.rejects(
+      engine.setCriteria([{ id: 'c1', description: 'a', artifacts: ['../outside.txt'] }]),
+      (e: { code?: string }) => e.code === 'GOAL_ACCEPTANCE_INVALID_CRITERIA',
+    )
+  })
+
+  it('setWorkspaceRoot is set-once', async () => {
+    const ws = makeWorkspace()
+    const engine = engineIn(ws)
+    engine.setWorkspaceRoot(ws)
+    assert.throws(() => engine.setWorkspaceRoot(join(ws, 'other')), /already set/)
+  })
+
+  it('non-required drift does not block the gate', async () => {
+    const ws = makeWorkspace()
+    writeFileSync(join(ws, 'a.txt'), 'x')
+    writeFileSync(join(ws, 'b.txt'), 'y')
+    const engine = engineIn(ws)
+    await engine.setCriteria([
+      { id: 'req', description: 'required', artifacts: ['a.txt'] },
+      { id: 'opt', description: 'optional', required: false, artifacts: ['b.txt'] },
+    ])
+    await engine.validateCriterion({ criterionId: 'req', status: 'passed', evidence: 'e', evidenceType: 'file', byReviewer: true })
+    await engine.validateCriterion({ criterionId: 'opt', status: 'passed', evidence: 'e', evidenceType: 'file', byReviewer: true })
+    writeFileSync(join(ws, 'b.txt'), 'tampered')
+    assert.equal(engine.canComplete().allowed, true)
+    assert.equal(engine.checkArtifactDrift().drifted.length, 1)
+  })
+
+  it('re-validation after rework clears drift', async () => {
+    const ws = makeWorkspace()
+    writeFileSync(join(ws, 'a.txt'), 'x')
+    const engine = engineIn(ws)
+    await engine.setCriteria([{ id: 'c1', description: 'a', artifacts: ['a.txt'] }])
+    await engine.validateCriterion({ criterionId: 'c1', status: 'passed', evidence: 'e', evidenceType: 'file', byReviewer: true })
+    writeFileSync(join(ws, 'a.txt'), 'y')
+    assert.equal(engine.canComplete().allowed, false)
+    await engine.validateCriterion({ criterionId: 'c1', status: 'passed', evidence: 're-verified', evidenceType: 'file', byReviewer: true })
+    assert.equal(engine.canComplete().allowed, true)
+  })
+
+  it('drift on a completed task makes it reclaimable as rework', async () => {
+    const ws = makeWorkspace()
+    writeFileSync(join(ws, 'a.txt'), 'x')
+    writeFileSync(join(ws, 'b.txt'), 'y')
+    const engine = engineIn(ws)
+    await engine.setCriteria([
+      { id: 'c1', description: 'a', artifacts: ['a.txt'], taskIds: ['t1'] },
+      { id: 'c2', description: 'b', artifacts: ['b.txt'], taskIds: ['t2'] },
+    ])
+    await engine.setTaskPlan([
+      { id: 't1', description: 'task one', deliverable: 'a.txt' },
+      { id: 't2', description: 'task two', deliverable: 'b.txt', dependsOn: ['t1'] },
+    ])
+    await engine.claimTask('t1')
+    await engine.reviewTask('t1', [{ criterionId: 'c1', status: 'passed', evidence: 'ok', evidenceType: 'file' }])
+    await engine.claimTask('t2')
+    await engine.reviewTask('t2', [{ criterionId: 'c2', status: 'passed', evidence: 'ok', evidenceType: 'file' }])
+    assert.equal(engine.canComplete().allowed, true)
+
+    // t1's artifact drifts after t2 completed (shared-file regression).
+    writeFileSync(join(ws, 'a.txt'), 'tampered')
+    assert.equal(engine.canComplete().allowed, false)
+
+    // Rework claim takes priority over the (empty) ready frontier.
+    const rework = await engine.claimTask()
+    assert.equal(rework.claimKind, 'rework')
+    assert.equal(rework.task!.id, 't1')
+    assert.equal(rework.task!.status, 'in_progress')
+
+    writeFileSync(join(ws, 'a.txt'), 'fixed')
+    const re = await engine.reviewTask('t1', [{ criterionId: 'c1', status: 'passed', evidence: 're-ok', evidenceType: 'file' }])
+    assert.equal(re.taskCompleted, true)
+    assert.equal(engine.canComplete().allowed, true)
+  })
+
+  it('stores verifyCommand on the criterion and keeps it immutable via amend-only path', async () => {
+    const engine = new GoalAcceptanceEngine(new InMemoryAcceptanceStore())
+    const list = await engine.setCriteria([{ id: 'c1', description: 'a', verifyCommand: 'node --version' }])
+    assert.equal(list[0]!.verifyCommand, 'node --version')
+  })
+
+  it('empty artifacts array is normalized away', async () => {
+    const ws = makeWorkspace()
+    const engine = engineIn(ws)
+    const list = await engine.setCriteria([{ id: 'c1', description: 'a', artifacts: [] }])
+    assert.equal(list[0]!.artifacts, undefined)
+  })
+
+  it('digests survive event replay', async () => {
+    const ws = makeWorkspace()
+    writeFileSync(join(ws, 'a.txt'), 'x')
+    const store = new InMemoryAcceptanceStore()
+    const engine = new GoalAcceptanceEngine(store, ws)
+    await engine.setCriteria([{ id: 'c1', description: 'a', artifacts: ['a.txt'] }])
+    await engine.validateCriterion({ criterionId: 'c1', status: 'passed', evidence: 'e', evidenceType: 'file', byReviewer: true })
+
+    // Fresh engine over the same store replays digests.
+    const replayed = new GoalAcceptanceEngine(store, ws)
+    const drift = replayed.checkArtifactDrift()
+    assert.equal(drift.drifted.length, 0)
+    assert.equal(drift.intact.length, 1)
+  })
+})
+
+describe('F5 audit follow-ups (update_criterion, digestDelta, drift event, pin enforcement)', () => {
+  const tmp = { dir: '' }
+  function makeWorkspace(): string {
+    tmp.dir = mkdtempSync(join(os.tmpdir(), 'ga-f5-'))
+    return tmp.dir
+  }
+  function engineIn(ws: string) {
+    return new GoalAcceptanceEngine(new InMemoryAcceptanceStore(), ws)
+  }
+
+  it('updateCriterion patches verifyCommand on a pending criterion and persists it', async () => {
+    const engine = new GoalAcceptanceEngine(new InMemoryAcceptanceStore())
+    await engine.setCriteria([{ id: 'c1', description: 'a', verifyCommand: 'node --test test/' }])
+    const updated = await engine.updateCriterion({
+      criterionId: 'c1',
+      patch: { verifyCommand: 'node --test' },
+      reason: 'pin was broken on Windows',
+    })
+    assert.equal(updated.verifyCommand, 'node --test')
+  })
+
+  it('updateCriterion requires a reason and a non-empty patch', async () => {
+    const engine = new GoalAcceptanceEngine(new InMemoryAcceptanceStore())
+    await engine.setCriteria([{ id: 'c1', description: 'a' }])
+    await assert.rejects(
+      engine.updateCriterion({ criterionId: 'c1', patch: { description: 'x' }, reason: '' }),
+      (e: { code?: string }) => e.code === 'GOAL_ACCEPTANCE_UPDATE_REASON_REQUIRED',
+    )
+    await assert.rejects(
+      engine.updateCriterion({ criterionId: 'c1', patch: {}, reason: 'r' }),
+      (e: { code?: string }) => e.code === 'GOAL_ACCEPTANCE_INVALID_ARGS',
+    )
+    await assert.rejects(
+      engine.updateCriterion({ criterionId: 'nope', patch: { description: 'x' }, reason: 'r' }),
+      (e: { code?: string }) => e.code === 'GOAL_ACCEPTANCE_CRITERION_NOT_FOUND',
+    )
+  })
+
+  it('updateCriterion on artifacts of a PASSED criterion resets it to pending and clears digests', async () => {
+    const ws = makeWorkspace()
+    writeFileSync(join(ws, 'a.txt'), 'x')
+    writeFileSync(join(ws, 'b.txt'), 'y')
+    const engine = engineIn(ws)
+    await engine.setCriteria([{ id: 'c1', description: 'a', artifacts: ['a.txt'] }])
+    await engine.validateCriterion({ criterionId: 'c1', status: 'passed', evidence: 'e', evidenceType: 'file', byReviewer: true })
+    assert.equal(engine.getCriterion('c1')!.artifactDigests !== undefined, true)
+
+    const updated = await engine.updateCriterion({
+      criterionId: 'c1',
+      patch: { artifacts: ['a.txt', 'b.txt'] },
+      reason: 'package.json was missing from bindings',
+    })
+    assert.equal(updated.status, 'pending')
+    assert.equal(updated.artifactDigests, undefined)
+    assert.deepEqual(updated.artifacts, ['a.txt', 'b.txt'])
+    assert.equal(engine.canComplete().allowed, false)
+  })
+
+  it('updateCriterion description-only patch keeps passed status', async () => {
+    const ws = makeWorkspace()
+    writeFileSync(join(ws, 'a.txt'), 'x')
+    const engine = engineIn(ws)
+    await engine.setCriteria([{ id: 'c1', description: 'a', artifacts: ['a.txt'] }])
+    await engine.validateCriterion({ criterionId: 'c1', status: 'passed', evidence: 'e', evidenceType: 'file', byReviewer: true })
+    const updated = await engine.updateCriterion({ criterionId: 'c1', patch: { description: 'better desc' }, reason: 'clarity' })
+    assert.equal(updated.status, 'passed')
+    assert.equal(engine.canComplete().allowed, true)
+  })
+
+  it('pinned criterion rejects a passed verdict without a declared command', async () => {
+    const engine = new GoalAcceptanceEngine(new InMemoryAcceptanceStore())
+    await engine.setCriteria([{ id: 'c1', description: 'a', verifyCommand: 'node --test' }])
+    await assert.rejects(
+      engine.validateCriterion({ criterionId: 'c1', status: 'passed', evidence: 'ran it' }),
+      (e: { code?: string }) => e.code === 'GOAL_ACCEPTANCE_VERIFY_COMMAND_MISMATCH',
+    )
+  })
+
+  it('pinned criterion rejects a mismatched declared command, accepts the pin', async () => {
+    const engine = new GoalAcceptanceEngine(new InMemoryAcceptanceStore())
+    await engine.setCriteria([{ id: 'c1', description: 'a', verifyCommand: 'node --test' }])
+    await assert.rejects(
+      engine.validateCriterion({ criterionId: 'c1', status: 'passed', evidence: 'e', command: 'npm test' }),
+      (e: { code?: string }) => e.code === 'GOAL_ACCEPTANCE_VERIFY_COMMAND_MISMATCH',
+    )
+    const ok = await engine.validateCriterion({ criterionId: 'c1', status: 'passed', evidence: 'e', command: 'node --test' })
+    assert.equal(ok.status, 'passed')
+    // non-passed verdicts may omit the command but cannot lie
+    await assert.rejects(
+      engine.validateCriterion({ criterionId: 'c1', status: 'failed', evidence: 'e', command: 'other' }),
+      (e: { code?: string }) => e.code === 'GOAL_ACCEPTANCE_VERIFY_COMMAND_MISMATCH',
+    )
+  })
+
+  it('review_task enforces the pin on verdicts too', async () => {
+    const engine = new GoalAcceptanceEngine(new InMemoryAcceptanceStore())
+    await engine.setCriteria([{ id: 'c1', description: 'a', taskIds: ['t1'], verifyCommand: 'node --test' }])
+    await engine.setTaskPlan([{ id: 't1', description: 't', deliverable: 'd' }])
+    await engine.claimTask('t1')
+    await assert.rejects(
+      engine.reviewTask('t1', [{ criterionId: 'c1', status: 'passed', evidence: 'e', evidenceType: 'command' }]),
+      (e: { code?: string }) => e.code === 'GOAL_ACCEPTANCE_VERIFY_COMMAND_MISMATCH',
+    )
+    const ok = await engine.reviewTask('t1', [{ criterionId: 'c1', status: 'passed', evidence: 'e', evidenceType: 'command', command: 'node --test' }])
+    assert.equal(ok.taskCompleted, true)
+  })
+
+  it('re-validation records digestDelta on the criterion and event', async () => {
+    const ws = makeWorkspace()
+    writeFileSync(join(ws, 'a.txt'), 'x')
+    const engine = engineIn(ws)
+    await engine.setCriteria([{ id: 'c1', description: 'a', artifacts: ['a.txt'] }])
+    await engine.validateCriterion({ criterionId: 'c1', status: 'passed', evidence: 'e', evidenceType: 'file', byReviewer: true })
+    writeFileSync(join(ws, 'a.txt'), 'y')
+    const updated = await engine.validateCriterion({ criterionId: 'c1', status: 'passed', evidence: 're', evidenceType: 'file', byReviewer: true })
+    assert.deepEqual(updated.digestDelta, { changed: ['a.txt'], added: [], removed: [] })
+  })
+
+  it('rework claim persists a drift event and claimKind on task-update', async () => {
+    const ws = makeWorkspace()
+    writeFileSync(join(ws, 'a.txt'), 'x')
+    const store = new InMemoryAcceptanceStore()
+    const engine = new GoalAcceptanceEngine(store, ws)
+    await engine.setCriteria([{ id: 'c1', description: 'a', artifacts: ['a.txt'], taskIds: ['t1'] }])
+    await engine.setTaskPlan([{ id: 't1', description: 't', deliverable: 'd' }])
+    await engine.claimTask('t1')
+    await engine.reviewTask('t1', [{ criterionId: 'c1', status: 'passed', evidence: 'ok', evidenceType: 'file' }])
+    writeFileSync(join(ws, 'a.txt'), 'tampered')
+    const rework = await engine.claimTask()
+    assert.equal(rework.claimKind, 'rework')
+    const types = store.events.map(e => e.type)
+    const driftIdx = types.indexOf('goal-acceptance/drift')
+    assert.ok(driftIdx > 0, 'drift event should be persisted')
+    const reopen = store.events.find(e => e.type === 'goal-acceptance/task-update' && (e as { claimKind?: string }).claimKind === 'rework')
+    assert.ok(reopen !== undefined, 'task-update should carry claimKind=rework')
+  })
+
+  it('update events replay: patched pin survives sync', async () => {
+    const store = new InMemoryAcceptanceStore()
+    const engine = new GoalAcceptanceEngine(store)
+    await engine.setCriteria([{ id: 'c1', description: 'a', verifyCommand: 'bad' }])
+    await engine.updateCriterion({ criterionId: 'c1', patch: { verifyCommand: 'good' }, reason: 'fix' })
+    const replayed = new GoalAcceptanceEngine(store)
+    assert.equal(replayed.getCriterion('c1')!.verifyCommand, 'good')
+  })
+
+  it('verifyCommand null clears the pin', async () => {
+    const engine = new GoalAcceptanceEngine(new InMemoryAcceptanceStore())
+    await engine.setCriteria([{ id: 'c1', description: 'a', verifyCommand: 'node --test' }])
+    const updated = await engine.updateCriterion({ criterionId: 'c1', patch: { verifyCommand: null }, reason: 'unpin' })
+    assert.equal(updated.verifyCommand, undefined)
+    const ok = await engine.validateCriterion({ criterionId: 'c1', status: 'passed', evidence: 'e', evidenceType: 'text', byReviewer: true })
+    assert.equal(ok.status, 'passed')
   })
 })
